@@ -223,6 +223,48 @@ const DECISION_NAMES: &[&str] = &["allow", "deny", "require_approval"];
 const FALLBACK_NAMES: &[&str] = &["deny", "require_approval"];
 const SENSITIVE_ACTIONS: &[&str] = &["deny", "require_approval"];
 
+/// Parse a standalone test-cases file for `policy test`: either a bare
+/// list of cases or a mapping with a `tests` key. Same case validation as
+/// embedded policy tests; paths use the `cases` root.
+pub fn parse_test_cases(text: &str) -> Result<Vec<PolicyTestCase>> {
+    if text.trim().is_empty() {
+        return Err(PolicyLoadError::InvalidConfiguration {
+            path: "cases".to_owned(),
+            message: "expected a list of test cases or a mapping with a 'tests' key".to_owned(),
+        });
+    }
+    let value: Value = yaml_serde::from_str(text).map_err(|e| {
+        let (line, column) = match e.location() {
+            Some(loc) => (Some(loc.line()), Some(loc.column())),
+            None => (None, None),
+        };
+        PolicyLoadError::InvalidYaml { line, column }
+    })?;
+    let list = match &value {
+        Value::Sequence(items) => items.clone(),
+        Value::Mapping(map) => match map.get(Value::from("tests")) {
+            Some(Value::Sequence(items)) => items.clone(),
+            _ => {
+                return Err(PolicyLoadError::InvalidConfiguration {
+                    path: "cases".to_owned(),
+                    message: "expected a list of test cases or a mapping with a 'tests' key"
+                        .to_owned(),
+                });
+            }
+        },
+        _ => {
+            return Err(PolicyLoadError::InvalidConfiguration {
+                path: "cases".to_owned(),
+                message: "expected a list of test cases or a mapping with a 'tests' key".to_owned(),
+            });
+        }
+    };
+    list.iter()
+        .enumerate()
+        .map(|(i, raw)| validate_test_case(raw, &format!("cases[{i}]")))
+        .collect()
+}
+
 /// Parse and strictly validate a policy v1 YAML document.
 ///
 /// An empty or whitespace-only document is not valid YAML input for our

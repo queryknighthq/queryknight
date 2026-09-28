@@ -312,6 +312,43 @@ No `describe.skip/it.skip/todo/xfail` literals. Gating is `test.skipIf(!LIVE)` w
   `call` is known); `GRANT` under the standard policy reaches
   `DEFAULT_DENY` (no rule names it).
 
+## CLI re-audit (CLI-parity phase, verified against source and live runs)
+
+- Exit codes: `0` success (valid policy, all tests pass, inspect ALLOW);
+  `1` policy-test failures, unknown subcommand, or bare `policy`;
+  `2` usage errors (bad CLI shape, missing file/SQL), invalid policy or
+  cases files; `3` inspect evaluated but decision is not allow (deny or
+  require-approval). TS `policy` bare prints usage to stderr with exit 1;
+  unknown commands print full help to stdout with exit 1.
+- `inspect` defaults: `--dialect mysql` (differs from `policy test`
+  default `postgres`), demo policy when `--policy` is absent, `--env
+  production`, `--db main`, `--integration cli`. Demo policy: allow
+  `select|show|describe|explain`, deny `drop|truncate|grant|revoke`,
+  approval `insert|update|delete|create|alter`, sensitive columns,
+  `deny_without_where: [update, delete]`, `max_limit: 1000`.
+- `inspect` reads piped stdin when no positional SQL is given; text output
+  lines are `Decision` (uppercase), `Reason`, `Message`, optional
+  `Table`/`Column`/`Matched policy`/`Risk signals`; `--json` emits the
+  9-key shape (decision uppercase, reason_code, message, matched_policy,
+  table, column, operation, risk_signals, fingerprint; absent keys
+  omitted). Non-allow exits 3.
+- `policy validate` prints `policy <path>: valid (version 1, <dbs>
+  database scope(s), <tests> embedded test(s))`; invalid/missing files go
+  to stderr with exit 2 (`invalid policy <path>: ...` vs `cannot read
+  policy <path>: ...`).
+- `policy test <policy> [cases]` runs embedded `tests:` or a standalone
+  cases file (bare list or `{tests: [...]}`), defaults
+  `--dialect postgres --env production --db main`, per-case context
+  overrides, `TestApprovalProvider(['waiting'])` so approval verdicts
+  surface; lines `PASS <name> (<code>)` /
+  `FAIL <name>: expected <exp>[/<reason>], got <dec>/<code> (<message>)`
+  plus `<p>/<n> passed`; exit 1 on failures, 2 on usage/invalid.
+- `version`, `--version`, `-v` print `QueryKnight 0.1.0-beta.0`;
+  `help`, `--help`, `-h` print help (exit 0). Unknown flags are silently
+  ignored by positional parsing; unknown dialects fall back to MySQL
+  options silently. CLI `inspect` wires no approval provider, so
+  approval-gated SQL reports `APPROVAL_UNAVAILABLE`/deny.
+
 ## Fingerprint audit (identity-hardening phase, probed 2026-09-28)
 
 `normalizeSql`/`sqlFingerprint` (`packages/core/src/fingerprint.ts`) are a
