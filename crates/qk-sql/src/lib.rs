@@ -19,11 +19,16 @@
 #![warn(missing_docs)]
 
 pub mod analyze;
+pub mod defensive;
 pub mod dialect;
 pub mod error;
 pub mod model;
 
 pub use analyze::{analyze, analyze_with_options, AnalyzeOptions};
+pub use defensive::{
+    defensive_scan, DefensiveScan, DefensiveSignal, PossibleOperation, ScanCompleteness,
+    SqlInspection,
+};
 pub use dialect::{parse_dialect, SqlDialect};
 pub use error::SqlAnalysisError;
 pub use model::{

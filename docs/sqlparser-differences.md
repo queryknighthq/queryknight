@@ -114,6 +114,30 @@ Consequences, stated plainly:
   safety; unknown and unsupported shapes stay non-read (fail-closed
   direction for the future evaluator).
 
+## Defensive lexical scan vs reference `fallbackScan`
+
+The reference runs 13 phrase regexes over comment/string-stripped text,
+only after parse failure, feeding the deny message (`possible: ...`) but
+never verdicts. The Rust `defensive_scan` (state machine, no regexes) is
+word-based and runs independently of parse outcome:
+
+- Exact (A): quoted literals/identifiers hide keywords; `#` comments are
+  not stripped; comment-split keywords (`DR/**/OP`) flag via transparent
+  comments; word boundaries (`dropbox` safe); mixed case; `CALL`/`COPY`
+  keywords; semicolon counting outside protected regions.
+- Conservative improvements (B): `EXEC`/`EXECUTE` -> `UnknownAdmin`;
+  `BEGIN`/`COMMIT`/`ROLLBACK`/`START` -> `Transaction`; MySQL `/*!...*/`
+  executable comments scanned through; bare dangerous words flag without
+  needing TS phrase shapes (`DROP` alone, `DELETE` without `FROM`).
+- Precision improvements, still safe (B): PostgreSQL dollar quotes and
+  SQLite brackets hide keywords (TS flags both); MySQL backslash escapes
+  honored (fewer false positives, DB-correct); `LOAD DATA` reports `Copy`
+  instead of kind `load`; `MERGE`/`VACUUM` report concretely instead of
+  `unknown`. Safe because fallback output never feeds verdicts: the
+  failure path stays fail-closed either way.
+- `UnknownWrite` is added on any lexically incomplete tail; the scan can
+  only add risk, never establish safety (INV-023).
+
 ## Known walker gaps (syntactic, documented)
 
 Exotic expression shapes contribute nothing rather than wrong facts:
