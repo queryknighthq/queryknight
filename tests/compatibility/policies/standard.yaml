@@ -1,0 +1,27 @@
+# Shared corpus policy. Mirrors reference policy-engine/evaluate tests + examples/policy.yaml.
+version: 1
+defaults:
+  decision: deny
+  on_parse_error: deny
+  on_unknown: deny
+environments:
+  production:
+    databases:
+      main:
+        allow:
+          - operations: [select]
+            schemas: [public]
+        deny:
+          - operations: [drop, truncate]
+        approval_required:
+          - operations: [update, delete, insert]
+        sensitive:
+          columns:
+            - users.password_hash
+            - users.mfa_secret
+            - customers.ssn
+            - "*.api_key"
+        mutations:
+          deny_without_where: [update, delete]
+        row_safety:
+          max_limit: 1000

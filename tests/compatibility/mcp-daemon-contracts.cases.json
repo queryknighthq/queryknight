@@ -1,0 +1,15 @@
+[
+  {"name": "mcp db_query zod limits", "contract": "mcp.db_query.schema", "assert": {"sql_max_chars": 1000000, "params_max_items": 1000, "max_rows_min": 1, "max_rows_max": 200}},
+  {"name": "mcp list limits", "contract": "mcp.list.schema", "assert": {"limit_min": 1, "limit_max": 200, "default_limit": 50, "default_sample_limit": 20}},
+  {"name": "mcp pending approval template", "contract": "mcp.pending_approval.text", "assert": {"line1_prefix": "Blocked: waiting for approval ", "contains": ["approvals_decide(", "approvalId="]}},
+  {"name": "mcp blocked prefix", "contract": "mcp.denied.text", "assert": {"prefix": "Blocked: ", "suffix_format": "[REASON_CODE]"}},
+  {"name": "mcp no-daemon fallback", "contract": "mcp.no_daemon.text", "assert": {"text": "daemon unavailable; start queryknight"}},
+  {"name": "daemon token sources", "contract": "daemon.auth", "assert": {"methods": ["bearer", "query_token", "x-qk-token"], "unauth_paths": ["/status", "/health", "/ready"], "codes": {"bad_token": 401, "bad_host": 403, "bad_origin": 403}}},
+  {"name": "daemon approval decide", "contract": "daemon.approvals.decide", "assert": {"path": "/approvals/:id/decide", "body": ["status", "source", "scope"], "unknown_id": 400}},
+  {"name": "daemon connections redacted", "contract": "daemon.connections", "assert": {"path": "/connections", "password_visible": false, "redaction_marker": ":***@"}},
+  {"name": "daemon health readiness", "contract": "daemon.health", "assert": {"health": {"path": "/health", "fields": ["ok", "version"]}, "ready_codes": {"ok": 200, "degraded": 503}}},
+  {"name": "openshell reason code format", "contract": "openshell.reason_code", "assert": {"prefix": "queryknight_", "charset": "a-z0-9_", "max_len": 75, "bad_config": "queryknight_bad_config"}},
+  {"name": "audit log levels", "contract": "audit.sql_log_levels", "assert": {"levels": ["none", "fingerprint", "metadata", "full_sql"], "default": "fingerprint", "max_chars": 20000}},
+  {"name": "prometheus metric names", "contract": "metrics.names", "assert": {"counters": ["queryknight_requests_total", "queryknight_decisions_total", "queryknight_policy_denials_total", "queryknight_parse_errors_total", "queryknight_approval_requests_total"], "histogram": "queryknight_evaluation_duration_seconds"}},
+  {"name": "fingerprint format", "contract": "normalize.fingerprint", "assert": {"hex_len": 16, "literal_rule": "strings and numbers collapse to ?", "case_rule": "lowercased"}}
+]

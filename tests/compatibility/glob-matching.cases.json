@@ -1,0 +1,12 @@
+[
+  {"name": "star matches dots", "pattern": "*.api_key", "value": "public.users.api_key", "expected": true},
+  {"name": "star matches bare table", "pattern": "*.api_key", "value": "users.api_key", "expected": true},
+  {"name": "exact match", "pattern": "users.password_hash", "value": "users.password_hash", "expected": true},
+  {"name": "case-insensitive", "pattern": "USERS.PASSWORD_HASH", "value": "users.password_hash", "expected": true},
+  {"name": "no partial match", "pattern": "users.password_hash", "value": "users.password_hash_v2", "expected": false},
+  {"name": "prefix star", "pattern": "public.*", "value": "public.customers", "expected": true},
+  {"name": "operation glob", "pattern": "del*", "value": "delete", "expected": true},
+  {"name": "signal glob", "pattern": "nested_*", "value": "nested_delete", "expected": true},
+  {"name": "regex chars escaped", "pattern": "users.api_key+v2", "value": "users.api_key+v2", "expected": true},
+  {"name": "regex chars not regex", "pattern": "users.api_key+v2", "value": "users.api_keyvv", "expected": false}
+]
