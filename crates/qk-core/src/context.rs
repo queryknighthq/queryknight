@@ -23,6 +23,10 @@ pub struct ExecutionContext {
     pub agent_id: Option<String>,
     /// Tool/operation source for `tools` rules (e.g. `db_query`).
     pub tool: Option<String>,
+    /// Session identity for approval binding (MCP/daemon session id).
+    /// Unset outside sessioned transports; missing sessions never match
+    /// session-scoped grants.
+    pub session_id: Option<String>,
 }
 
 impl ExecutionContext {

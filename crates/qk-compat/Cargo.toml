@@ -9,3 +9,4 @@ qk-core = { path = "../qk-core" }
 [dev-dependencies]
 serde_json = "1"
 qk-sql = { path = "../qk-sql" }
+qk-approval = { path = "../qk-approval" }

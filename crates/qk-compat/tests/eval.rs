@@ -44,13 +44,53 @@ const SHARED_EVAL_FILES: &[&str] = &[
     "approvals-rowlimits.cases.json",
 ];
 
-/// Approval-resolution cases: need the provider protocol (later layer).
-const DEFERRED_PROVIDER: &[&str] = &[
-    "approval missing provider denies",
-    "approval granted allows",
-    "approval denied stays denied",
-    "approval provider throw fails closed",
-];
+/// Approval-resolution cases unlocked by the approval layer: the harness
+/// maps each fixture `approval` value onto a provider (approved, denied,
+/// waiting, throws, missing) and resolves through `qk_approval::resolve`.
+fn resolve_approval(
+    file: &str,
+    name: &str,
+    approval: &str,
+    evaluation: &qk_core::EvaluationResult,
+    context: &qk_core::ExecutionContext,
+    sql: &str,
+) -> (String, String) {
+    use qk_approval::{
+        ErrorProvider, InMemoryApprovalStore, ProviderDecision, TestProvider, UnavailableProvider,
+        DEFAULT_APPROVAL_TTL_MS,
+    };
+    let mut store = InMemoryApprovalStore::new();
+    let approved = TestProvider::new(vec![ProviderDecision::Approved]);
+    let denied = TestProvider::new(vec![ProviderDecision::Denied]);
+    let waiting = TestProvider::new(vec![ProviderDecision::Waiting]);
+    let erroring = ErrorProvider::new("paged human, got voicemail");
+    let unavailable = UnavailableProvider;
+    let provider: Option<&dyn qk_approval::ApprovalProvider> = match approval {
+        "approved" => Some(&approved),
+        "denied" => Some(&denied),
+        "waiting" | "none" => Some(&waiting),
+        "throws" => Some(&erroring),
+        "unavailable" => Some(&unavailable),
+        "missing-provider" => None,
+        other => panic!("{file}::{name}: unknown approval mode {other}"),
+    };
+    let resolved = qk_approval::resolve(
+        &qk_approval::ResolveRequest {
+            evaluation,
+            context,
+            sql,
+            approval_id: None,
+            ttl_ms: DEFAULT_APPROVAL_TTL_MS,
+            now_ms: 1_000,
+        },
+        &mut store,
+        provider,
+    );
+    (
+        resolved.decision.as_str().to_owned(),
+        resolved.reason_code.as_str().to_owned(),
+    )
+}
 
 /// Observe mode is omitted (no product caller in the reference); the
 /// corpus fixture documents evaluate() API behavior only.
@@ -123,8 +163,10 @@ fn load_policy(case: &serde_json::Value, file: &str) -> PolicyFile {
 }
 
 struct Evaluated {
-    decision: String,
-    reason_code: String,
+    evaluation: qk_core::EvaluationResult,
+    context: qk_core::ExecutionContext,
+    sql: String,
+    approval: String,
 }
 
 fn rust_evaluate(file: &str, case: &serde_json::Value) -> Evaluated {
@@ -154,6 +196,10 @@ fn rust_evaluate(file: &str, case: &serde_json::Value) -> Evaluated {
             .get("tool")
             .and_then(|v| v.as_str())
             .map(str::to_owned),
+        session_id: ctx_value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
     };
     let dialect: qk_sql::SqlDialect = str_field(case, "dialect")
         .unwrap_or_else(|| "postgres".to_owned())
@@ -168,6 +214,11 @@ fn rust_evaluate(file: &str, case: &serde_json::Value) -> Evaluated {
             .and_then(|v| v.as_u64())
             .map_or(qk_sql::MAX_SQL_BYTES, |n| n as usize),
     };
+    let approval = case
+        .get("approval")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+        .to_owned();
     let result = evaluate(
         &EvaluationRequest {
             context: &context,
@@ -178,8 +229,10 @@ fn rust_evaluate(file: &str, case: &serde_json::Value) -> Evaluated {
         &options,
     );
     Evaluated {
-        decision: result.decision.as_str().to_owned(),
-        reason_code: result.reason_code.as_str().to_owned(),
+        evaluation: result,
+        context,
+        sql,
+        approval,
     }
 }
 
@@ -202,16 +255,22 @@ fn evaluator_parity_with_frozen_fixtures() {
                 continue;
             }
             let name = str_field(&case, "name").unwrap_or_else(|| panic!("{file}: nameless"));
-            if DEFERRED_PROVIDER.contains(&name.as_str())
-                || DEFERRED_OBSERVE.contains(&name.as_str())
-            {
+            if DEFERRED_OBSERVE.contains(&name.as_str()) {
                 deferred.push(format!("{file}::{name}"));
                 continue;
             }
             let got = rust_evaluate(file, &case);
-            if let Some((decision, reason)) = divergent(&name) {
-                assert_eq!(got.decision, decision, "{file}::{name} divergent decision");
-                assert_eq!(got.reason_code, reason, "{file}::{name} divergent reason");
+            let (decision, reason) = resolve_approval(
+                file,
+                &name,
+                &got.approval,
+                &got.evaluation,
+                &got.context,
+                &got.sql,
+            );
+            if let Some((want_decision, want_reason)) = divergent(&name) {
+                assert_eq!(decision, want_decision, "{file}::{name} divergent decision");
+                assert_eq!(reason, want_reason, "{file}::{name} divergent reason");
                 diverged.push(format!("{file}::{name}"));
                 continue;
             }
@@ -224,25 +283,17 @@ fn evaluator_parity_with_frozen_fixtures() {
                 .get("reason_code")
                 .and_then(|v| v.as_str())
                 .expect("reason");
-            assert_eq!(got.decision, want_decision, "{file}::{name} decision");
-            assert_eq!(got.reason_code, want_reason, "{file}::{name} reason");
+            assert_eq!(decision, want_decision, "{file}::{name} decision");
+            assert_eq!(reason, want_reason, "{file}::{name} reason");
             applied += 1;
         }
     }
-    let mut deferred_sorted = deferred.clone();
-    deferred_sorted.sort();
-    let mut want_deferred: Vec<String> = DEFERRED_PROVIDER
-        .iter()
-        .map(|n| format!("approvals-rowlimits.cases.json::{n}"))
-        .chain(
-            DEFERRED_OBSERVE
-                .iter()
-                .map(|n| format!("policy-evaluation.cases.json::{n}")),
-        )
-        .collect();
-    want_deferred.sort();
     assert_eq!(
-        deferred_sorted, want_deferred,
+        deferred,
+        DEFERRED_OBSERVE
+            .iter()
+            .map(|n| format!("policy-evaluation.cases.json::{n}"))
+            .collect::<Vec<_>>(),
         "deferred set must stay pinned"
     );
     assert_eq!(
@@ -251,7 +302,7 @@ fn evaluator_parity_with_frozen_fixtures() {
         "divergent set must stay pinned: {diverged:?}"
     );
     assert_eq!(
-        applied, 48,
+        applied, 52,
         "applied count must stay pinned, applied={applied}"
     );
     println!(
@@ -283,7 +334,7 @@ fn differential_against_typescript_oracle() {
         if !SHARED_EVAL_FILES.contains(&file) {
             continue;
         }
-        if DEFERRED_PROVIDER.contains(&name) || DEFERRED_OBSERVE.contains(&name) {
+        if DEFERRED_OBSERVE.contains(&name) {
             continue;
         }
         let ts_decision = row.get("decision").and_then(|v| v.as_str()).unwrap_or("?");
@@ -317,18 +368,20 @@ fn differential_against_typescript_oracle() {
             .find(|c| c.get("name").and_then(|v| v.as_str()) == Some(name))
             .expect("fixture");
         let got = rust_evaluate(file, &case);
-        assert_eq!(
-            got.decision, ts_decision,
-            "{file}::{name} decision vs oracle"
+        let (decision, reason) = resolve_approval(
+            file,
+            name,
+            &got.approval,
+            &got.evaluation,
+            &got.context,
+            &got.sql,
         );
-        assert_eq!(
-            got.reason_code, ts_reason,
-            "{file}::{name} reason vs oracle"
-        );
+        assert_eq!(decision, ts_decision, "{file}::{name} decision vs oracle");
+        assert_eq!(reason, ts_reason, "{file}::{name} reason vs oracle");
         compared += 1;
     }
     assert_eq!(
-        compared, 36,
+        compared, 40,
         "compared count must stay pinned, compared={compared}"
     );
     println!("differential: {compared} Rust==TS, {oracle_sanity} oracle-sanity on divergences");

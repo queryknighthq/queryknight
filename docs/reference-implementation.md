@@ -312,6 +312,40 @@ No `describe.skip/it.skip/todo/xfail` literals. Gating is `test.skipIf(!LIVE)` w
   `call` is known); `GRANT` under the standard policy reaches
   `DEFAULT_DENY` (no rule names it).
 
+## Approval lifecycle re-audit (approval-layer phase, verified)
+
+- `RequireApproval` is produced only by `evaluatePolicy()` (sensitive
+  action, approval rules, `on_parse_error`/`on_unknown` set to
+  `require_approval`, `defaults.decision`). Envelope codes
+  (`APPROVAL_*`) come from `evaluate()` around providers, never the
+  policy engine.
+- Provider input: `{eventId, context, fingerprint, reasonCode, message,
+  matchedPolicy, table, column, operation}` — fingerprint plus facts,
+  never raw SQL. Outcomes: `{id, status: approved|denied|waiting}`;
+  throws map to `APPROVAL_ERROR` (message bounded to 300 chars).
+- Fingerprint: literal/number-stripped, lowercased SHA-256, first 16 hex
+  (`sqlFingerprint`). Session grants and approval retries bind on it, so
+  literal-only variants (`id=42` vs `id=43`) intentionally share identity.
+- Daemon IDs: `qka_<4 random bytes hex>`; in-memory test IDs `qka_<seq>`;
+  test-provider IDs `test-<n>`.
+- Expiry: `expiresAt = createdAt + timeoutMs` (default 60s); reads lazily
+  flip `waiting` to `expired` at `expires_at <= now` (boundary inclusive).
+  `waitForApproval` polls every 50ms, then marks expired.
+- `decideApproval` only transitions `waiting` (else throws `approval not
+  waiting`); `scope: once|session` (default `once`); approved + session +
+  sessionId writes an unbounded-lifetime `(session_id, fingerprint)` row
+  (no TTL, no revocation path).
+- Session-allow matches `(session_id, fingerprint)` only — no
+  environment/database/agent comparison (sessions are per-connection).
+- Retry (`approvalId`): approved fingerprint-match executes without a new
+  row; denied/expired deny; waiting + non-blocking rethrows pending;
+  unknown/mismatched id mints a fresh approval. "Single-approval retry"
+  is mechanism C: re-invoke evaluation carrying the approval token.
+- `cancelled` exists in the status union but has no producer in any flow.
+- Envelope field rules: granted/denied/error drop `table`/`column`/
+  `operation`; unavailable preserves them; waiting passes the policy
+  result through with `approvalId` added.
+
 ## External compatibility surfaces (freeze list)
 
 1. `evaluate(ctx, sql, opts)` signature + Evaluation JSON shape + all reason codes.
