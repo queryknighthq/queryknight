@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "crates/qk-core",
     "crates/qk-compat",
+    "crates/qk-sql",
 ]
