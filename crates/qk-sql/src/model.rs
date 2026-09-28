@@ -186,6 +186,23 @@ pub enum OpCategory {
     Unknown,
 }
 
+impl OpCategory {
+    /// Stable lowercase name, matching the reference operation vocabulary
+    /// used in policy `operations` rules.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Ddl => "ddl",
+            Self::Destructive => "destructive",
+            Self::Privilege => "privilege",
+            Self::Admin => "admin",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// LIMIT representation. Non-literal limits are never coerced to numbers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LimitValue {
@@ -219,6 +236,25 @@ pub enum RiskSignal {
     DepthTruncated,
 }
 
+impl RiskSignal {
+    /// Stable snake_case name for policy `signals` rule matching.
+    /// `multi_statement` mirrors the reference vocabulary; the rest are
+    /// QueryKnight-owned names for facts the reference never produced.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::MultipleStatements => "multi_statement",
+            Self::MutationWithoutWhere => "mutation_without_where",
+            Self::SelectStar => "select_star",
+            Self::DynamicLimit => "dynamic_limit",
+            Self::DdlOperation => "ddl_operation",
+            Self::AdministrativeOperation => "administrative_operation",
+            Self::NestedMutation => "nested_mutation",
+            Self::DepthTruncated => "depth_truncated",
+        }
+    }
+}
+
 /// Normalized analysis of one statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementAnalysis {
@@ -244,6 +280,10 @@ pub struct StatementAnalysis {
     /// subqueries, MERGE branches, EXPLAIN inner statements). Sorted,
     /// deduplicated, excluding the top-level operation itself.
     pub nested_operations: Vec<Operation>,
+    /// Nested UPDATE/DELETE operations lacking a WHERE clause. Sorted,
+    /// deduplicated. Lets the evaluator apply unbounded-mutation protection
+    /// to nested writes without claiming catalog knowledge.
+    pub nested_unbounded: Vec<Operation>,
 }
 
 /// Whether the whole AST was visited. A truncated analysis must never be

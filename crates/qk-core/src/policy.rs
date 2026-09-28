@@ -27,6 +27,18 @@ pub enum Decision {
     RequireApproval,
 }
 
+impl Decision {
+    /// Frozen lowercase serialization.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::RequireApproval => "require_approval",
+        }
+    }
+}
+
 /// Fallback for unparseable or unsupported statements (`deny` default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ParseFallback {

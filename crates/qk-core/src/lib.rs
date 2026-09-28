@@ -6,14 +6,22 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod context;
+pub mod decision;
 pub mod error;
+pub mod evaluate;
 pub mod glob;
 pub mod policy;
 
+pub use context::ExecutionContext;
+pub use decision::{Decision, ReasonCode};
 pub use error::PolicyLoadError;
+pub use evaluate::{evaluate, EvaluateOptions, EvaluationRequest, EvaluationResult};
 pub use glob::{check_glob, glob_match};
+/// Policy-file verdict type (config level), aliased to avoid clashing with
+/// the evaluation [`Decision`].
+pub use policy::Decision as PolicyDecision;
 pub use policy::{
-    parse_policy, DatabasePolicy, Decision, Defaults, EnvironmentPolicy, MutationsPolicy,
-    ParseFallback, PolicyFile, PolicyRule, PolicyTestCase, RowSafety, SensitiveAction,
-    SensitivePolicy,
+    parse_policy, DatabasePolicy, Defaults, EnvironmentPolicy, MutationsPolicy, ParseFallback,
+    PolicyFile, PolicyRule, PolicyTestCase, RowSafety, SensitiveAction, SensitivePolicy,
 };

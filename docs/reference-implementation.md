@@ -287,6 +287,31 @@ Multi-stage: `oven/bun:1` build (`bun install --frozen-lockfile`, `bun build pac
 
 No `describe.skip/it.skip/todo/xfail` literals. Gating is `test.skipIf(!LIVE)` with `LIVE = QK_LIVE_DB !== '0'`: mysql-adapter (6: ping, introspect, missing-table, budgeted SELECT, estimateImpact skip-path, dumpSchema), postgres-adapter (4: ping+introspect, estimateImpact skip-path, dumpSchema + one more), mysql proxy (2: SELECT-allow/DROP-block, mysql2 driver COM_QUERY/prepared/write/block), postgres proxy (2: same pair). Locally without DB servers these 11 fail with connection errors instead of skipping; with `QK_LIVE_DB=0` they skip (CI green).
 
+## Re-audit notes (evaluator phase, 2026-09-28, verified against source)
+
+- Observe mode (`evaluate(..., {mode: 'observe'})` -> `OBSERVED_*` allow) has
+  no product caller: MCP, CLI `inspect`/`policy test`, daemon, proxies, and
+  OpenShell never set it. It is a library option exercised by one unit test
+  and one corpus fixture. Not a frozen product surface.
+- Approval codes (`APPROVAL_UNAVAILABLE/GRANTED/DENIED/ERROR`) are produced
+  only by the `evaluate()` envelope around approval providers, never by
+  `evaluatePolicy()` itself, which stops at `require_approval`.
+- `SELECT *` receives no special sensitive handling: `*` is an ordinary
+  column string, so `users.password_hash` and `*.api_key` patterns do not
+  match it (verified: all star selects allow under a sensitive policy
+  unless another rule fires).
+- Result field rules: `table`/`column` appear only on sensitive hits
+  (bare names) and `table` on unbounded mutations (qualified); `operation`
+  is kinds-joined (duplicates kept) on rule/default/unknown paths and the
+  single kind on unbounded paths; empty/oversized results carry no
+  `matched_policy`, `table`, `column`, or `operation`.
+- `possible_*` fallback signals are verdict-dead by structure: failure
+  paths return before signals rules are consulted, and successful parses
+  never carry them. They enrich deny messages only.
+- `CALL` reaches `DENY_UNKNOWN_STATEMENT` via unknown operation (kind
+  `call` is known); `GRANT` under the standard policy reaches
+  `DEFAULT_DENY` (no rule names it).
+
 ## External compatibility surfaces (freeze list)
 
 1. `evaluate(ctx, sql, opts)` signature + Evaluation JSON shape + all reason codes.

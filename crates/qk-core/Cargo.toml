@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 regex = "1"
 yaml_serde = "0.10"
+qk-sql = { path = "../qk-sql" }

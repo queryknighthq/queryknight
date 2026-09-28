@@ -219,6 +219,7 @@ struct Collector {
     mutated: BTreeSet<TableRef>,
     columns: BTreeSet<ColumnRef>,
     nested: BTreeSet<Operation>,
+    nested_unbounded: BTreeSet<Operation>,
     has_where: Option<bool>,
     limit: Option<LimitValue>,
     has_returning: bool,
@@ -238,6 +239,9 @@ impl Collector {
         nested.sort();
         nested.dedup();
         let _ = &mut self;
+        let mut unbounded: Vec<Operation> = self.nested_unbounded.iter().cloned().collect();
+        unbounded.sort();
+        unbounded.dedup();
         StatementAnalysis {
             operation,
             tables: self.tables.into_iter().collect(),
@@ -248,6 +252,7 @@ impl Collector {
             has_returning: self.has_returning,
             select_star: self.select_star,
             nested_operations: nested,
+            nested_unbounded: unbounded,
         }
     }
 
@@ -370,11 +375,11 @@ fn walk_statement(stmt: &Statement, col: &mut Collector, primary: bool, depth: u
             Operation::Insert
         }
         Statement::Update(u) => {
-            walk_update(u, col, depth + 1);
+            walk_update(u, col, depth + 1, primary);
             Operation::Update
         }
         Statement::Delete(d) => {
-            walk_delete(d, col, depth + 1);
+            walk_delete(d, col, depth + 1, primary);
             Operation::Delete
         }
         Statement::Merge(m) => {
@@ -509,7 +514,7 @@ fn walk_statement(stmt: &Statement, col: &mut Collector, primary: bool, depth: u
 // DML walkers
 // ---------------------------------------------------------------------------
 
-fn walk_update(u: &Update, col: &mut Collector, depth: usize) {
+fn walk_update(u: &Update, col: &mut Collector, depth: usize, primary: bool) {
     if let TableFactor::Table { name, .. } = &u.table.relation {
         if let Some(t) = table_ref_of(name) {
             col.tables.insert(t.clone());
@@ -546,19 +551,23 @@ fn walk_update(u: &Update, col: &mut Collector, depth: usize) {
             walk_table_with_joins(twj, col, depth, false);
         }
     }
-    if col.has_where.is_none() {
-        col.has_where = Some(u.selection.is_some());
+    if primary {
+        if col.has_where.is_none() {
+            col.has_where = Some(u.selection.is_some());
+        }
+        if let Some(e) = &u.limit {
+            set_limit(limit_of(e), col);
+        }
+    } else if u.selection.is_none() {
+        col.nested_unbounded.insert(Operation::Update);
     }
     if let Some(selection) = &u.selection {
         walk_expr(selection, col, depth);
     }
-    if let Some(e) = &u.limit {
-        set_limit(limit_of(e), col);
-    }
     walk_returning(u.returning.as_deref(), col, depth);
 }
 
-fn walk_delete(d: &Delete, col: &mut Collector, depth: usize) {
+fn walk_delete(d: &Delete, col: &mut Collector, depth: usize, primary: bool) {
     use sqlparser::ast::FromTable;
     let from_tables: Vec<TableWithJoins> = match &d.from {
         FromTable::WithFromKeyword(t) => t.clone(),
@@ -594,14 +603,18 @@ fn walk_delete(d: &Delete, col: &mut Collector, depth: usize) {
             walk_table_with_joins(twj, col, depth, false);
         }
     }
-    if col.has_where.is_none() {
-        col.has_where = Some(d.selection.is_some());
+    if primary {
+        if col.has_where.is_none() {
+            col.has_where = Some(d.selection.is_some());
+        }
+        if let Some(e) = &d.limit {
+            set_limit(limit_of(e), col);
+        }
+    } else if d.selection.is_none() {
+        col.nested_unbounded.insert(Operation::Delete);
     }
     if let Some(selection) = &d.selection {
         walk_expr(selection, col, depth);
-    }
-    if let Some(e) = &d.limit {
-        set_limit(limit_of(e), col);
     }
     walk_returning(d.returning.as_deref(), col, depth);
 }

@@ -3,7 +3,11 @@
 // implementation (../queryknight-ts). No modification to the reference repo:
 // it is imported, never edited. Usage:
 //   bun tools/reference-runner/run.ts [--file <name>] [--json]
-// Exit: 0 all pass, 1 any fail, 2 harness error.
+//   bun tools/reference-runner/run.ts --dump [--file <name>]
+// --dump prints one JSON object per evaluable case:
+//   {"file":..., "name":..., "decision":..., "reason_code":...}
+// for differential comparison with the Rust evaluator. Exit: 0 all pass,
+// 1 any fail, 2 harness error.
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,7 +55,54 @@ function providerFor(c: Case) {
 
 const onlyFile = process.argv.includes('--file') ? process.argv[process.argv.indexOf('--file') + 1] : undefined;
 const asJson = process.argv.includes('--json');
+const dump = process.argv.includes('--dump');
 const files = readdirSync(COMPAT).filter((f) => f.endsWith('.cases.json')).filter((f) => !onlyFile || f.includes(onlyFile));
+
+// --dump: evaluable cases only (expected.decision present); generated SQL
+// placeholders (CHAIN_*/NEST_*) are expanded like the Rust harness does.
+function expandGenerated(sql: string): string {
+  if (sql === 'CHAIN_200') return 'SELECT 1' + ' + 1'.repeat(200);
+  if (sql === 'NEST_2000') {
+    let s = 'SELECT 1';
+    for (let i = 0; i < 2000; i++) s = `SELECT * FROM (${s}) t${i}`;
+    return s;
+  }
+  return sql;
+}
+
+if (dump) {
+  const rows: Array<Record<string, unknown>> = [];
+  for (const file of files) {
+    const cases = JSON.parse(readFileSync(join(COMPAT, file), 'utf8')) as Case[];
+    for (const c of cases) {
+      if (!c.expected?.decision || typeof c.sql !== 'string') continue;
+      // Provider-resolution cases need async daemon providers; the dump
+      // covers the same provider mapping as the check runner.
+      try {
+        const policy = loadPolicy(c);
+        const ctx = {
+          integration: c.context?.integration ?? 'cli',
+          environment: (c.context?.environment ?? 'production') as core.AgentContext['environment'],
+          database: c.context?.database ?? 'main',
+          agent_id: c.context?.agent_id,
+          tool: c.context?.tool,
+        };
+        const result = await core.evaluate(ctx, expandGenerated(c.sql), {
+          policy,
+          dialect: c.dialect ?? 'postgres',
+          mode: (c.mode as 'enforce' | 'observe') ?? 'enforce',
+          approvalProvider: providerFor(c),
+          ...(c.max_sql_bytes ? { maxSqlBytes: c.max_sql_bytes } : {}),
+        });
+        rows.push({ file, name: c.name, decision: result.decision, reason_code: result.reason_code });
+      } catch (e) {
+        rows.push({ file, name: c.name, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+  }
+  console.log(JSON.stringify(rows));
+  process.exit(0);
+}
 
 let pass = 0, fail = 0;
 const failures: Array<Record<string, unknown>> = [];
