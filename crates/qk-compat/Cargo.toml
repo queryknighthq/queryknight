@@ -1,0 +1,10 @@
+[package]
+name = "qk-compat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+qk-core = { path = "../qk-core" }
+
+[dev-dependencies]
+serde_json = "1"
