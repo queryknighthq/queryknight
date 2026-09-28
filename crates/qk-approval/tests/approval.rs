@@ -61,6 +61,7 @@ fn resolve_with(
         &ResolveRequest {
             evaluation,
             context,
+            dialect: qk_sql::SqlDialect::PostgreSql,
             sql,
             approval_id,
             ttl_ms: DEFAULT_APPROVAL_TTL_MS,
@@ -145,8 +146,9 @@ fn approval_cannot_override_hard_denials() {
         assert_eq!(evaluation.decision, Decision::Deny, "{sql:?}");
         let mut store = InMemoryApprovalStore::new();
         store.insert(StoredGrant {
-            id: "qka-live".to_owned(),
-            fingerprint: qk_core::sql_fingerprint(sql),
+            id: qk_approval::ApprovalId::new("qka-live".to_owned()),
+            shape: qk_core::sql_fingerprint(sql),
+            exact: qk_core::exact_request_digest(qk_sql::SqlDialect::PostgreSql, sql),
             scope: qk_approval::ApprovalScope {
                 session_id: Some("session-1".to_owned()),
                 integration: "mcp".to_owned(),
@@ -281,7 +283,7 @@ fn retry_resolves_without_reasking() {
         &evaluation,
         &context,
         SQL,
-        Some(&id),
+        Some(id.as_str()),
         &mut store,
         Some(&provider),
     );
@@ -308,7 +310,7 @@ fn session_grant_flow() {
     // Human approves for the session out of band.
     store
         .decide(
-            &id,
+            id.as_str(),
             GrantStatus::Approved,
             Scope::Session,
             qk_approval::DecisionSource::Cli,
@@ -360,7 +362,7 @@ fn replay_across_dimensions_fails() {
         &other_eval,
         &context,
         other_sql,
-        Some(&id),
+        Some(id.as_str()),
         &mut store,
         Some(&waiting),
     );
@@ -388,7 +390,7 @@ fn replay_across_dimensions_fails() {
             &evaluation,
             &altered,
             SQL,
-            Some(&id),
+            Some(id.as_str()),
             &mut store,
             Some(&probe),
         );
@@ -402,11 +404,10 @@ fn replay_across_dimensions_fails() {
 }
 
 #[test]
-fn literal_variants_share_identity_by_design() {
-    // Frozen semantics: the fingerprint strips literals, so approving
-    // `id = 42` authorizes retrying `id = 43`. This is the documented
-    // session-allow purpose (approve a statement shape once), not a
-    // bypass: table, operation, and scope must still match exactly.
+fn exact_token_rejects_literal_change() {
+    // An exact (Once) approval token binds the precise request bytes:
+    // `id = 43` must not reuse the token minted for `id = 42`. The
+    // mismatch proceeds as a fresh request instead.
     let (evaluation, context, _) = require_approval();
     let mut store = InMemoryApprovalStore::new();
     let provider = TestProvider::new(vec![ProviderDecision::Approved]);
@@ -435,12 +436,84 @@ fn literal_variants_share_identity_by_design() {
         &variant_eval,
         &context,
         variant_sql,
-        Some(&id),
+        Some(id.as_str()),
         &mut store,
         Some(&idle),
     );
-    assert_eq!(replayed.outcome, ResolutionOutcome::ExistingGrant);
-    assert_eq!(idle.calls(), 0);
+    assert_eq!(replayed.outcome, ResolutionOutcome::ProviderWaiting);
+    assert_eq!(idle.calls(), 1, "literal change mints a fresh request");
+}
+
+#[test]
+fn session_shape_accepts_literal_variant() {
+    // Session scope explicitly means shape scope: after a session-scoped
+    // approval, literal variants reuse the grant without re-asking, while
+    // scope dimensions and the normalized shape still bind fully.
+    let (evaluation, context, _) = require_approval();
+    let mut store = InMemoryApprovalStore::new();
+    let provider = TestProvider::new(vec![ProviderDecision::Waiting]);
+    let pending = resolve_with(
+        &evaluation,
+        &context,
+        SQL,
+        None,
+        &mut store,
+        Some(&provider),
+    );
+    let id = pending.approval_id.clone().expect("id");
+    store
+        .decide(
+            id.as_str(),
+            GrantStatus::Approved,
+            Scope::Session,
+            qk_approval::DecisionSource::Cli,
+            NOW,
+        )
+        .expect("decide");
+    let variant_sql = "DELETE FROM customers WHERE id = 43";
+    let variant_eval = evaluate(
+        &EvaluationRequest {
+            context: &context,
+            dialect: "postgres".parse().expect("dialect"),
+            sql: variant_sql,
+            policy: &policy(),
+        },
+        &EvaluateOptions::default(),
+    );
+    let idle = TestProvider::new(vec![ProviderDecision::Waiting]);
+    let reused = resolve_with(
+        &variant_eval,
+        &context,
+        variant_sql,
+        None,
+        &mut store,
+        Some(&idle),
+    );
+    assert_eq!(reused.decision, Decision::Allow);
+    assert_eq!(reused.outcome, ResolutionOutcome::ExistingGrant);
+    assert_eq!(idle.calls(), 0, "session shape must not re-ask");
+    // A different shape under the same session does not reuse.
+    let other_sql = "DELETE FROM orders WHERE id = 43";
+    let other_eval = evaluate(
+        &EvaluationRequest {
+            context: &context,
+            dialect: "postgres".parse().expect("dialect"),
+            sql: other_sql,
+            policy: &policy(),
+        },
+        &EvaluateOptions::default(),
+    );
+    let probe = TestProvider::new(vec![ProviderDecision::Waiting]);
+    let other = resolve_with(
+        &other_eval,
+        &context,
+        other_sql,
+        None,
+        &mut store,
+        Some(&probe),
+    );
+    assert_eq!(other.outcome, ResolutionOutcome::ProviderWaiting);
+    assert_eq!(probe.calls(), 1);
 }
 
 #[test]
@@ -475,8 +548,9 @@ fn expiry_and_unknown_ids() {
         &qk_approval::ResolveRequest {
             evaluation: &evaluation,
             context: &context,
+            dialect: qk_sql::SqlDialect::PostgreSql,
             sql: SQL,
-            approval_id: Some(&id),
+            approval_id: Some(id.as_str()),
             ttl_ms: DEFAULT_APPROVAL_TTL_MS,
             now_ms: expired_at,
         },
@@ -506,17 +580,66 @@ fn waiting_retry_stays_pending_without_reasking() {
         &evaluation,
         &context,
         SQL,
-        Some(&id),
+        Some(id.as_str()),
         &mut store,
         Some(&provider),
     );
     assert_eq!(again.decision, Decision::RequireApproval);
-    assert_eq!(again.approval_id.as_deref(), Some(id.as_str()));
+    assert_eq!(
+        again.approval_id.as_ref().map(|id| id.as_str()),
+        Some(id.as_str())
+    );
     assert_eq!(
         provider.calls(),
         1,
         "waiting retry must not create a new request"
     );
+}
+
+#[test]
+fn dialect_change_breaks_exact_binding() {
+    // Same SQL bytes under another dialect: different exact digest, so the
+    // token cannot be reused — even though the shape fingerprint (which
+    // ignores dialect, frozen behavior) is identical.
+    let (evaluation, context, _) = require_approval();
+    let mut store = InMemoryApprovalStore::new();
+    let provider = TestProvider::new(vec![ProviderDecision::Approved]);
+    let first = resolve_with(
+        &evaluation,
+        &context,
+        SQL,
+        None,
+        &mut store,
+        Some(&provider),
+    );
+    let id = first.approval_id.clone().expect("id");
+    // Shape identity takes no dialect (frozen); exact identity does.
+    let mysql_eval = evaluate(
+        &EvaluationRequest {
+            context: &context,
+            dialect: qk_sql::SqlDialect::MySql,
+            sql: SQL,
+            policy: &policy(),
+        },
+        &EvaluateOptions::default(),
+    );
+    assert_eq!(mysql_eval.decision, Decision::RequireApproval);
+    let fresh = TestProvider::new(vec![ProviderDecision::Waiting]);
+    let out = qk_approval::resolve(
+        &qk_approval::ResolveRequest {
+            evaluation: &mysql_eval,
+            context: &context,
+            dialect: qk_sql::SqlDialect::MySql,
+            sql: SQL,
+            approval_id: Some(id.as_str()),
+            ttl_ms: DEFAULT_APPROVAL_TTL_MS,
+            now_ms: NOW,
+        },
+        &mut store,
+        Some(&fresh),
+    );
+    assert_eq!(out.outcome, ResolutionOutcome::ProviderWaiting);
+    assert_eq!(fresh.calls(), 1, "dialect change mints a fresh request");
 }
 
 #[test]

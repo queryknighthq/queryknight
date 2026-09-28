@@ -175,6 +175,7 @@ name = "qk-approval"
 version = "0.1.0"
 dependencies = [
  "qk-core",
+ "qk-sql",
 ]
 
 [[package]]

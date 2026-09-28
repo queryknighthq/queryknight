@@ -8,6 +8,7 @@ use std::fmt::{self, Display, Formatter};
 
 use qk_core::ReasonCode;
 
+use crate::id::ApprovalId;
 use crate::scope::ApprovalScope;
 
 /// What a human/provider is asked to decide. Contains the SQL fingerprint
@@ -15,8 +16,10 @@ use crate::scope::ApprovalScope;
 /// input, which carries fingerprint plus reason, not statement text).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {
-    /// Fingerprint of the exact SQL under evaluation.
-    pub fingerprint: String,
+    /// Query-shape fingerprint (compatibility identity for display and
+    /// session-shape reasoning). The exact-request binding stays inside
+    /// the resolution layer and is never delegated to the provider.
+    pub fingerprint: qk_core::QueryShapeFingerprint,
     /// Binding scope the grant would carry.
     pub scope: ApprovalScope,
     /// Frozen reason that produced `RequireApproval`.
@@ -48,7 +51,7 @@ pub enum ProviderDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderResponse {
     /// Approval id (provider-assigned; opaque to the evaluator).
-    pub id: String,
+    pub id: ApprovalId,
     /// The verdict.
     pub decision: ProviderDecision,
 }
@@ -122,7 +125,7 @@ pub struct DenyByDefaultProvider;
 impl ApprovalProvider for DenyByDefaultProvider {
     fn request(&self, _request: &ApprovalRequest) -> Result<ProviderResponse, ProviderError> {
         Ok(ProviderResponse {
-            id: "denied-default".to_owned(),
+            id: ApprovalId::new("denied-default".to_owned()),
             decision: ProviderDecision::Denied,
         })
     }
@@ -200,7 +203,7 @@ impl ApprovalProvider for TestProvider {
             .pop_front()
             .unwrap_or(ProviderDecision::Waiting);
         Ok(ProviderResponse {
-            id: self.ids.generate(),
+            id: ApprovalId::new(self.ids.generate()),
             decision,
         })
     }
@@ -217,7 +220,7 @@ mod tests {
 
     fn request() -> ApprovalRequest {
         ApprovalRequest {
-            fingerprint: "abc".to_owned(),
+            fingerprint: qk_core::sql_fingerprint("SELECT 1"),
             scope: ApprovalScope {
                 session_id: None,
                 integration: "mcp".to_owned(),
@@ -241,8 +244,8 @@ mod tests {
             TestProvider::new(vec![ProviderDecision::Approved, ProviderDecision::Denied]);
         let first = provider.request(&request()).expect("ok");
         let second = provider.request(&request()).expect("ok");
-        assert_eq!(first.id, "test-1");
-        assert_eq!(second.id, "test-2");
+        assert_eq!(first.id.as_str(), "test-1");
+        assert_eq!(second.id.as_str(), "test-2");
         assert_eq!(first.decision, ProviderDecision::Approved);
         assert_eq!(second.decision, ProviderDecision::Denied);
         // Exhausted queue waits rather than inventing verdicts.

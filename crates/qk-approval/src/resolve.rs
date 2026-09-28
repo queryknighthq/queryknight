@@ -18,8 +18,13 @@
 //! cannot override a `Deny` — there is simply no path that consults grants
 //! for non-approval evaluations.
 
-use qk_core::{sql_fingerprint, Decision, EvaluationResult, ExecutionContext, ReasonCode};
+use qk_core::{
+    exact_request_digest, sql_fingerprint, Decision, EvaluationResult, ExactRequestDigest,
+    ExecutionContext, ReasonCode,
+};
+use qk_sql::SqlDialect;
 
+use crate::id::ApprovalId;
 use crate::provider::{ApprovalProvider, ApprovalRequest, ProviderDecision, ProviderError};
 use crate::scope::{ApprovalScope, Scope};
 use crate::store::{ApprovalStore, GrantStatus, StoredGrant};
@@ -39,7 +44,9 @@ pub struct ResolveRequest<'a> {
     pub evaluation: &'a EvaluationResult,
     /// Trusted context (scope binding + session identity).
     pub context: &'a ExecutionContext,
-    /// Untrusted SQL under evaluation (fingerprinted, never stored raw).
+    /// Dialect the SQL was evaluated under (part of exact identity).
+    pub dialect: SqlDialect,
+    /// Untrusted SQL under evaluation (hashed, never stored raw).
     pub sql: &'a str,
     /// Retry token: a previously issued approval id, if any.
     pub approval_id: Option<&'a str>,
@@ -85,7 +92,7 @@ pub struct ResolvedEvaluation {
     /// Decisive policy path, when the evaluation named one.
     pub matched_policy: Option<String>,
     /// Pending or resolving approval id, when any.
-    pub approval_id: Option<String>,
+    pub approval_id: Option<ApprovalId>,
     /// Machine-readable path taken.
     pub outcome: ResolutionOutcome,
 }
@@ -110,27 +117,35 @@ pub fn resolve(
         };
     }
 
-    let fingerprint = sql_fingerprint(request.sql);
+    // Both identities, computed locally from trusted inputs (dialect comes
+    // from the evaluation call, SQL from the request): a compromised
+    // provider can never weaken the binding because providers never mint
+    // identities, only verdicts under caller-stored bindings.
+    let shape = sql_fingerprint(request.sql);
+    let exact = exact_request_digest(request.dialect, request.sql);
     let scope = scope_of(request.context);
 
-    // Retry path: a live grant with matching fingerprint and scope resolves
-    // without contacting the provider (single-approval retry). Unknown,
-    // mismatched, or waiting ids fall through (waiting stays pending on
-    // the same id; anything else proceeds as a fresh request).
+    // Retry path: a live grant with matching EXACT digest and scope
+    // resolves without contacting the provider (single-approval retry).
+    // Literal changes alter the digest, so the same token cannot authorize
+    // them. Unknown, mismatched, or waiting ids fall through (waiting stays
+    // pending on the same id; anything else proceeds as a fresh request).
     if let Some(id) = request.approval_id {
-        match retry_outcome(request, store, id, &fingerprint, &scope) {
+        match retry_outcome(request, store, id, &exact, &scope) {
             Retry::Settled(resolved) => return resolved,
             Retry::Pending(resolved) => return resolved,
             Retry::Fresh => {}
         }
     }
 
-    // Session path: a live session-scoped grant for this fingerprint and
-    // scope authorizes without contacting the provider.
+    // Session path: a live session-scoped grant for this query SHAPE and
+    // scope authorizes without contacting the provider. Shape matching is
+    // explicitly broader than token matching (literal variants share a
+    // session grant by frozen design); scope dimensions still bind fully.
     if let Some(session_id) = &request.context.session_id {
         // Clone the id out first: `store` is borrowed mutably below.
         let session_grant = store
-            .find_session_grant(session_id, &fingerprint, &scope, request.now_ms)
+            .find_session_grant(session_id, &shape, &scope, request.now_ms)
             .map(|grant| grant.id.clone());
         if let Some(id) = session_grant {
             return granted(request, &id);
@@ -150,7 +165,7 @@ pub fn resolve(
     };
 
     let approval_request = ApprovalRequest {
-        fingerprint: fingerprint.clone(),
+        fingerprint: shape.clone(),
         scope: scope.clone(),
         reason_code: evaluation.reason_code,
         message: evaluation.message.clone(),
@@ -163,7 +178,8 @@ pub fn resolve(
         Ok(response) => {
             let stored = StoredGrant {
                 id: response.id.clone(),
-                fingerprint,
+                shape: shape.clone(),
+                exact,
                 scope,
                 status: match response.decision {
                     ProviderDecision::Approved => GrantStatus::Approved,
@@ -183,17 +199,17 @@ pub fn resolve(
                 ProviderDecision::Approved => ResolvedEvaluation {
                     decision: Decision::Allow,
                     reason_code: ReasonCode::ApprovalGranted,
-                    message: format!("approved via approval {}", response.id),
+                    message: format!("approved via approval {}", response.id.as_str()),
                     matched_policy: evaluation.matched_policy.clone(),
-                    approval_id: Some(response.id),
+                    approval_id: Some(response.id.clone()),
                     outcome: ResolutionOutcome::ProviderApproved,
                 },
                 ProviderDecision::Denied => ResolvedEvaluation {
                     decision: Decision::Deny,
                     reason_code: ReasonCode::ApprovalDenied,
-                    message: format!("denied via approval {}", response.id),
+                    message: format!("denied via approval {}", response.id.as_str()),
                     matched_policy: evaluation.matched_policy.clone(),
-                    approval_id: Some(response.id),
+                    approval_id: Some(response.id.clone()),
                     outcome: ResolutionOutcome::ProviderDenied,
                 },
                 ProviderDecision::Waiting => ResolvedEvaluation {
@@ -201,7 +217,7 @@ pub fn resolve(
                     reason_code: evaluation.reason_code,
                     message: evaluation.message.clone(),
                     matched_policy: evaluation.matched_policy.clone(),
-                    approval_id: Some(response.id),
+                    approval_id: Some(response.id.clone()),
                     outcome: ResolutionOutcome::ProviderWaiting,
                 },
             }
@@ -253,16 +269,18 @@ fn retry_outcome(
     request: &ResolveRequest<'_>,
     store: &dyn ApprovalStore,
     id: &str,
-    fingerprint: &str,
+    exact: &ExactRequestDigest,
     scope: &ApprovalScope,
 ) -> Retry {
     let evaluation = request.evaluation;
     let Some(grant) = store.get(id) else {
         return Retry::Fresh;
     };
-    if grant.fingerprint != fingerprint || !grant.scope.matches(scope) {
-        // Token for a different request: ignore it and proceed as fresh
-        // (the reference mints a new approval row in this case).
+    // Exact-request binding: any literal (or dialect, or scope) change
+    // alters the digest or scope, so the token cannot be reused for it.
+    // The reference mints a new approval row in this case; we proceed as
+    // a fresh request the same way.
+    if grant.exact != *exact || !grant.scope.matches(scope) {
         return Retry::Fresh;
     }
     if request.now_ms >= grant.expires_at_ms {
@@ -273,18 +291,18 @@ fn retry_outcome(
             reason_code: ReasonCode::ApprovalDenied,
             message: format!("denied via approval {id}"),
             matched_policy: evaluation.matched_policy.clone(),
-            approval_id: Some(id.to_owned()),
+            approval_id: Some(ApprovalId::new(id.to_owned())),
             outcome: ResolutionOutcome::ProviderDenied,
         });
     }
     match grant.status {
-        GrantStatus::Approved => Retry::Settled(granted(request, id)),
+        GrantStatus::Approved => Retry::Settled(granted(request, &ApprovalId::new(id.to_owned()))),
         GrantStatus::Denied => Retry::Settled(ResolvedEvaluation {
             decision: Decision::Deny,
             reason_code: ReasonCode::ApprovalDenied,
             message: format!("denied via approval {id}"),
             matched_policy: evaluation.matched_policy.clone(),
-            approval_id: Some(id.to_owned()),
+            approval_id: Some(ApprovalId::new(id.to_owned())),
             outcome: ResolutionOutcome::ProviderDenied,
         }),
         GrantStatus::Waiting => Retry::Pending(ResolvedEvaluation {
@@ -292,19 +310,19 @@ fn retry_outcome(
             reason_code: evaluation.reason_code,
             message: evaluation.message.clone(),
             matched_policy: evaluation.matched_policy.clone(),
-            approval_id: Some(id.to_owned()),
+            approval_id: Some(ApprovalId::new(id.to_owned())),
             outcome: ResolutionOutcome::ProviderWaiting,
         }),
     }
 }
 
-fn granted(request: &ResolveRequest<'_>, id: &str) -> ResolvedEvaluation {
+fn granted(request: &ResolveRequest<'_>, id: &ApprovalId) -> ResolvedEvaluation {
     ResolvedEvaluation {
         decision: Decision::Allow,
         reason_code: ReasonCode::ApprovalGranted,
         message: format!("approved via approval {id}"),
         matched_policy: request.evaluation.matched_policy.clone(),
-        approval_id: Some(id.to_owned()),
+        approval_id: Some(id.clone()),
         outcome: ResolutionOutcome::ExistingGrant,
     }
 }

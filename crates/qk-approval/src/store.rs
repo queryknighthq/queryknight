@@ -6,8 +6,9 @@
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
-use qk_core::ReasonCode;
+use qk_core::{ExactRequestDigest, QueryShapeFingerprint, ReasonCode};
 
+use crate::id::ApprovalId;
 use crate::scope::{ApprovalScope, DecisionSource, Scope};
 
 /// Stored approval state. `Expired` is computed at match time, never
@@ -23,12 +24,20 @@ pub enum GrantStatus {
 }
 
 /// One stored approval row.
+///
+/// Every grant carries both identities: `exact` binds approval-id retries
+/// to the precise request bytes, while `shape` serves explicitly
+/// shape-scoped session grants (and compatibility display). Storing both
+/// is required because shape cannot be derived back from a one-way exact
+/// digest when a waiting grant is later upgraded to session scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredGrant {
     /// Approval id (provider-assigned or generated).
-    pub id: String,
-    /// SQL fingerprint this grant binds to.
-    pub fingerprint: String,
+    pub id: ApprovalId,
+    /// Normalized query-shape identity (compat + session-shape binding).
+    pub shape: QueryShapeFingerprint,
+    /// Exact request identity (approval-token binding).
+    pub exact: ExactRequestDigest,
     /// Scope the grant binds to.
     pub scope: ApprovalScope,
     /// Current state.
@@ -89,12 +98,12 @@ pub trait ApprovalStore {
         source: DecisionSource,
         now_ms: u64,
     ) -> Result<(), DecideError>;
-    /// Find a live session-scoped approval matching session, fingerprint,
+    /// Find a live session-scoped approval matching session, query shape,
     /// and full scope. Expired grants never match.
     fn find_session_grant(
         &self,
         session_id: &str,
-        fingerprint: &str,
+        shape: &QueryShapeFingerprint,
         scope: &ApprovalScope,
         now_ms: u64,
     ) -> Option<&StoredGrant>;
@@ -121,7 +130,7 @@ impl InMemoryApprovalStore {
 
 impl ApprovalStore for InMemoryApprovalStore {
     fn insert(&mut self, grant: StoredGrant) {
-        self.grants.insert(grant.id.clone(), grant);
+        self.grants.insert(grant.id.as_str().to_owned(), grant);
     }
 
     fn get(&self, id: &str) -> Option<&StoredGrant> {
@@ -155,14 +164,14 @@ impl ApprovalStore for InMemoryApprovalStore {
     fn find_session_grant(
         &self,
         session_id: &str,
-        fingerprint: &str,
+        shape: &QueryShapeFingerprint,
         scope: &ApprovalScope,
         now_ms: u64,
     ) -> Option<&StoredGrant> {
         self.grants.values().find(|grant| {
             grant.status == GrantStatus::Approved
                 && grant.reuse == Scope::Session
-                && grant.fingerprint == fingerprint
+                && grant.shape == *shape
                 && grant.scope.session_id.as_deref() == Some(session_id)
                 && grant.scope.matches(scope)
                 && Self::live(grant, now_ms)
@@ -173,8 +182,10 @@ impl ApprovalStore for InMemoryApprovalStore {
 #[cfg(test)]
 mod tests {
     use super::{ApprovalStore, DecideError, GrantStatus, InMemoryApprovalStore, StoredGrant};
+    use crate::id::ApprovalId;
     use crate::scope::{ApprovalScope, DecisionSource, Scope};
-    use qk_core::ReasonCode;
+    use qk_core::{exact_request_digest, sql_fingerprint, ReasonCode};
+    use qk_sql::SqlDialect;
 
     fn scope() -> ApprovalScope {
         ApprovalScope {
@@ -187,10 +198,19 @@ mod tests {
         }
     }
 
+    fn shape() -> qk_core::QueryShapeFingerprint {
+        qk_core::sql_fingerprint("SELECT 1")
+    }
+
+    fn other_shape() -> qk_core::QueryShapeFingerprint {
+        qk_core::sql_fingerprint("SELECT id FROM users")
+    }
+
     fn grant() -> StoredGrant {
         StoredGrant {
-            id: "qka-1".to_owned(),
-            fingerprint: "fp".to_owned(),
+            id: ApprovalId::new("qka-1".to_owned()),
+            shape: sql_fingerprint("SELECT 1"),
+            exact: exact_request_digest(SqlDialect::PostgreSql, "SELECT 1"),
             scope: scope(),
             status: GrantStatus::Waiting,
             reuse: Scope::Once,
@@ -262,22 +282,22 @@ mod tests {
         approved.reuse = Scope::Session;
         store.insert(approved);
         assert!(store
-            .find_session_grant("s1", "fp", &scope(), 999_999)
+            .find_session_grant("s1", &shape(), &scope(), 999_999)
             .is_some());
         // Wrong session, wrong fingerprint, expired, or Once reuse: no match.
         assert!(store
-            .find_session_grant("s2", "fp", &scope(), 999_999)
+            .find_session_grant("s2", &shape(), &scope(), 999_999)
             .is_none());
         assert!(store
-            .find_session_grant("s1", "other", &scope(), 999_999)
+            .find_session_grant("s1", &other_shape(), &scope(), 999_999)
             .is_none());
         assert!(store
-            .find_session_grant("s1", "fp", &scope(), 1_000_000)
+            .find_session_grant("s1", &shape(), &scope(), 1_000_000)
             .is_none());
         let mut other_scope = scope();
         other_scope.database = "other".to_owned();
         assert!(store
-            .find_session_grant("s1", "fp", &other_scope, 999_999)
+            .find_session_grant("s1", &shape(), &other_scope, 999_999)
             .is_none());
     }
 }

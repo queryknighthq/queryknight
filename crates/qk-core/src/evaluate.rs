@@ -780,6 +780,7 @@ mod tests {
             database: Some("main".to_owned()),
             agent_id: None,
             tool: None,
+            session_id: None,
         }
     }
 

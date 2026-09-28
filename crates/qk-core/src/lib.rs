@@ -18,7 +18,9 @@ pub use context::ExecutionContext;
 pub use decision::{Decision, ReasonCode};
 pub use error::PolicyLoadError;
 pub use evaluate::{evaluate, EvaluateOptions, EvaluationRequest, EvaluationResult};
-pub use fingerprint::{normalize_sql, sql_fingerprint};
+pub use fingerprint::{
+    exact_request_digest, normalize_sql, sql_fingerprint, ExactRequestDigest, QueryShapeFingerprint,
+};
 pub use glob::{check_glob, glob_match};
 /// Policy-file verdict type (config level), aliased to avoid clashing with
 /// the evaluation [`Decision`].

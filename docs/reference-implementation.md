@@ -312,6 +312,23 @@ No `describe.skip/it.skip/todo/xfail` literals. Gating is `test.skipIf(!LIVE)` w
   `call` is known); `GRANT` under the standard policy reaches
   `DEFAULT_DENY` (no rule names it).
 
+## Fingerprint audit (identity-hardening phase, probed 2026-09-28)
+
+`normalizeSql`/`sqlFingerprint` (`packages/core/src/fingerprint.ts`) are a
+single global algorithm with no dialect input: single-quoted spans collapse
+(only `''` escapes; backslash is literal), double-quoted spans collapse
+(treated as strings, never identifiers), ASCII bare numbers collapse
+(`$1` -> `$?`, `1.5` -> `?.?`, `-3` -> `-?`, while `0x10` survives),
+whitespace runs collapse with trim and lowercase. Comments, `?`
+placeholders, backticks, and `$n` prefixes are NOT special. The
+fingerprint is the first 16 hex characters of SHA-256 over the normalized
+form (64-bit truncation). It appears in `QueryEvent.sqlFingerprint`,
+approval rows (`fingerprint` column), the session-allow key
+`(session_id, fingerprint)`, the `/allows` check, MCP approval retry
+matching, and audit/OCSF (`qk_fingerprint`) output. Literal-only variants
+(`id = 42` vs `id = 43`) intentionally share identity: session-shape
+grants approve a statement shape once per session.
+
 ## Approval lifecycle re-audit (approval-layer phase, verified)
 
 - `RequireApproval` is produced only by `evaluatePolicy()` (sensitive

@@ -20,11 +20,13 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod id;
 pub mod provider;
 pub mod resolve;
 pub mod scope;
 pub mod store;
 
+pub use id::ApprovalId;
 pub use provider::{
     ApprovalIdGenerator, ApprovalProvider, ApprovalRequest, CountingIdGenerator,
     DenyByDefaultProvider, ErrorProvider, ProviderDecision, ProviderError, ProviderResponse,

@@ -53,6 +53,7 @@ fn resolve_approval(
     approval: &str,
     evaluation: &qk_core::EvaluationResult,
     context: &qk_core::ExecutionContext,
+    dialect: qk_sql::SqlDialect,
     sql: &str,
 ) -> (String, String) {
     use qk_approval::{
@@ -78,6 +79,7 @@ fn resolve_approval(
         &qk_approval::ResolveRequest {
             evaluation,
             context,
+            dialect,
             sql,
             approval_id: None,
             ttl_ms: DEFAULT_APPROVAL_TTL_MS,
@@ -165,6 +167,7 @@ fn load_policy(case: &serde_json::Value, file: &str) -> PolicyFile {
 struct Evaluated {
     evaluation: qk_core::EvaluationResult,
     context: qk_core::ExecutionContext,
+    dialect: qk_sql::SqlDialect,
     sql: String,
     approval: String,
 }
@@ -230,6 +233,7 @@ fn rust_evaluate(file: &str, case: &serde_json::Value) -> Evaluated {
     );
     Evaluated {
         evaluation: result,
+        dialect,
         context,
         sql,
         approval,
@@ -266,6 +270,7 @@ fn evaluator_parity_with_frozen_fixtures() {
                 &got.approval,
                 &got.evaluation,
                 &got.context,
+                got.dialect,
                 &got.sql,
             );
             if let Some((want_decision, want_reason)) = divergent(&name) {
@@ -374,6 +379,7 @@ fn differential_against_typescript_oracle() {
             &got.approval,
             &got.evaluation,
             &got.context,
+            got.dialect,
             &got.sql,
         );
         assert_eq!(decision, ts_decision, "{file}::{name} decision vs oracle");

@@ -24,6 +24,14 @@ impl Scope {
         }
     }
 
+    /// Session scope means shape scope: the grant binds the normalized
+    /// query shape (literal variants share it) rather than exact request
+    /// bytes. `Once` always binds exact bytes.
+    #[must_use]
+    pub fn is_shape_scoped(&self) -> bool {
+        matches!(self, Self::Session)
+    }
+
     /// Parse a wire name; anything else is rejected (never defaulted).
     pub fn parse(name: &str) -> Option<Self> {
         match name {
