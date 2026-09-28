@@ -28,8 +28,15 @@ pub enum SqlAnalysisError {
         /// 1-based column, when reported.
         column: Option<usize>,
     },
-    /// Internal analysis failure (parser thread spawn failure, parser panic).
-    /// Fail-closed: the input is never treated as analyzed.
+    /// Input exceeds the structural complexity bound (parser recursion
+    /// limit). Machine-distinguishable from [`Self::ParseError`]: later
+    /// policy/audit layers map this to its own stable reason code.
+    ComplexityLimitExceeded {
+        /// The enforced limit ([`crate::SQL_PARSER_RECURSION_LIMIT`]).
+        limit: usize,
+    },
+    /// Internal analysis failure (e.g. a parser panic caught at the
+    /// boundary). Fail-closed: the input is never treated as analyzed.
     AnalysisError {
         /// Stable QueryKnight-owned detail; never parser prose.
         message: String,
@@ -48,6 +55,9 @@ impl Display for SqlAnalysisError {
                 f,
                 "SQL input of {bytes} bytes exceeds the limit of {max_bytes} bytes"
             ),
+            Self::ComplexityLimitExceeded { limit } => {
+                write!(f, "SQL complexity exceeds the analysis limit ({limit})")
+            }
             Self::AnalysisError { message } => {
                 write!(f, "SQL analysis failed: {message}")
             }

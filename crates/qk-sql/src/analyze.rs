@@ -24,7 +24,7 @@ use crate::model::{
     ColumnName, ColumnRef, Identifier, LimitValue, OpCategory, Operation, QueryAnalysis,
     RiskSignal, StatementAnalysis, TableRef,
 };
-use crate::{MAX_SQL_BYTES, MAX_WALK_DEPTH};
+use crate::{AnalysisCompleteness, MAX_SQL_BYTES, MAX_WALK_DEPTH, SQL_PARSER_RECURSION_LIMIT};
 
 /// Analysis input bounds. `Default` carries the frozen [`MAX_SQL_BYTES`].
 #[derive(Debug, Clone, Copy)]
@@ -61,28 +61,34 @@ pub fn analyze_with_options(
             max_bytes: options.max_bytes,
         });
     }
-    let owned = sql.to_owned();
-    let handle = std::thread::Builder::new()
-        .name("qk-sql-analyze".to_owned())
-        .stack_size(ANALYZE_STACK_BYTES)
-        .spawn(move || analyze_guarded_inner(dialect, &owned))
-        .map_err(|e| SqlAnalysisError::AnalysisError {
-            message: format!("analysis thread spawn failed: {e}"),
-        })?;
-    // A parser or walker panic becomes AnalysisError. Deep ASTs are built,
-    // walked, and dropped on the guarded thread: dropping a pathological
-    // tree on a small caller stack would itself overflow.
-    let inner = match handle.join() {
-        Ok(inner) => inner,
-        Err(_) => {
-            return Err(SqlAnalysisError::AnalysisError {
+    // Execution guard: the whole pipeline runs on a grown stack segment.
+    // `maybe_grow` is insufficient here on purpose: it switches segments at
+    // most once, only when the red zone is already tripped, so a deep drop
+    // starting with ample stack still overflows mid-destruction. An
+    // unconditional `grow` is the honest primitive: sized from measurement
+    // (~80-130 bytes per level; 1 MiB worst case ~500k levels needs ~65 MB;
+    // 128 MiB carries ~2x margin, freed on return). Panics inside become
+    // AnalysisError; the catch sits inside the segment so unwinding never
+    // crosses the stack boundary.
+    stacker::grow(GROWTH_BYTES, || {
+        std::panic::catch_unwind(|| analyze_inline(dialect, sql)).unwrap_or_else(|_| {
+            Err(SqlAnalysisError::AnalysisError {
                 message: "analysis panicked on input; failing closed".to_owned(),
-            });
-        }
-    }?;
-    let mut analyses = Vec::with_capacity(inner.len());
+            })
+        })
+    })
+}
+
+/// Inner pipeline: parse, walk, assemble. Runs inside the grown segment.
+fn analyze_inline(dialect: SqlDialect, sql: &str) -> Result<QueryAnalysis, SqlAnalysisError> {
+    let statements = parse_bounded(dialect, sql)?;
+    if statements.is_empty() {
+        return Err(SqlAnalysisError::EmptyQuery);
+    }
+    let mut analyses = Vec::with_capacity(statements.len());
     let mut truncated = false;
-    for (analysis, was_truncated) in inner {
+    for stmt in &statements {
+        let (analysis, was_truncated) = analyze_statement(stmt);
         truncated |= was_truncated;
         analyses.push(analysis);
     }
@@ -131,12 +137,21 @@ pub fn analyze_with_options(
             signals.insert(RiskSignal::MutationWithoutWhere);
         }
     }
-    let read_only = operations
+    // A truncated walk is never confidently read-only: unvisited remainder
+    // may contain anything. The evaluator distinguishes via `completeness`.
+    let mut read_only = operations
         .iter()
         .all(|op| op.category() == OpCategory::Read);
+    let completeness = if truncated {
+        read_only = false;
+        AnalysisCompleteness::DepthTruncated
+    } else {
+        AnalysisCompleteness::Complete
+    };
 
     Ok(QueryAnalysis {
         dialect,
+        completeness,
         statements: analyses,
         tables: tables.into_iter().collect(),
         mutated_tables: mutated.into_iter().collect(),
@@ -147,42 +162,46 @@ pub fn analyze_with_options(
     })
 }
 
-/// Analysis stack guard.
-///
-/// Two measured facts drive this design:
-///
-/// 1. Expression chains thousands deep abort the parsing thread with an
-///    uncatchable stack overflow, and the parser's own recursion counter
-///    does not cover them (an 80 KiB arithmetic chain aborts a 2 MiB thread
-///    while the reference implementation fails closed with `parsed: false`).
-/// 2. A successfully parsed pathological tree is itself deeply recursive:
-///    walking is depth-capped, but *dropping* the tree recurses with the
-///    tree's own depth and would overflow a small caller stack.
-///
-/// Hence the whole parse-walk-drop pipeline runs on a dedicated thread with
-/// a stack sized beyond the worst case expressible in [`MAX_SQL_BYTES`],
-/// keeping this API synchronous and abort-free. Only flat, owned
-/// [`QueryAnalysis`] values cross back to the caller.
-const ANALYZE_STACK_BYTES: usize = 512 * 1024 * 1024;
+/// Grown execution segment for the whole pipeline. Sizing: measured
+/// ~80-130 bytes per AST level on destruction; the 1 MiB input worst case
+/// (~500k levels) needs ~65 MB; 128 MiB carries ~2x margin and is freed on
+/// return. Transient per call, not reserved.
+const GROWTH_BYTES: usize = 128 * 1024 * 1024;
 
-fn analyze_guarded_inner(
-    dialect: SqlDialect,
-    sql: &str,
-) -> Result<Vec<(StatementAnalysis, bool)>, SqlAnalysisError> {
-    let statements = match dialect {
-        SqlDialect::PostgreSql => Parser::parse_sql(&PostgreSqlDialect {}, sql),
-        SqlDialect::MySql => Parser::parse_sql(&MySqlDialect {}, sql),
-        SqlDialect::Sqlite => Parser::parse_sql(&SQLiteDialect {}, sql),
+/// Parse with the explicit QueryKnight recursion limit. Left-associative
+/// operator chains bypass this counter (the parser handles them
+/// iteratively); their trees are bounded by [`MAX_SQL_BYTES`] and destroyed
+/// via the guarded drop above.
+fn parse_bounded(dialect: SqlDialect, sql: &str) -> Result<Vec<Statement>, SqlAnalysisError> {
+    let mut parser = match dialect {
+        SqlDialect::PostgreSql => {
+            Parser::new(&PostgreSqlDialect {}).with_recursion_limit(SQL_PARSER_RECURSION_LIMIT)
+        }
+        SqlDialect::MySql => {
+            Parser::new(&MySqlDialect {}).with_recursion_limit(SQL_PARSER_RECURSION_LIMIT)
+        }
+        SqlDialect::Sqlite => {
+            Parser::new(&SQLiteDialect {}).with_recursion_limit(SQL_PARSER_RECURSION_LIMIT)
+        }
     }
+    .try_with_sql(sql)
     .map_err(|e| SqlAnalysisError::ParseError {
         message: truncate_diagnostic(&e.to_string()),
         line: None,
         column: None,
     })?;
-    if statements.is_empty() {
-        return Err(SqlAnalysisError::EmptyQuery);
-    }
-    Ok(statements.iter().map(analyze_statement).collect())
+    parser.parse_statements().map_err(|e| match e {
+        sqlparser::parser::ParserError::RecursionLimitExceeded => {
+            SqlAnalysisError::ComplexityLimitExceeded {
+                limit: SQL_PARSER_RECURSION_LIMIT,
+            }
+        }
+        other => SqlAnalysisError::ParseError {
+            message: truncate_diagnostic(&other.to_string()),
+            line: None,
+            column: None,
+        },
+    })
 }
 
 fn analyze_statement(stmt: &Statement) -> (StatementAnalysis, bool) {

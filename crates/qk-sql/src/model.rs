@@ -246,11 +246,26 @@ pub struct StatementAnalysis {
     pub nested_operations: Vec<Operation>,
 }
 
+/// Whether the whole AST was visited. A truncated analysis must never be
+/// mistaken for a complete inspection: `read_only` is forced to false and
+/// [`RiskSignal::DepthTruncated`] is set whenever completeness is not
+/// [`AnalysisCompleteness::Complete`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisCompleteness {
+    /// Every node visited; `read_only` is a confident claim.
+    Complete,
+    /// Traversal stopped at [`crate::MAX_WALK_DEPTH`]; unvisited remainder
+    /// may contain anything, including mutations.
+    DepthTruncated,
+}
+
 /// Normalized whole-input analysis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryAnalysis {
     /// Dialect the input was parsed with.
     pub dialect: SqlDialect,
+    /// Inspection completeness (see [`AnalysisCompleteness`]).
+    pub completeness: AnalysisCompleteness,
     /// Per-statement analyses in source order.
     pub statements: Vec<StatementAnalysis>,
     /// Union of all statement tables. Sorted, deduplicated.

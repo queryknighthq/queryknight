@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 sqlparser = "0.63"
+stacker = "0.1"
 
 [dev-dependencies]
 serde_json = "1"

@@ -56,24 +56,63 @@ future evaluator (INV-003).
 
 ## Recursion and resource behavior (security-relevant)
 
-- Subquery/CTE nesting: `sqlparser-rs` enforces its own recursion counter
-  and returns a typed error past it (measured: 50-deep derived tables ->
-  `recursion limit exceeded`). The walker additionally caps at
-  `MAX_WALK_DEPTH = 64` and sets `RiskSignal::DepthTruncated`.
-- Expression chains: the parser's counter does NOT cover them. An 80 KiB
-  `SELECT 1 + 1 + ...` (20k terms) aborts a 2 MiB thread with an
-  uncatchable stack overflow, while the reference fails closed
-  (`parsed:false`, ~655 ms; Rust parses the same input in ~57 ms once
-  guarded). Mitigation in place: the whole parse-walk-drop pipeline runs
-  on a dedicated 512 MiB-stack thread (`ANALYZE_STACK_BYTES`), keeping
-  `analyze()` synchronous and abort-free for everything expressible in the
-  1 MiB input budget. A second, subtler find: dropping a pathological AST
-  recurses with tree depth, so the drop also happens on the guarded
-  thread. Residual risk (a >512 MiB frame need inside 1 MiB of input) is
-  considered unreachable; revisit if corpus evidence says otherwise.
+- Parser nesting (subqueries, CTEs, parenthesized expressions,
+  right-associative operators) is bounded by an explicit
+  `SQL_PARSER_RECURSION_LIMIT = 50` (upstream default, kept deliberately).
+  Past it the parser returns `RecursionLimitExceeded`, mapped to the
+  QueryKnight-owned `SqlAnalysisError::ComplexityLimitExceeded` (stable
+  reason-code material, distinct from `ParseError`). Measured: 300-deep
+  derived tables, 20k-deep parentheses, 8k-deep function nests, 1500-deep
+  subquery chains all terminate typed. Near-limit nesting can surface as a
+  plain `ParseError` instead (parser backtracking swallows the limit error
+  into a confusing downstream diagnostic); both are typed fail-closed
+  errors, so the distinction is diagnostic only.
+- Expression chains: the parser counter does NOT cover left-associative
+  operator chains (handled iteratively). An 80 KiB `SELECT 1 + 1 + ...`
+  (20k terms) parses in ~57 ms (reference: fails closed, ~655 ms). The
+  resulting tree is deep but the QueryKnight walk caps at
+  `MAX_WALK_DEPTH = 64`, surfacing `RiskSignal::DepthTruncated`,
+  `AnalysisCompleteness::DepthTruncated`, and forcing `read_only = false`.
+- AST destruction: dropping a deep tree recurses with tree depth
+  (measured: dropping a 25k chain aborts a bare 2 MiB thread; 15k
+  survives). The whole pipeline therefore runs inside one transient
+  `stacker::grow` segment (128 MiB, sized from the measured ~80-130
+  bytes/level against the 1 MiB worst case with ~2x margin, freed on
+  return; ~21 us to establish). `maybe_grow` was tried and rejected: it
+  switches segments at most once and only when the red zone is already
+  tripped, so a deep drop starting with ample stack still overflows
+  mid-destruction. No per-request threads, no giant reserved stacks.
+  `recursive-protection` (default-on; `recursive` + `stacker` verified in
+  `Cargo.lock` and covered by a build test) already grows the stack at
+  instrumented parser points; panics inside the segment become
+  `AnalysisError` via an inner `catch_unwind`, never propagated.
+- No `mem::forget`, no leaked ASTs, no Tokio in this layer.
 - Input budget: `MAX_SQL_BYTES = 1_000_000` enforced at this boundary,
   mirroring reference `DEFAULT_MAX_SQL_BYTES`. The 64 KiB / 8000-token
-  heuristic is a *result* budget owned by the future execution layer.
+  heuristic is a *result* budget owned by the future execution layer. A
+  <=64 KiB hostile battery (16k operator chain, 20k parens, 1500
+  subqueries, 8k functions, 1200 CASEs, mixed combo) plus 24 concurrent
+  hostile analyses on 2 MiB stacks all terminate with typed results.
+- `PARSER_RECURSION_LIMIT` (50) vs `ANALYZER_DEPTH_LIMIT` (64): different
+  units on purpose. The parser counts its own recursion steps (one nesting
+  level can consume several, and chains consume none); the analyzer counts
+  AST levels visited. The walker cap is defense in depth for shapes the
+  parser counter cannot see.
+
+## Syntax is not database validity
+
+`sqlparser-rs` performs syntactic parsing only and accepts constructs the
+real engines reject. Known example: `SELECT FROM WHERE` analyzes as
+`select` with table `"WHERE"` (reserved word as identifier). Pinned by
+regression test (`keyword_as_table_leniency_documented`).
+
+Consequences, stated plainly:
+
+- Parser acceptance does NOT assert PostgreSQL/MySQL/SQLite validity.
+- Actual database execution remains authoritative for semantic validity.
+- Policy logic must never treat parser acceptance alone as evidence of
+  safety; unknown and unsupported shapes stay non-read (fail-closed
+  direction for the future evaluator).
 
 ## Known walker gaps (syntactic, documented)
 

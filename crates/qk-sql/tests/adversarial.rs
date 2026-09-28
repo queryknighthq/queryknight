@@ -142,20 +142,22 @@ fn malformed_variants_are_typed_errors() {
 
 #[test]
 fn deep_nesting_fails_closed_without_panic() {
-    // sqlparser-rs enforces its own recursion limit; the walker additionally
-    // caps depth. Either way: typed error, no panic, no hang.
+    // Parser nesting shapes trip the explicit recursion limit with a
+    // machine-distinguishable error; no panic, no hang.
     let mut sql = String::from("SELECT 1");
     for i in 0..300 {
         sql = format!("SELECT * FROM ({sql}) t{i}");
     }
     assert!(matches!(
         analyze(&sql, "postgres"),
-        Err(SqlAnalysisError::ParseError { .. })
+        Err(SqlAnalysisError::ComplexityLimitExceeded { .. })
     ));
 }
 
 #[test]
 fn large_but_bounded_input_parses() {
+    // Operator chains bypass the parser counter; the capped walk truncates
+    // explicitly instead of claiming a complete inspection.
     let padding = "SELECT 1".to_owned() + &" + 1".repeat(20_000);
     assert!(padding.len() < qk_sql::MAX_SQL_BYTES);
     let a = match analyze(&padding, "postgres") {
@@ -163,6 +165,8 @@ fn large_but_bounded_input_parses() {
         Err(e) => panic!("bounded input must parse: {e}"),
     };
     assert_eq!(a.statements[0].operation, Operation::Select);
+    assert_eq!(a.completeness, qk_sql::AnalysisCompleteness::DepthTruncated);
+    assert!(!a.read_only);
 }
 
 #[test]
