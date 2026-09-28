@@ -1,6 +1,11 @@
 //! Compatibility harness: runs `tests/compatibility/*.cases.json` against
-//! qk-core. Commit 1 executes validation and glob fixtures; evaluation and
-//! contract fixtures unlock with later commits (qk-sql, daemon, MCP).
+//! qk-core. Commit 1 executes validation, hardening, and glob fixtures;
+//! evaluation and contract fixtures unlock with later commits (qk-sql,
+//! daemon, MCP).
+//!
+//! `policy-hardening.cases.json` is Rust-only: duplicate-key wording is a
+//! QueryKnight-owned hardening message with no oracle counterpart. Every
+//! other fixture here must also pass the TypeScript reference runner.
 
 use std::fs;
 use std::path::PathBuf;
@@ -28,15 +33,12 @@ fn str_field(case: &serde_json::Value, key: &str) -> String {
         .to_owned()
 }
 
-#[test]
-fn policy_validation_fixtures() {
+fn run_validation_file(file: &str) -> u32 {
     let mut pass = 0u32;
-    let mut cases = 0u32;
-    for case in load_cases("policy-validation.cases.json") {
+    for case in load_cases(file) {
         if get(&case, "valid").is_none() {
             continue;
         }
-        cases += 1;
         let name = str_field(&case, "name");
         let yaml = str_field(&case, "policy_yaml");
         let want_valid = get(&case, "valid")
@@ -44,24 +46,38 @@ fn policy_validation_fixtures() {
             .unwrap_or(false);
         match parse_policy(&yaml) {
             Ok(_) => {
-                assert!(want_valid, "case '{name}' expected invalid, parsed valid");
+                assert!(
+                    want_valid,
+                    "{file} case '{name}' expected invalid, parsed valid"
+                );
                 pass += 1;
             }
             Err(e) => {
-                assert!(!want_valid, "case '{name}' expected valid, got: {e}");
+                assert!(!want_valid, "{file} case '{name}' expected valid, got: {e}");
                 let text = e.to_string();
                 if let Some(needle) = get(&case, "error_contains").and_then(|v| v.as_str()) {
                     assert!(
                         text.contains(needle),
-                        "case '{name}': error '{text}' missing '{needle}'"
+                        "{file} case '{name}': error '{text}' missing '{needle}'"
                     );
                 }
                 pass += 1;
             }
         }
     }
-    assert_eq!(cases, 10, "expected 10 validation fixtures");
-    assert_eq!(pass, cases, "all validation fixtures must pass");
+    pass
+}
+
+#[test]
+fn policy_validation_fixtures() {
+    let pass = run_validation_file("policy-validation.cases.json");
+    assert_eq!(pass, 12, "expected 12 shared validation fixtures");
+}
+
+#[test]
+fn policy_hardening_fixtures() {
+    let pass = run_validation_file("policy-hardening.cases.json");
+    assert_eq!(pass, 10, "expected 10 hardening fixtures");
 }
 
 #[test]

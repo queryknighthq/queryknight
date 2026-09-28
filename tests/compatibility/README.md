@@ -16,6 +16,7 @@ Language-neutral black-box fixtures. Every `*.cases.json` entry:
 ```
 
 `policy` may also be inline YAML under `policy_yaml` (validation cases use `policy_yaml` + `valid: false`).
+`policy-hardening.cases.json` is Rust-only: duplicate-key and legacy-bool wording pins QueryKnight-owned hardening messages with no oracle counterpart. All other fixture files must also pass the TypeScript reference runner.
 `approval: missing-provider` = call evaluate with no provider (expect APPROVAL_UNAVAILABLE).
 `mode: observe` asserts the OBSERVED_ downgrade path.
 Runner: `tools/reference-runner/` executes each case against `../queryknight-ts` via Bun with zero modifications to the reference repo.

@@ -40,6 +40,19 @@ pub enum PolicyLoadError {
         /// Comma-separated allowlist, mirrored in the message.
         allowed: String,
     },
+    /// A mapping key appears twice. Duplicates are rejected rather than
+    /// resolved by first-wins or last-wins, so an ambiguous document can
+    /// never silently select the more permissive value.
+    DuplicateKey {
+        /// Validation path of the offending mapping, e.g. `policy.defaults`.
+        path: String,
+        /// Offending key name.
+        key: String,
+        /// 1-based line, when known.
+        line: Option<usize>,
+        /// 1-based column, when known.
+        column: Option<usize>,
+    },
     /// A glob pattern cannot be compiled and must never broaden access.
     InvalidGlob {
         /// Validation path of the offending pattern list.
@@ -89,6 +102,18 @@ impl Display for PolicyLoadError {
                     "{path}: unknown operation '{operation}' (allowed: {allowed})"
                 )
             }
+            Self::DuplicateKey {
+                path,
+                key,
+                line,
+                column,
+            } => {
+                write!(f, "{path}: duplicate mapping key '{key}'")?;
+                match (line, column) {
+                    (Some(l), Some(c)) => write!(f, " at line {l} column {c}"),
+                    _ => Ok(()),
+                }
+            }
             Self::InvalidGlob { path } => write!(
                 f,
                 "{path}: invalid glob pattern (rejected; patterns must never broaden on failure)"
@@ -104,6 +129,27 @@ impl std::error::Error for PolicyLoadError {}
 #[cfg(test)]
 mod tests {
     use super::PolicyLoadError;
+
+    #[test]
+    fn duplicate_message_shape() {
+        let e = PolicyLoadError::DuplicateKey {
+            path: "policy.defaults".to_owned(),
+            key: "decision".to_owned(),
+            line: Some(4),
+            column: Some(3),
+        };
+        assert_eq!(
+            e.to_string(),
+            "policy.defaults: duplicate mapping key 'decision' at line 4 column 3"
+        );
+        let e = PolicyLoadError::DuplicateKey {
+            path: "policy".to_owned(),
+            key: "a".to_owned(),
+            line: None,
+            column: None,
+        };
+        assert_eq!(e.to_string(), "policy: duplicate mapping key 'a'");
+    }
 
     #[test]
     fn messages_keep_contract_shape() {

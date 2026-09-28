@@ -225,13 +225,95 @@ pub fn parse_policy(text: &str) -> Result<PolicyFile> {
         });
     }
     let value: Value = yaml_serde::from_str(text).map_err(|e| {
-        let (line, column) = match e.location() {
-            Some(loc) => (Some(loc.line()), Some(loc.column())),
-            None => (None, None),
-        };
-        PolicyLoadError::InvalidYaml { line, column }
+        let loc = e.location().map(|l| (l.line(), l.column()));
+        duplicate_key_error(&e.to_string(), loc).unwrap_or(match loc {
+            Some((line, column)) => PolicyLoadError::InvalidYaml {
+                line: Some(line),
+                column: Some(column),
+            },
+            None => PolicyLoadError::InvalidYaml {
+                line: None,
+                column: None,
+            },
+        })
     })?;
     validate_policy(&value)
+}
+
+/// Classify a duplicate-mapping-key syntax failure into the QueryKnight-owned
+/// [`PolicyLoadError::DuplicateKey`]. Returns `None` for any other syntax
+/// error (which stays [`PolicyLoadError::InvalidYaml`]) and for unrecognized
+/// message shapes, so a future parser wording change can only make the error
+/// less specific, never accept the document.
+fn duplicate_key_error(
+    message: &str,
+    fallback_pos: Option<(usize, usize)>,
+) -> Option<PolicyLoadError> {
+    if !message.contains("duplicate entry") {
+        return None;
+    }
+    // Observed shapes (yaml_serde, pinned in Cargo.lock):
+    //   `duplicate entry with key "a"`                                   (top level)
+    //   `defaults: duplicate entry with key "decision" at line 2 column 3`
+    //   `allow[0]: duplicate entry with key "operations" at line 2 column 5`
+    // Non-string keys render unquoted: `` with key `true` `` / `with key 1`.
+    let (prefix, rest) = match message.split_once(": duplicate entry with key ") {
+        Some(parts) => (parts.0, parts.1),
+        None => ("", message.strip_prefix("duplicate entry with key ")?),
+    };
+    let (key, tail) = take_key(rest)?;
+    let (mut line, mut column) = scan_position(tail);
+    if line.is_none() {
+        line = fallback_pos.map(|pos| pos.0);
+    }
+    if column.is_none() {
+        column = fallback_pos.map(|pos| pos.1);
+    }
+    Some(PolicyLoadError::DuplicateKey {
+        path: if prefix.is_empty() {
+            "policy".to_owned()
+        } else {
+            format!("policy.{}", prefix.trim())
+        },
+        key,
+        line,
+        column,
+    })
+}
+
+/// Split the rendered key from the remainder of a duplicate-entry message.
+fn take_key(rest: &str) -> Option<(String, &str)> {
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        return Some((quoted[..end].to_owned(), &quoted[end + 1..]));
+    }
+    if let Some(quoted) = rest.strip_prefix('`') {
+        let end = quoted.find('`')?;
+        return Some((quoted[..end].to_owned(), &quoted[end + 1..]));
+    }
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some((rest[..end].to_owned(), &rest[end..]))
+}
+
+/// Scan a ` at line L column C` suffix; returns `(None, None)` when absent.
+fn scan_position(tail: &str) -> (Option<usize>, Option<usize>) {
+    let after_line = tail.find("at line ").map(|i| &tail[i + 8..]);
+    let line = after_line.and_then(take_uint);
+    let after_col = tail.find(" column ").map(|i| &tail[i + 8..]);
+    (line, after_col.and_then(take_uint))
+}
+
+fn take_uint(text: &str) -> Option<usize> {
+    let end = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    if end == 0 {
+        return None;
+    }
+    text[..end].parse().ok()
 }
 
 fn validate_policy(value: &Value) -> Result<PolicyFile> {
@@ -720,7 +802,7 @@ fn validate_optional_limit(map: &Mapping, path: &str) -> Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_policy;
+    use super::{parse_policy, PolicyLoadError};
 
     #[test]
     fn empty_document_is_not_a_mapping() {
@@ -745,6 +827,146 @@ mod tests {
         let err = parse_policy("version: [1\ndefaults: {decision: deny\n")
             .expect_err("broken yaml must fail");
         assert!(err.to_string().starts_with("invalid YAML"), "{err}");
+    }
+
+    fn policy_with(field: &str, value: &str) -> String {
+        format!("version: 1\ndefaults:\n  decision: deny\n  {field}: {value}\n")
+    }
+
+    #[test]
+    fn legacy_bool_words_are_not_booleans() {
+        // Oracle parity (YAML 1.2 core): yes/no/on/off in any case stay strings,
+        // so boolean fields must reject them instead of coercing.
+        for word in [
+            "yes", "Yes", "YES", "no", "No", "NO", "on", "On", "ON", "off", "Off", "OFF",
+        ] {
+            let err = parse_policy(&policy_with("require_limit", word))
+                .expect_err(&format!("{word} must not coerce to boolean"));
+            assert_eq!(
+                err.to_string(),
+                "policy.defaults.require_limit: expected a boolean",
+                "word {word}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_booleans_keep_working() {
+        for (word, want) in [
+            ("true", true),
+            ("True", true),
+            ("TRUE", true),
+            ("false", false),
+            ("False", false),
+            ("FALSE", false),
+        ] {
+            let policy = match parse_policy(&policy_with("require_limit", word)) {
+                Ok(policy) => policy,
+                Err(e) => panic!("{word} must parse as boolean: {e}"),
+            };
+            assert_eq!(policy.defaults.require_limit, want, "word {word}");
+        }
+    }
+
+    #[test]
+    fn legacy_bool_words_stay_strings() {
+        // String-typed fields and mapping keys keep legacy words verbatim.
+        let text = "version: 1\ndefaults:\n  decision: deny\ntests:\n  - name: t\n    sql: SELECT 1\n    expect: deny\n    agent_id: yes\n";
+        let policy = match parse_policy(text) {
+            Ok(policy) => policy,
+            Err(e) => panic!("agent_id yes must stay a string: {e}"),
+        };
+        assert_eq!(policy.tests[0].agent_id.as_deref(), Some("yes"));
+
+        let text = "version: 1\ndefaults:\n  decision: deny\nenvironments:\n  on:\n    databases:\n      main:\n        allow:\n          - operations: [select]\n";
+        let policy = match parse_policy(text) {
+            Ok(policy) => policy,
+            Err(e) => panic!("environment 'on' must stay a string key: {e}"),
+        };
+        assert!(policy.environments.contains_key("on"));
+
+        // Quoted legacy words are strings too, and still rejected as booleans.
+        let err = parse_policy(&policy_with("require_limit", "'yes'"))
+            .expect_err("quoted yes must not coerce");
+        assert!(err.to_string().contains("expected a boolean"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_top_level_key_rejected() {
+        let err = parse_policy("version: 1\ndefaults:\n  decision: deny\n  decision: allow\n")
+            .expect_err("duplicate must fail");
+        assert_eq!(
+            err,
+            PolicyLoadError::DuplicateKey {
+                path: "policy.defaults".to_owned(),
+                key: "decision".to_owned(),
+                line: Some(3),
+                column: Some(3),
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_deep_security_key_rejected() {
+        let text = "version: 1\ndefaults:\n  decision: deny\nenvironments:\n  production:\n    databases:\n      main:\n        allow:\n          - operations: [select]\n        allow:\n          - operations: [drop]\n";
+        let err = parse_policy(text).expect_err("deep duplicate must fail");
+        assert_eq!(
+            err.to_string(),
+            "policy.environments.production.databases.main: duplicate mapping key 'allow' at line 8 column 9"
+        );
+    }
+
+    #[test]
+    fn duplicate_rule_key_rejected() {
+        let text = "version: 1\ndefaults:\n  decision: deny\nenvironments:\n  production:\n    databases:\n      main:\n        allow:\n          - operations: [select]\n            operations: [drop]\n";
+        let err = parse_policy(text).expect_err("rule duplicate must fail");
+        assert!(
+            err.to_string()
+                .contains("duplicate mapping key 'operations'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_flow_and_scalar_keys_rejected() {
+        let err = parse_policy("version: 1\ndefaults: {decision: deny, decision: allow}\n")
+            .expect_err("flow duplicate must fail");
+        assert!(
+            err.to_string().contains("duplicate mapping key 'decision'"),
+            "{err}"
+        );
+        let err = parse_policy("version: 1\nversion: 2\ndefaults:\n  decision: deny\n")
+            .expect_err("top-level duplicate must fail");
+        assert_eq!(
+            err.to_string(),
+            "policy: duplicate mapping key 'version' at line 1 column 1"
+        );
+    }
+
+    #[test]
+    fn duplicate_errors_are_deterministic() {
+        let text = "version: 1\ndefaults:\n  decision: deny\n  decision: allow\n";
+        let first = parse_policy(text).expect_err("must fail");
+        let second = parse_policy(text).expect_err("must fail");
+        assert_eq!(first, second);
+        assert_eq!(first.to_string(), second.to_string());
+    }
+
+    #[test]
+    fn hostile_inputs_fail_without_panic() {
+        let nested = "version: 1\ndefaults:\n  decision: {deny: {deny: {deny: {}}}}\n".to_owned();
+        assert!(parse_policy(&nested).is_err());
+        let deep: String = "a: ".repeat(500) + "1\nversion: 1\n";
+        assert!(parse_policy(&deep).is_err());
+        let tabs = "version: 1\n\tdefaults:\n\t\tdecision: deny\n";
+        assert!(parse_policy(tabs).is_err());
+        let nul = "version: 1\ndefaults:\n  decision: de\0ny\n";
+        assert!(parse_policy(nul).is_err());
+        let big = format!(
+            "version: 1\n# {}\ndefaults:\n  decision: deny\n",
+            "x".repeat(1_000_000)
+        );
+        assert!(parse_policy(&big).is_ok());
     }
 
     #[test]

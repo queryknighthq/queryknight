@@ -61,3 +61,6 @@ INV-019: Timeouts fail closed and never imply cancellation.
 
 INV-020: Default posture is deny.
   `defaultPolicy()` = deny/deny/deny; unknown db scope falls to `DEFAULT_DENY`; legacy unknown SQL production-deny; OpenShell no-SQL traffic allows (not a firewall) but any extracted SQL evaluates normally. Corpus: policy-evaluation.
+
+INV-021: Ambiguous or duplicate policy configuration must fail closed and must never be resolved in favor of a more permissive authorization policy.
+  YAML 1.1 legacy boolean words (yes/no/on/off, any case) are strings per oracle YAML 1.2 core typing and must never coerce in boolean fields; only true/false (+case variants) are booleans. Duplicate mapping keys at any depth are invalid policy (DuplicateKey), never first-wins or last-wins, so `decision: deny` can never be shadowed by a later `decision: allow`. Parser diagnostics stay QueryKnight-owned (position only, never third-party prose); unrecognized ambiguity shapes degrade to InvalidYaml, still invalid. Corpus: policy-hardening (10) + shared legacy-bool validation cases; unit pins for determinism and no-panic on hostile input. This extends INV-007/INV-009: those cover invalid values and unknown fields, but neither pins scalar-typing ambiguity nor key multiplicity, both of which select between two valid meanings rather than rejecting one invalid value.

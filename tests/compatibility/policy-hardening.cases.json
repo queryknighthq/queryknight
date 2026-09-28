@@ -1,0 +1,12 @@
+[
+  {"name": "duplicate defaults decision rejected", "policy_yaml": "version: 1\ndefaults:\n  decision: deny\n  decision: allow\n", "valid": false, "error_contains": "policy.defaults: duplicate mapping key 'decision'"},
+  {"name": "duplicate top-level version rejected", "policy_yaml": "version: 1\nversion: 2\ndefaults:\n  decision: deny\n", "valid": false, "error_contains": "policy: duplicate mapping key 'version'"},
+  {"name": "duplicate nested allow rejected", "policy_yaml": "version: 1\ndefaults:\n  decision: deny\nenvironments:\n  production:\n    databases:\n      main:\n        allow:\n          - operations: [select]\n        allow:\n          - operations: [drop]\n", "valid": false, "error_contains": "duplicate mapping key 'allow'"},
+  {"name": "duplicate rule operations rejected", "policy_yaml": "version: 1\ndefaults:\n  decision: deny\nenvironments:\n  production:\n    databases:\n      main:\n        allow:\n          - operations: [select]\n            operations: [drop]\n", "valid": false, "error_contains": "duplicate mapping key 'operations'"},
+  {"name": "duplicate flow key rejected", "policy_yaml": "version: 1\ndefaults: {decision: deny, decision: allow}\n", "valid": false, "error_contains": "duplicate mapping key 'decision'"},
+  {"name": "duplicate carries line and column", "policy_yaml": "version: 1\ndefaults:\n  decision: deny\n  decision: allow\n", "valid": false, "error_contains": "at line 3 column 3"},
+  {"name": "legacy off word not a boolean", "policy_yaml": "version: 1\ndefaults:\n  decision: deny\n  require_limit: off\n", "valid": false, "error_contains": "expected a boolean"},
+  {"name": "real TRUE boolean still works", "policy_yaml": "version: 1\ndefaults:\n  decision: deny\n  require_limit: TRUE\n", "valid": true},
+  {"name": "legacy word stays a string field", "policy_yaml": "version: 1\ndefaults:\n  decision: deny\ntests:\n  - name: t\n    sql: SELECT 1\n    expect: deny\n    agent_id: yes\n", "valid": true},
+  {"name": "legacy word stays a mapping key", "policy_yaml": "version: 1\ndefaults:\n  decision: deny\nenvironments:\n  on:\n    databases:\n      main:\n        allow:\n          - operations: [select]\n", "valid": true}
+]
