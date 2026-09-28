@@ -117,6 +117,34 @@ impl Display for ReasonCode {
     }
 }
 
+/// Parse a frozen reason-code string. Used when reading persisted rows;
+/// unknown values are rejected (never defaulted) by the caller.
+pub fn parse_reason_code(name: &str) -> Option<ReasonCode> {
+    match name {
+        "DENY_PARSE_ERROR" => Some(ReasonCode::DenyParseError),
+        "DENY_UNKNOWN_STATEMENT" => Some(ReasonCode::DenyUnknownStatement),
+        "SENSITIVE_COLUMN" => Some(ReasonCode::SensitiveColumn),
+        "DENY_RULE" => Some(ReasonCode::DenyRule),
+        "UNBOUNDED_UPDATE" => Some(ReasonCode::UnboundedUpdate),
+        "UNBOUNDED_DELETE" => Some(ReasonCode::UnboundedDelete),
+        "LIMIT_REQUIRED" => Some(ReasonCode::LimitRequired),
+        "LIMIT_EXCEEDED" => Some(ReasonCode::LimitExceeded),
+        "REQUIRE_APPROVAL" => Some(ReasonCode::RequireApproval),
+        "ALLOW_RULE" => Some(ReasonCode::AllowRule),
+        "DEFAULT_ALLOW" => Some(ReasonCode::DefaultAllow),
+        "DEFAULT_APPROVAL" => Some(ReasonCode::DefaultApproval),
+        "DEFAULT_DENY" => Some(ReasonCode::DefaultDeny),
+        "EMPTY_QUERY" => Some(ReasonCode::EmptyQuery),
+        "QUERY_TOO_LARGE" => Some(ReasonCode::QueryTooLarge),
+        "POLICY_ERROR" => Some(ReasonCode::PolicyError),
+        "APPROVAL_UNAVAILABLE" => Some(ReasonCode::ApprovalUnavailable),
+        "APPROVAL_GRANTED" => Some(ReasonCode::ApprovalGranted),
+        "APPROVAL_DENIED" => Some(ReasonCode::ApprovalDenied),
+        "APPROVAL_ERROR" => Some(ReasonCode::ApprovalError),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ReasonCode;

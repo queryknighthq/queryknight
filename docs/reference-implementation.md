@@ -349,6 +349,29 @@ No `describe.skip/it.skip/todo/xfail` literals. Gating is `test.skipIf(!LIVE)` w
   options silently. CLI `inspect` wires no approval provider, so
   approval-gated SQL reports `APPROVAL_UNAVAILABLE`/deny.
 
+## SQLite layer audit (persistence phase, read from source DDL)
+
+- Path `~/.queryknight/queryknight.db`; `new Database(path)` with no
+  flags; exactly one PRAGMA (`journal_mode = WAL`); no `synchronous`,
+  `busy_timeout`, `foreign_keys`, `user_version`, transactions, busy
+  handling, or corruption handling anywhere.
+- Six tables, no indexes, no foreign keys: `connections`, `sessions`,
+  `query_events`, `settings` (created but never read or written),
+  `approvals`, `session_allows`. Tolerant upgrades only via `PRAGMA
+  table_info` checks adding `approvals.schema_ddl`, `approvals.schema_diff`,
+  and `query_events.sql`.
+- IDs: sessions `qks_<4B hex>`, events `qke_<6B hex>`, approvals
+  `qka_<4B hex>`; connections `qkc_<sha256(key)[..12]>` (pure function).
+- Connections upsert via SELECT-then-INSERT (race-prone, throws on
+  conflict); URL parsing derives engine/database/host label, unknown
+  environment/source defaults.
+- Events insert then trim to 5000 by oldest `rowid` (no other cleanup;
+  cap<=0 disables). Listings: events newest-first (limit 100), session
+  events newest-first reversed to chronological (limit 500), sessions
+  newest-first with live-computed summaries (`summarizeEvents` counts
+  reads/writes/schema-changes/rows/bytes/tokens by class).
+- Session summaries are computed on read from events, never stored.
+
 ## Fingerprint audit (identity-hardening phase, probed 2026-09-28)
 
 `normalizeSql`/`sqlFingerprint` (`packages/core/src/fingerprint.ts`) are a

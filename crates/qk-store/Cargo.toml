@@ -1,0 +1,14 @@
+[package]
+name = "qk-store"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+qk-core = { path = "../qk-core" }
+qk-approval = { path = "../qk-approval" }
+# Native builds only: compile SQLite from source (deterministic across
+# release targets) instead of the wasm-first defaults.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+
+[dev-dependencies]
+qk-sql = { path = "../qk-sql" }

@@ -180,6 +180,7 @@ pub fn resolve(
                 id: response.id.clone(),
                 shape: shape.clone(),
                 exact,
+                legacy_shape_only: false,
                 scope,
                 status: match response.decision {
                     ProviderDecision::Approved => GrantStatus::Approved,

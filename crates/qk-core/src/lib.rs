@@ -15,7 +15,7 @@ pub mod glob;
 pub mod policy;
 
 pub use context::ExecutionContext;
-pub use decision::{Decision, ReasonCode};
+pub use decision::{parse_reason_code, Decision, ReasonCode};
 pub use error::PolicyLoadError;
 pub use evaluate::{evaluate, EvaluateOptions, EvaluationRequest, EvaluationResult};
 pub use fingerprint::{

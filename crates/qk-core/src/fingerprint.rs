@@ -41,6 +41,11 @@ static WHITESPACE_RUN: LazyLock<Regex> =
 pub struct QueryShapeFingerprint(String);
 
 impl QueryShapeFingerprint {
+    /// Wrap an already-validated 16-hex shape value (storage reads).
+    pub fn new(hex: String) -> Self {
+        Self(hex)
+    }
+
     /// The 16-hex compatibility rendering.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -62,6 +67,12 @@ impl Display for QueryShapeFingerprint {
 pub struct ExactRequestDigest([u8; 32]);
 
 impl ExactRequestDigest {
+    /// Wrap validated 32 bytes (storage reads; length is enforced by the
+    /// caller reporting `InvalidRow` otherwise).
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Full 64-hex rendering (persistence and test vectors; the bytes are
     /// a hash of provider-visible input, not a secret).
     #[must_use]
@@ -71,6 +82,21 @@ impl ExactRequestDigest {
             out.push_str(&format!("{byte:02x}"));
         }
         out
+    }
+
+    /// Raw 32 bytes for BLOB persistence.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Synthetic digest that can never match a real request. Used for
+    /// legacy rows that predate exact identity: equality would require a
+    /// SHA-256 preimage of this fixed value, so mismatch is structural,
+    /// not probabilistic reasoning at match time.
+    #[must_use]
+    pub fn unmatchable() -> Self {
+        Self([0xFF; 32])
     }
 }
 

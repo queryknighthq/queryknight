@@ -149,6 +149,7 @@ fn approval_cannot_override_hard_denials() {
             id: qk_approval::ApprovalId::new("qka-live".to_owned()),
             shape: qk_core::sql_fingerprint(sql),
             exact: qk_core::exact_request_digest(qk_sql::SqlDialect::PostgreSql, sql),
+            legacy_shape_only: false,
             scope: qk_approval::ApprovalScope {
                 session_id: Some("session-1".to_owned()),
                 integration: "mcp".to_owned(),

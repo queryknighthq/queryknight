@@ -38,6 +38,10 @@ pub struct StoredGrant {
     pub shape: QueryShapeFingerprint,
     /// Exact request identity (approval-token binding).
     pub exact: ExactRequestDigest,
+    /// True for pre-Rust rows lacking exact identity or scope dimensions.
+    /// Such rows keep frozen session+shape matching but never satisfy
+    /// strict scope comparison or exact-token replay.
+    pub legacy_shape_only: bool,
     /// Scope the grant binds to.
     pub scope: ApprovalScope,
     /// Current state.
@@ -173,7 +177,7 @@ impl ApprovalStore for InMemoryApprovalStore {
                 && grant.reuse == Scope::Session
                 && grant.shape == *shape
                 && grant.scope.session_id.as_deref() == Some(session_id)
-                && grant.scope.matches(scope)
+                && (grant.legacy_shape_only || grant.scope.matches(scope))
                 && Self::live(grant, now_ms)
         })
     }
@@ -211,6 +215,7 @@ mod tests {
             id: ApprovalId::new("qka-1".to_owned()),
             shape: sql_fingerprint("SELECT 1"),
             exact: exact_request_digest(SqlDialect::PostgreSql, "SELECT 1"),
+            legacy_shape_only: false,
             scope: scope(),
             status: GrantStatus::Waiting,
             reuse: Scope::Once,
