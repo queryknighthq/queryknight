@@ -26,13 +26,17 @@ fn temp_home(name: &str) -> PathBuf {
 }
 
 fn runtime(home: PathBuf) -> DaemonRuntime {
+    runtime_on(home, 0)
+}
+
+fn runtime_on(home: PathBuf, port: u16) -> DaemonRuntime {
     // Serialized against the env-mutating tests: resolution reads the
     // process environment, so every resolve takes the guard (briefly,
     // never across awaits). The env tests hold the same guard for their
     // whole body and resolve directly (the mutex is not reentrant).
     let _guard = ENV_LOCK.lock().expect("env lock");
-    // Ephemeral port: pid-file port tracking keeps status/stop working.
-    DaemonRuntime::with_home(home, Some(0)).expect("resolve")
+    // Ephemeral port (0): pid-file port tracking keeps status/stop working.
+    DaemonRuntime::with_home(home, Some(port)).expect("resolve")
 }
 
 /// Spawn a foreground daemon in-task; returns (join handle, bound addr).
@@ -133,7 +137,7 @@ async fn port_conflict_fails_without_pid_state() {
     // Occupy a port with an unrelated listener.
     let squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("squatter");
     let port = squatter.local_addr().expect("addr").port();
-    let runtime = DaemonRuntime::with_home(home.clone(), Some(port)).expect("resolve");
+    let runtime = runtime_on(home.clone(), port);
     let error = run_foreground(&runtime, None, async {
         // Never resolves; bind must fail first.
         std::future::pending::<()>().await;

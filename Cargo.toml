@@ -6,6 +6,7 @@ members = [
     "crates/qk-sql",
     "crates/qk-approval",
     "crates/qk-cli",
+    "crates/qk-db",
     "crates/qk-store",
-    "crates/qk-daemon",
+    "crates/qk-daemon", "crates/qk-db",
 ]

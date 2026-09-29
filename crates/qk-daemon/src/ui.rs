@@ -224,7 +224,9 @@ mod tests {
                 .next()
                 .unwrap_or("");
             assert!(
-                stem.split('-').next_back().is_some_and(|hash| hash.len() >= 8),
+                stem.split('-')
+                    .next_back()
+                    .is_some_and(|hash| hash.len() >= 8),
                 "unhashed asset would break the immutable rule: {name}"
             );
         }

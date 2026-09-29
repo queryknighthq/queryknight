@@ -565,6 +565,75 @@ Source: `apps/ui/src/{App.vue (434 lines), main.ts, logo.svg}`,
     `qk_token` from localStorage, `?token=` one-shot bootstrap with
     immediate `replaceState` cleanup.
 
+## Database execution audit (db-layer phase, verified against source 2026-09-30)
+
+Source: `packages/adapters/{mysql,postgres,sqlite}/src/index.ts`,
+`packages/core/src/{adapter.ts,query.ts,budget.ts,cursors.ts,safety.ts}`,
+`packages/mcp/src/{engine.ts,tools.ts}` (`dbQuery`, `dbExplain`,
+`dbSample`, `dbTables`, `dbDescribe`, `dbSchema`, `withTimeout`).
+
+- Adapter selection (`engine.ts createAdapter`): `sqlite:` ->
+  SqliteAdapter, `^postgres(ql)?:` -> PostgresAdapter, EVERYTHING ELSE
+  -> MysqlAdapter (mysql is the default). All three wrap `Bun.SQL`
+  (`bun:sqlite` for sqlite); `sql.unsafe(sql, params)` binds params
+  safely. No pools configured; adapter objects hold one client.
+- `DatabaseAdapter` surface: connect/disconnect/ping/listSchemas/
+  listTables/describeTable/dumpSchema?/execute/explain/analyze/
+  sample/estimateImpact?/getCapabilities. Capabilities: sqlite
+  {explain, sampling}, pg {explain, explainWrites, sampling},
+  mysql {schemas, explain, explainWrites, protocolProxy, sampling}.
+- `runSafeQuery`: analyze -> estimateImpact (unbounded writes only,
+  EXPLAIN pre-decision) -> enforcePolicy (deny/confirm/allow,
+  session-allow, approval create-or-retry, waitForApproval unless
+  `wait:false` -> ApprovalPendingError) -> runQuery -> after-diff
+  record. Legacy env-preset path and policy-file path (`evaluate` +
+  DaemonApprovalProvider) coexist in `dbQuery`.
+- `runQuery`: cursor resolves stored (sql,params,offset) FIRST (and the
+  policy-file path re-evaluates the resolved text); trailing `;`
+  trimmed; `multi = includes(';')`; SELECT without `/\blimit\b/i`
+  gets `LIMIT maxRows+1 OFFSET offset`; `maxRows =
+  min(input.maxRows ?? 50, 50)`; `clipRows` (row cap first, then byte
+  `Buffer.byteLength(JSON.stringify(row))` / token `ceil(bytes/4)`
+  caps vs 65536/8000, first row exempt); `hitRowCap` (fetched >
+  maxRows) also marks truncated; `estimatedRowsMatched` via EXPLAIN
+  regex `/\brows[=:]?\s*(\d+)/i` post-execution; `tokensAvoided =
+  max(0, est(avg*matched) - returned)`; cursor issued iff truncated
+  && SELECT && `opts.cursor !== false`, `offset + shown`.
+- `DEFAULT_BUDGET = {maxRows: 50, maxBytes: 64*1024,
+  maxEstimatedTokens: 8000}`; `DEFAULT_LIMIT = 50` (list caps),
+  `DEFAULT_SAMPLE_LIMIT = 20`, sample clamp 200, `MAX_QUERY_PARAMS =
+  1000` (-> `Blocked:` text), `dbTimeoutMs =
+  QUERYKNIGHT_DB_TIMEOUT_MS ?? 30000`, `withTimeout` races the driver
+  with `may still be running server-side` semantics (no cancellation
+  claim).
+- Cursors: in-memory Map, `qk_cur_<9 random bytes base64url>` (12
+  chars), TTL 10min, sweep on access, connectionKey-bound, unknown /
+  cross-connection -> throw. `connectionKeyFromUrl` strips passwords;
+  `connectionIdFromKey` = `qkc_<sha256hex[0..12]>`.
+- Values: driver rows are JS objects passed through verbatim
+  (`columns = Object.keys(first)`, duplicate columns collapse
+  last-wins at the driver); mutations return `rowsAffected` ONLY for
+  sqlite (`changes`); pg/mysql mutations return no count.
+- `execute` sends multi-statement batches to the driver as-is (only
+  `runExplain` asserts single-statement); params via driver binding.
+- `estimateImpact`: UPDATE/DELETE only, `EXPLAIN` (never ANALYZE),
+  pg takes max of `rows=` matches, mysql max of the `rows` column,
+  failures -> `{}`.
+- Introspection SQL: pg `information_schema` (+current_schema,
+  BASE TABLE/VIEW filter), mysql `information_schema` (+DATABASE(),
+  BASE TABLE/VIEW filter), sqlite `sqlite_master` + PRAGMAs +
+  `ORDER BY RANDOM()/RAND()/random()` sampling; `dumpSchema` =
+  sqlite_master DDL / `SHOW CREATE TABLE` / `pg_dump` subprocess.
+- `dbExplain` and `runSample` evaluate NO policy (direct
+  adapter calls); metadata tools (`dbTables`/`dbDescribe`/`dbSchema`)
+  take identifiers only. History `track()` records every tool call
+  (decision/errorCode on failure).
+- Errors: raw driver messages propagate (`throw error` after
+  tracking); URLs redacted only via `redact()` (password -> `***`)
+  at display edges.
+- No implicit transactions anywhere; per-request adapter use means
+  no cross-request transaction affinity.
+
 ## External compatibility surfaces (freeze list)
 
 1. `evaluate(ctx, sql, opts)` signature + Evaluation JSON shape + all reason codes.

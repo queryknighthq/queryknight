@@ -1,0 +1,25 @@
+[package]
+name = "qk-db"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+qk-core = { path = "../qk-core" }
+qk-sql = { path = "../qk-sql" }
+qk-approval = { path = "../qk-approval" }
+tokio = { version = "1", features = ["macros", "rt", "net", "time", "sync"] }
+tokio-postgres = "0.7"
+mysql_async = "0.37"
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+base64 = "0.22"
+getrandom = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+qk-core = { path = "../qk-core" }
+qk-sql = { path = "../qk-sql" }
+qk-approval = { path = "../qk-approval" }
+serde_json = "1"
