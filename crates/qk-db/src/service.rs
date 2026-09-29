@@ -2,36 +2,36 @@
 //! SQL and real databases.
 //!
 //! ```text
-//! execute_guarded(request, auth)
+//! authorize_guarded(request, auth)          [crate::auth, zero DB contact]
 //!   → resolve cursor (cursor SQL is re-evaluated, never trusted)
 //!   → evaluate() the exact SQL that will run
 //!   → Deny (or anything unparsable) ⇒ Blocked, no adapter contact
 //!   → RequireApproval ⇒ qk-approval resolve (store + provider)
 //!   → not executable ⇒ Blocked / PendingApproval, still no contact
-//!   → ONLY explicit executable Allow ⇒ adapter.execute(...)
-//!   → budgets, paging, impact estimate, cursor issuance
+//!   → explicit executable Allow ⇒ ExecutionPermit (moved, not cloned)
+//!
+//! execute_guarded = authorize_guarded + execute_authorized
+//! execute_authorized(permit) ⇒ adapter.execute(...) then budgets,
+//! paging, post-execution impact estimate, cursor issuance
 //! ```
 //!
 //! The service never interpolates params, never rewrites SQL except
-//! the frozen paging append, and never contacts the database for
-//! denied evaluations (impact EXPLAIN included).
+//! the frozen paging append, and never contacts the database while
+//! authorizing — not even for an impact EXPLAIN.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use qk_approval::{ApprovalId, ApprovalProvider, ApprovalStore, ResolutionOutcome, ResolveRequest};
-use qk_core::{
-    evaluate, Decision, EvaluateOptions, EvaluationRequest, ExecutionContext, PolicyFile,
-    ReasonCode,
-};
+use qk_approval::{ApprovalId, ApprovalProvider, ApprovalStore};
+use qk_core::{Decision, ExecutionContext, PolicyFile, ReasonCode};
 
 use crate::adapter::{DatabaseAdapter, Param};
 use crate::budget::{
     clip_rows, estimate_tokens, is_multi_statement, is_select, trim_trailing_semicolons, with_page,
-    ResultBudget, MAX_PARAMS,
+    ResultBudget,
 };
 use crate::config::DbConfig;
-use crate::cursor::{CursorStore, StoredCursor};
+use crate::cursor::CursorStore;
 use crate::error::{DbError, DbErrorKind};
 use crate::result::{BudgetedResult, PingResult, RawResult, TableInfo, TableRef};
 
@@ -225,129 +225,119 @@ impl ExecutionService {
         }
     }
 
-    /// Guarded query execution: evaluate → resolve → execute-or-refuse.
+    /// Guarded query execution: shared authorization first, then
+    /// permit-consuming execution. Direct execution and future
+    /// session-pinned adapters use the SAME authorization code.
     pub async fn execute_guarded(
         &self,
         call: &GuardedCall<'_, '_>,
         request: &ExecuteRequest,
     ) -> ExecutionOutcome {
-        // Cursor paging reuses stored SQL; the resolved text is what
-        // gets evaluated and executed (never trust the cursor blindly).
-        let (sql, params, offset) = match self.resolve_cursor(request, call.connection_key) {
-            Ok(resolved) => resolved,
-            Err(error) => return ExecutionOutcome::Failed(error),
-        };
-        if params.len() > MAX_PARAMS {
-            return ExecutionOutcome::Failed(DbError::new(
-                DbErrorKind::Query,
-                format!("too many query parameters (max {MAX_PARAMS})"),
-            ));
-        }
-        // The executed form is byte-identical to the evaluated form
-        // except the frozen paging append (part of the evaluated pair
-        // via (sql, offset) binding — see docs/database-execution.md).
-        let evaluation = evaluate(
-            &EvaluationRequest {
-                context: &call.auth.execution_context(),
-                dialect: call.config.dialect(),
-                sql: &sql,
+        use crate::auth::{authorize_guarded, AuthorizationRequest, ResolveMode};
+        let outcome = authorize_guarded(
+            &self.cursors,
+            &crate::auth::GuardedAuthorizationCall {
+                config: call.config,
+                connection_key: call.connection_key,
+                auth: call.auth,
+                approval: Some(call.approval),
                 policy: call.policy,
             },
-            &EvaluateOptions::default(),
+            &AuthorizationRequest {
+                sql: request.sql.clone(),
+                params: request.params.clone(),
+                approval_id: request.approval_id.clone(),
+                max_rows: request.max_rows,
+                cursor: request.cursor.clone(),
+            },
+            ResolveMode::ResolveApprovals,
         );
-        if evaluation.decision != Decision::Allow
-            && evaluation.decision != Decision::RequireApproval
-        {
-            return ExecutionOutcome::Blocked(BlockedReason {
-                decision: Decision::Deny,
-                code: evaluation.reason_code.as_str().to_owned(),
-                message: evaluation.message.clone(),
-                matched_policy: evaluation.matched_policy.clone(),
-            });
-        }
-        // Non-denied evaluations may enrich the pending approval
-        // with a planner impact estimate (EXPLAIN, never ANALYZE).
-        // Denied evaluations cause zero DB contact (hardening vs the
-        // reference pre-decision estimate).
-        let mut impact = None;
-        if evaluation.decision == Decision::RequireApproval && is_unbounded_write(&sql) {
-            let bound = match to_driver_params(&params) {
-                Ok(bound) => bound,
-                Err(error) => return ExecutionOutcome::Failed(error),
-            };
-            impact = call
-                .adapter
-                .estimate_impact(url_of(call.config), &sql, &bound)
-                .await
-                .unwrap_or(None)
-                .map(|estimate| estimate.estimated_rows);
-        }
-        // Authorization facts travel with the outcome for observers
-        // (no re-derivation downstream).
-        let mut authz = AuthzFacts {
-            approval_id: None,
-            reason_code: evaluation.reason_code,
-            matched_policy: evaluation.matched_policy.clone(),
-        };
-        if evaluation.decision == Decision::RequireApproval {
-            match self.resolve_approval(call, &evaluation, &sql, impact, request) {
-                Resolve::Executable(resolved) => {
-                    authz = AuthzFacts {
-                        approval_id: resolved.approval_id,
-                        reason_code: resolved.reason_code,
-                        matched_policy: resolved.matched_policy,
-                    };
-                }
-                Resolve::Outcome(outcome) => return outcome,
+        match outcome {
+            crate::auth::AuthorizationOutcome::Permitted(permit) => {
+                self.execute_authorized(call.adapter, call.config, *permit)
+                    .await
             }
+            crate::auth::AuthorizationOutcome::Blocked(reason) => ExecutionOutcome::Blocked(reason),
+            crate::auth::AuthorizationOutcome::PendingApproval(pending) => {
+                ExecutionOutcome::PendingApproval(pending)
+            }
+            crate::auth::AuthorizationOutcome::Failed(error) => ExecutionOutcome::Failed(error),
         }
-        // ONLY explicit executable Allow reaches the adapter.
-        self.run_authorized(call, &sql, &params, request, offset, authz)
-            .await
+    }
+
+    /// Execute an authorized request, consuming its permit. The ONLY
+    /// path from a permit to adapter contact: everything executed here
+    /// was bound into the permit at authorization time. Consuming (not
+    /// cloning) makes accidental repeated execution harder. `config`
+    /// supplies only the connection target; the executed identity
+    /// (dialect, SQL, params, paging) comes from the permit, and a
+    /// dialect mismatch fails closed.
+    pub async fn execute_authorized(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        config: &DbConfig,
+        permit: crate::auth::ExecutionPermit,
+    ) -> ExecutionOutcome {
+        if config.dialect() != permit.dialect {
+            return ExecutionOutcome::Failed(DbError::new(
+                DbErrorKind::Query,
+                "permit dialect does not match connection dialect",
+            ));
+        }
+        self.run_permitted(adapter, config, permit).await
     }
 
     /// Guarded EXPLAIN: allow-only (plans leak schema names, so
     /// approval-required statements pend and denied ones block).
+    /// Shares the authorization implementation; `EvaluateOnly` means
+    /// no provider contact and no rows created.
     pub async fn explain_guarded(
         &self,
         call: &ExplainCall<'_>,
         sql: &str,
         params: &[serde_json::Value],
     ) -> ExecutionOutcome {
-        let evaluation = evaluate(
-            &EvaluationRequest {
-                context: &call.auth.execution_context(),
-                dialect: call.config.dialect(),
-                sql,
+        use crate::auth::{authorize_guarded, AuthorizationRequest, ResolveMode};
+        let outcome = authorize_guarded(
+            &self.cursors,
+            &crate::auth::GuardedAuthorizationCall {
+                config: call.config,
+                // EXPLAIN never pages: no cursor can be supplied or
+                // issued, so the key is never compared.
+                connection_key: "",
+                auth: call.auth,
+                approval: None,
                 policy: call.policy,
             },
-            &EvaluateOptions::default(),
+            &AuthorizationRequest {
+                sql: sql.to_owned(),
+                params: params.to_vec(),
+                approval_id: None,
+                max_rows: None,
+                cursor: None,
+            },
+            ResolveMode::EvaluateOnly,
         );
-        match evaluation.decision {
-            Decision::Allow => {}
-            Decision::RequireApproval => {
-                return ExecutionOutcome::PendingApproval(PendingApproval {
-                    approval_id: String::new(),
-                    reason_code: evaluation.reason_code.as_str().to_owned(),
-                    estimated_rows: None,
-                });
+        let permit = match outcome {
+            crate::auth::AuthorizationOutcome::Permitted(permit) => *permit,
+            crate::auth::AuthorizationOutcome::Blocked(reason) => {
+                return ExecutionOutcome::Blocked(reason)
             }
-            _ => {
-                return ExecutionOutcome::Blocked(BlockedReason {
-                    decision: Decision::Deny,
-                    code: evaluation.reason_code.as_str().to_owned(),
-                    message: evaluation.message.clone(),
-                    matched_policy: evaluation.matched_policy.clone(),
-                });
+            crate::auth::AuthorizationOutcome::PendingApproval(pending) => {
+                return ExecutionOutcome::PendingApproval(pending);
             }
-        }
-        let bound = match to_driver_params(params) {
+            crate::auth::AuthorizationOutcome::Failed(error) => {
+                return ExecutionOutcome::Failed(error)
+            }
+        };
+        let bound = match to_driver_params(&permit.params) {
             Ok(params) => params,
             Err(error) => return ExecutionOutcome::Failed(error),
         };
         match with_deadline(
             self.timeout,
-            call.adapter.explain(url_of(call.config), sql, &bound),
+            call.adapter
+                .explain(url_of(call.config), &permit.sql, &bound),
         )
         .await
         {
@@ -364,9 +354,9 @@ impl ExecutionService {
                     estimated_tokens_avoided: None,
                     cursor: None,
                 },
-                approval_id: None,
-                reason_code: evaluation.reason_code,
-                matched_policy: evaluation.matched_policy.clone(),
+                approval_id: permit.approval_id,
+                reason_code: permit.reason_code,
+                matched_policy: permit.matched_policy,
             }),
             Ok(Err(error)) => ExecutionOutcome::Failed(error),
             Err(_) => ExecutionOutcome::Failed(timeout_error()),
@@ -441,130 +431,42 @@ impl ExecutionService {
             .map_err(|_| timeout_error())?
     }
 
-    /// Resolve cursor-or-direct input into (sql, params, offset).
-    /// Empty SQL with a cursor reuses stored state; anything else
-    /// uses the request verbatim (cursor ignored when SQL is given,
-    /// mirroring the reference `input.cursor && !sql` branch).
-    fn resolve_cursor(
-        &self,
-        request: &ExecuteRequest,
-        connection_key: &str,
-    ) -> Result<(String, Vec<serde_json::Value>, u64), DbError> {
-        if let Some(cursor_id) = request.cursor.as_deref() {
-            if request.sql.trim().is_empty() {
-                let stored: StoredCursor = self.cursors.read(cursor_id, connection_key)?;
-                return Ok((stored.sql, stored.params, stored.offset));
-            }
-        }
-        Ok((request.sql.clone(), request.params.clone(), 0))
-    }
-
-    /// Approval resolution for RequireApproval evaluations. Only
-    /// `Executable` proceeds; every other path returns its outcome
-    /// without adapter contact.
-    fn resolve_approval(
-        &self,
-        call: &GuardedCall<'_, '_>,
-        evaluation: &qk_core::EvaluationResult,
-        sql: &str,
-        impact: Option<u64>,
-        request: &ExecuteRequest,
-    ) -> Resolve {
-        let context = call.auth.execution_context();
-        // Exact identity covers the actual driver-bound params (empty
-        // means no params → Exact V1; anything else → Exact V2).
-        // qk-db owns this construction from trusted dialect + exact SQL
-        // + bound values; MCP never precomputes digests.
-        let digest_params: Vec<qk_core::DigestParam> =
-            request.params.iter().map(param_to_digest).collect();
-        let resolved = qk_approval::resolve(
-            &ResolveRequest {
-                evaluation,
-                context: &context,
-                dialect: call.config.dialect(),
-                sql,
-                params: &digest_params,
-                approval_id: request.approval_id.as_deref(),
-                ttl_ms: call.approval.ttl_ms,
-                now_ms: call.approval.now_ms,
-            },
-            call.approval.store,
-            call.approval.provider,
-        );
-        match resolved.outcome {
-            ResolutionOutcome::ExistingGrant | ResolutionOutcome::ProviderApproved => {
-                if resolved.decision == Decision::Allow {
-                    Resolve::Executable(resolved)
-                } else {
-                    Resolve::Outcome(ExecutionOutcome::Blocked(BlockedReason {
-                        decision: Decision::Deny,
-                        code: resolved.reason_code.as_str().to_owned(),
-                        message: resolved.message.clone(),
-                        matched_policy: resolved.matched_policy.clone(),
-                    }))
-                }
-            }
-            ResolutionOutcome::ProviderWaiting => {
-                Resolve::Outcome(ExecutionOutcome::PendingApproval(PendingApproval {
-                    approval_id: resolved
-                        .approval_id
-                        .map(|id| id.as_str().to_owned())
-                        .unwrap_or_default(),
-                    reason_code: resolved.reason_code.as_str().to_owned(),
-                    estimated_rows: impact,
-                }))
-            }
-            ResolutionOutcome::ProviderDenied
-            | ResolutionOutcome::ProviderUnavailable
-            | ResolutionOutcome::ProviderError
-            | ResolutionOutcome::NotRequired => {
-                Resolve::Outcome(ExecutionOutcome::Blocked(BlockedReason {
-                    decision: Decision::Deny,
-                    code: resolved.reason_code.as_str().to_owned(),
-                    message: resolved.message.clone(),
-                    matched_policy: resolved.matched_policy.clone(),
-                }))
-            }
-        }
-    }
-
+    /// Approval resolution for RequireApproval evaluations lives in
+    /// `crate::auth` (shared with the future proxy path).
     /// Execute an explicitly authorized statement with budgets, paging,
-    /// impact estimates, and cursor issuance.
-    async fn run_authorized(
+    /// impact estimates, and cursor issuance. Every executable input
+    /// is read from the permit — none from the original request.
+    async fn run_permitted(
         &self,
-        call: &GuardedCall<'_, '_>,
-        sql: &str,
-        params: &[serde_json::Value],
-        request: &ExecuteRequest,
-        offset: u64,
-        authz: AuthzFacts,
+        adapter: &dyn DatabaseAdapter,
+        config: &DbConfig,
+        permit: crate::auth::ExecutionPermit,
     ) -> ExecutionOutcome {
-        if is_multi_statement(sql) {
+        if is_multi_statement(&permit.sql) {
             return ExecutionOutcome::Failed(DbError::new(
                 DbErrorKind::Query,
                 "multiple statements are not allowed",
             ));
         }
-        let bound = match to_driver_params(params) {
+        let bound = match to_driver_params(&permit.params) {
             Ok(params) => params,
             Err(error) => return ExecutionOutcome::Failed(error),
         };
-        let max_rows = request.max_rows.map_or(self.budget.max_rows, |max| {
+        let max_rows = permit.max_rows.map_or(self.budget.max_rows, |max| {
             max.min(self.budget.max_rows).max(1)
         });
-        let trimmed = trim_trailing_semicolons(sql);
+        let trimmed = trim_trailing_semicolons(&permit.sql);
         let select = is_select(&trimmed);
         // Frozen paging: limit-less SELECTs fetch one extra row to
         // detect the cap.
         let statement = if select && !has_limit_word(&trimmed) {
-            with_page(&trimmed, max_rows + 1, offset)
+            with_page(&trimmed, max_rows + 1, permit.offset)
         } else {
             trimmed.clone()
         };
         let executed = match with_deadline(
             self.timeout,
-            call.adapter
-                .execute(url_of(call.config), &statement, &bound),
+            adapter.execute(url_of(config), &statement, &bound),
         )
         .await
         {
@@ -573,16 +475,19 @@ impl ExecutionService {
             Err(_) => return ExecutionOutcome::Failed(timeout_error()),
         };
         self.shape_result(
-            call,
+            adapter,
+            config,
             executed,
-            RawShape {
+            PermittedShape {
                 select,
                 max_rows,
-                offset,
+                offset: permit.offset,
                 sql: trimmed,
-                params: params.to_vec(),
-                connection_key: call.connection_key.to_owned(),
-                authz,
+                params: permit.params,
+                connection_key: permit.connection_key,
+                approval_id: permit.approval_id,
+                reason_code: permit.reason_code,
+                matched_policy: permit.matched_policy,
             },
         )
         .await
@@ -591,9 +496,10 @@ impl ExecutionService {
     /// Apply row-cap probing, budgets, estimates, and cursor issuance.
     async fn shape_result(
         &self,
-        call: &GuardedCall<'_, '_>,
+        adapter: &dyn DatabaseAdapter,
+        config: &DbConfig,
         executed: RawResult,
-        shape: RawShape,
+        shape: PermittedShape,
     ) -> ExecutionOutcome {
         if !shape.select {
             // Mutations bypass paging (rowsAffected instead).
@@ -610,9 +516,9 @@ impl ExecutionService {
                     estimated_tokens_avoided: None,
                     cursor: None,
                 },
-                approval_id: shape.authz.approval_id,
-                reason_code: shape.authz.reason_code,
-                matched_policy: shape.authz.matched_policy,
+                approval_id: shape.approval_id,
+                reason_code: shape.reason_code,
+                matched_policy: shape.matched_policy,
             });
         }
         let fetched = executed.rows;
@@ -629,9 +535,8 @@ impl ExecutionService {
         let (rows, bytes, tokens, clipped) = clip_rows(page, page_budget);
         let truncated = clipped || hit_row_cap;
         // Planner estimate (post-execution; failures degrade to None).
-        let estimated_rows_matched = match call
-            .adapter
-            .explain(url_of(call.config), &shape.sql, &to_params(&shape.params))
+        let estimated_rows_matched = match adapter
+            .explain(url_of(config), &shape.sql, &to_params(&shape.params))
             .await
         {
             Ok(plan) => parse_rows_estimate(&plan),
@@ -668,38 +573,24 @@ impl ExecutionService {
                 estimated_tokens_avoided,
                 cursor,
             },
-            approval_id: shape.authz.approval_id,
-            reason_code: shape.authz.reason_code,
-            matched_policy: shape.authz.matched_policy,
+            approval_id: shape.approval_id,
+            reason_code: shape.reason_code,
+            matched_policy: shape.matched_policy,
         })
     }
 }
 
-/// Internal resolution verdict: executable (carrying the resolved
-/// authorization facts) or a final outcome.
-enum Resolve {
-    /// Explicit executable Allow: the adapter may be called.
-    Executable(qk_approval::ResolvedEvaluation),
-    /// Final non-executable outcome (no adapter contact).
-    Outcome(ExecutionOutcome),
-}
-
-/// Authorization facts accompanying an execution.
-struct AuthzFacts {
-    approval_id: Option<ApprovalId>,
-    reason_code: ReasonCode,
-    matched_policy: Option<String>,
-}
-
-/// Shaping inputs for a SELECT result.
-struct RawShape {
+/// Shaping inputs for a SELECT result, all derived from the permit.
+struct PermittedShape {
     select: bool,
     max_rows: usize,
     offset: u64,
     sql: String,
     params: Vec<serde_json::Value>,
     connection_key: String,
-    authz: AuthzFacts,
+    approval_id: Option<ApprovalId>,
+    reason_code: ReasonCode,
+    matched_policy: Option<String>,
 }
 
 fn offset_add(offset: u64, shown: usize) -> u64 {
@@ -714,33 +605,6 @@ fn url_of(config: &DbConfig) -> &crate::config::SecretUrl {
 
 fn to_driver_params(params: &[serde_json::Value]) -> Result<Vec<Param>, DbError> {
     params.iter().map(Param::from_json).collect()
-}
-
-/// Canonical digest parameter from a JSON scalar: the same typed
-/// value the driver will bind (integers keep integer precision —
-/// never routed through f64 for identity).
-fn param_to_digest(value: &serde_json::Value) -> qk_core::DigestParam {
-    use qk_core::DigestParam;
-    match value {
-        serde_json::Value::Null => DigestParam::Null,
-        serde_json::Value::Bool(value) => DigestParam::Bool(*value),
-        serde_json::Value::Number(value) => {
-            if let Some(int) = value.as_i64() {
-                DigestParam::Int(int)
-            } else if let Some(uint) = value.as_u64() {
-                DigestParam::UInt(uint)
-            } else if let Some(float) = value.as_f64() {
-                DigestParam::FloatBits(float.to_bits())
-            } else {
-                DigestParam::Text(value.to_string())
-            }
-        }
-        serde_json::Value::String(text) => DigestParam::Text(text.clone()),
-        // Compound values cannot bind as params (rejected later by
-        // to_driver_params); digest them by canonical JSON text so
-        // they still perturb identity deterministically.
-        other => DigestParam::Text(other.to_string()),
-    }
 }
 
 fn to_params(params: &[serde_json::Value]) -> Vec<Param> {
@@ -773,11 +637,6 @@ fn is_word_byte(byte: u8) -> bool {
 /// Frozen unbounded-write sniff for impact estimation. The evaluator
 /// owns the real classification; this is only the cheap pre-check for
 /// whether an EXPLAIN roundtrip is worthwhile.
-fn is_unbounded_write(sql: &str) -> bool {
-    use crate::adapter::starts_with_word;
-    (starts_with_word(sql, "update") || starts_with_word(sql, "delete")) && !has_limit_word(sql)
-}
-
 /// Frozen planner-estimate parse (`/\brows[=:]?\s*(\d+)/i`: covers pg
 /// `rows=` and mysql `rows:` header shapes).
 fn parse_rows_estimate(plan: &str) -> Option<u64> {

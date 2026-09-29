@@ -17,6 +17,7 @@
 
 pub mod adapter;
 pub mod adapters;
+pub mod auth;
 pub mod budget;
 pub mod config;
 pub mod cursor;
@@ -26,6 +27,10 @@ pub mod service;
 pub mod value;
 
 pub use adapter::{Capabilities, DatabaseAdapter, Param};
+pub use auth::{
+    authorize_guarded, AuthorizationOutcome, AuthorizationRequest, ExecutionPermit,
+    GuardedAuthorizationCall, ResolveMode,
+};
 pub use budget::{ResultBudget, MAX_BYTES, MAX_ROWS, MAX_TOKENS};
 pub use config::{DbConfig, SecretUrl};
 pub use cursor::{CursorStore, StoredCursor, CURSOR_TTL};

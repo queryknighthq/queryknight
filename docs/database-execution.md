@@ -263,3 +263,93 @@ daemon provider -> qk-daemon/qk-store -> approvals_decide -> retry`:
    version-aware matching. Session scope remains intentionally
    shape-wide; Once becomes exact-request-strict (deliberate TS
    divergence, INV-041).
+
+## Authorization plane vs execution/result plane
+
+`execute_guarded` previously combined both planes. They are now split
+(`qk-db::auth` vs `qk-db` execution); direct execution and future
+proxies share the authorization code, with one intentional security
+divergence (below).
+
+AUTHORIZATION PLANE (`authorize_guarded`, sync, ZERO database contact):
+trusted dialect derivation (`DbConfig`) → trusted context build →
+cursor resolution (stored SQL re-evaluated, never trusted) →
+param-count cap → `evaluate()` → deny short-circuit → approval
+resolution (`qk-approval`: retry/session/provider, exact V1/V2 +
+scope) → `Permitted(ExecutionPermit)` | `Blocked` | `Pending`.
+No `execute`, `explain`, schema query, ping, or impact EXPLAIN runs
+here. `explain_guarded` authorizes in evaluate-only mode (Allow →
+permit, RequireApproval → pending without provider contact, Deny →
+blocked): no separate mini evaluator.
+
+EXECUTION/RESULT PLANE (consumes the permit):
+`execute_authorized(permit)` → multi-statement guard → driver
+param binding → frozen paging rewrite → `adapter.execute` →
+row-cap probe → budgets → post-execution EXPLAIN estimate →
+token math → cursor issuance → `Executed`/`Failed`. Result
+budgeting, normalization, cursor state, and MCP text formatting
+live here or above — never in authorization.
+
+The permit binds the resolved request (dialect, shape, exact
+digest+version, scope, resolved SQL/params, offset, row cap,
+connection key, reason facts). Execution derives everything from
+the permit; callers cannot substitute different SQL/params after
+authorization. Permits are moved (not cloned), never serialized,
+process-local only.
+
+## Intentional security divergence: `PendingApproval.estimated_rows`
+
+`PendingApproval.estimated_rows` is retained for wire compatibility
+but is **no longer populated** — it is always `None`.
+
+The TypeScript/direct execution path could obtain mutation impact
+estimates through `EXPLAIN` **before** final authorization:
+
+```text
+RequireApproval
+      ↓
+EXPLAIN database interaction   ← already a database contact
+      ↓
+PendingApproval
+```
+
+That conflicts with INV-042: it contacts the database before an
+`ExecutionPermit` exists. Preserving the old observable value would
+mean routing around the choke point, so Rust intentionally drops it.
+No current MCP or audit consumer depends on the value (the audit
+observer does not serialize the field).
+
+The post-authorization estimate is **not** a replacement for it. That
+EXPLAIN runs after a permit, in the result plane, and feeds token
+accounting; it is never routed back into a pending-approval response.
+
+## Proxy design note (DESIGN ONLY — no protocol code)
+
+Why proxies cannot call `qk-db` per-operation adapters: `BEGIN`,
+`SET`, temporary tables, prepared statements, and transaction
+failure state live on ONE backend session. Per-operation connects
+would shatter that state. Instead:
+
+PostgreSQL proxy — Simple Query: `Query(sql)` → authorize(sql, no
+params) → Permit → forward the ORIGINAL `Query` message on the
+existing backend connection. Extended: `Parse(sql)` stores
+statement metadata only (forwarding Parse before authorization is
+an open question — see below); `Bind(params)` binds values to the
+parsed SQL; `Execute` → authorize(sql + actual params) → Permit →
+forward the correct existing protocol sequence/backend execution.
+
+MySQL proxy — `COM_QUERY(sql)` → authorize → Permit → forward.
+`COM_STMT_PREPARE(sql)` tracks SQL/backend statement id.
+`COM_STMT_EXECUTE(params)` reconstructs SQL identity + params →
+authorize → Permit → forward.
+
+Open questions for the proxy commit (no answers guessed here):
+whether `Parse`/`COM_STMT_PREPARE` may be forwarded before
+authorization (some servers parse/plan at prepare time — the
+security rule is that nothing materially executing or causing
+prohibited side effects may be forwarded pre-authorization; the
+proxy must audit actual server semantics), and how transaction
+error state interacts with permit issuance. `integration` will be
+`proxy_pg` / `proxy_mysql` (trusted listener config, never wire
+input). Observation wraps one client attempt (blocked / pending /
+executed / DB failure) exactly once, outside `qk-db`.
