@@ -267,8 +267,8 @@ daemon provider -> qk-daemon/qk-store -> approvals_decide -> retry`:
 ## Authorization plane vs execution/result plane
 
 `execute_guarded` previously combined both planes. They are now split
-(`qk-db::auth` vs `qk-db` execution); direct execution and future
-proxies share the authorization code, with one intentional security
+(`qk-db::auth` vs `qk-db` execution); direct execution and the PostgreSQL
+Simple Query proxy share the authorization code, with one intentional security
 divergence (below).
 
 AUTHORIZATION PLANE (`authorize_guarded`, sync, ZERO database contact):
@@ -400,29 +400,31 @@ with a typed identity error before permit issuance. `ExecutionParam` Debug
 redacts all values; it has no Display/Serde representation. Approval storage
 continues to persist only binding kind and 32-byte digest; no schema change.
 
-Future wire mapping (not implemented here):
+## PostgreSQL Simple Query identity boundary
 
-```text
-PostgreSQL Parse → retain SQL + optional generic type hints per statement
-Bind → validate each value → ordered ExecutionParam::Wire(Text|Binary,
-       type_hint, exact bytes), with NULL represented distinctly
-Execute → authorize_guarded(SQL, ExecutionParams) → consume permit →
-          forward original executable message on the bound backend session
-```
+The implemented PostgreSQL adapter accepts only Simple Query `Q` messages.
+Each complete SQL C string is authorized with no bind parameters and therefore
+uses the shared SQL-only exact identity; a permit authorizes every statement
+in that one request and is consumed before the original frame is forwarded on
+its authenticated backend session. Extended Query Parse/Bind/Execute is
+rejected, so PostgreSQL wire text/binary parameter mapping is not yet an
+executable surface. MySQL `COM_STMT_EXECUTE` behavior is unchanged.
 
-PostgreSQL ingress must use this shared Exact V2 encoder and must not add a
-proxy-local digest. MySQL `COM_STMT_EXECUTE` will use the same
-`ExecutionParam` identity model; this task adds no MySQL protocol behavior.
+The protocol-neutral `ExecutionParam::Wire` and Exact V2 encoder remain the
+shared boundary for any future parameterized ingress: text and binary bytes
+are hashed exactly as represented, with an optional type hint and NULL
+represented distinctly. Ingress adapters must not add a proxy-local digest.
 
 ## Shared daemon approval path
 
 The daemon-backed provider and authenticated control-plane HTTP client live
-in `qk-control-plane`; MCP and future protocol adapters consume the same
-provider. Runtime discovery reuses `qk-daemon::runtime`. The provider maps a
-typed `ApprovalRequest` through the existing `qk-approval::ApprovalProvider`
-trait, then `authorize_guarded` returns a request-specific permit. Only
-cryptographic digest/version and trusted scope cross the daemon boundary;
-`ExecutionParam`, SQL values, and wire bytes stay process-local.
+in `qk-control-plane`; MCP and the PostgreSQL Simple Query proxy consume the
+same provider. Runtime discovery reuses `qk-daemon::runtime`. The provider
+maps a typed `ApprovalRequest` through the existing
+`qk-approval::ApprovalProvider` trait, then `authorize_guarded` returns a
+request-specific permit. Only cryptographic digest/version and trusted scope
+cross the daemon boundary; `ExecutionParam`, SQL values, and wire bytes stay
+process-local.
 
 ```text
 ingress adapter → authorize_guarded → qk-approval resolve
@@ -432,5 +434,7 @@ ingress adapter → authorize_guarded → qk-approval resolve
 ```
 
 The provider performs bounded synchronous loopback I/O during authorization.
-Future async wire servers must schedule that work so it cannot block a Tokio
-core worker; the provider trait and authorization plane remain synchronous.
+The PostgreSQL proxy schedules this work on a blocking task so it cannot block
+a Tokio core worker; the provider trait and authorization plane remain
+synchronous.
+

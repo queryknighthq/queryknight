@@ -2,9 +2,9 @@
 //! ZERO database contact, issuing an opaque [`ExecutionPermit`] for
 //! exactly one concrete executable request.
 //!
-//! Direct execution (`execute_guarded`) and future session-pinned
-//! adapters (wire proxies) share this code: authorize first, then
-//! execute/forward only with a permit. There is deliberately no second
+//! Direct execution (`execute_guarded`) and session-pinned protocol
+//! adapters (currently the PostgreSQL Simple Query proxy) share this code:
+//! they authorize first; execution/forwarding then requires that permit.
 //! policy/approval implementation.
 
 use qk_approval::{ApprovalId, ApprovalScope, ResolveRequest};
@@ -50,6 +50,9 @@ pub struct AuthorizationRequest {
     pub params: Vec<qk_core::ExecutionParam>,
     /// Original JSON driver values retained only for qk-db execution.
     pub(crate) driver_params: Vec<serde_json::Value>,
+    /// Statement kinds this adapter refuses independently of policy (for
+    /// example, protocol operations it cannot safely execute).
+    pub reject_operations: Vec<qk_sql::Operation>,
     /// Retry with a previously issued approval id.
     pub approval_id: Option<String>,
     /// Requested row cap.
@@ -65,6 +68,7 @@ impl AuthorizationRequest {
             sql: sql.into(),
             params,
             driver_params: Vec::new(),
+            reject_operations: Vec::new(),
             approval_id: None,
             max_rows: None,
             cursor: None,
@@ -83,6 +87,7 @@ impl AuthorizationRequest {
             params: execution_identity_params(&params),
             sql,
             driver_params: params,
+            reject_operations: Vec::new(),
             approval_id,
             max_rows,
             cursor,
@@ -205,6 +210,7 @@ pub struct ExecutionPermit {
     pub(crate) offset: u64,
     pub(crate) max_rows: Option<usize>,
     pub(crate) connection_key: String,
+    pub(crate) operations: String,
 }
 
 impl ExecutionPermit {
@@ -241,6 +247,13 @@ impl ExecutionPermit {
     /// Approval that carried this permit, when one was used.
     pub fn approval_id(&self) -> Option<&ApprovalId> {
         self.approval_id.as_ref()
+    }
+    /// Whether the authorized request contains this evaluator-classified
+    /// top-level statement operation.
+    pub fn includes_operation(&self, operation: &qk_sql::Operation) -> bool {
+        self.operations
+            .split(',')
+            .any(|name| name == operation.name())
     }
 }
 
@@ -282,6 +295,19 @@ pub fn authorize_guarded(
         },
         &EvaluateOptions::default(),
     );
+    if evaluation.decision != Decision::Deny
+        && request
+            .reject_operations
+            .iter()
+            .any(|operation| evaluation.includes_operation(operation))
+    {
+        return AuthorizationOutcome::Blocked(BlockedReason {
+            decision: Decision::Deny,
+            code: "UNSUPPORTED_OPERATION".to_owned(),
+            message: "statement operation is not supported by this adapter".to_owned(),
+            matched_policy: None,
+        });
+    }
     if evaluation.decision != Decision::Allow && evaluation.decision != Decision::RequireApproval {
         return AuthorizationOutcome::Blocked(BlockedReason {
             decision: Decision::Deny,
@@ -316,6 +342,7 @@ pub fn authorize_guarded(
                     resolved.approval_id,
                     resolved.reason_code,
                     resolved.matched_policy,
+                    evaluation.operation.as_deref().unwrap_or_default(),
                 );
             }
             Resolve::Outcome(outcome) => return *outcome,
@@ -332,6 +359,7 @@ pub fn authorize_guarded(
         None,
         evaluation.reason_code,
         evaluation.matched_policy.clone(),
+        evaluation.operation.as_deref().unwrap_or_default(),
     )
 }
 
@@ -347,6 +375,7 @@ fn permit_for(
     approval_id: Option<qk_approval::ApprovalId>,
     reason_code: ReasonCode,
     matched_policy: Option<String>,
+    operations: &str,
 ) -> AuthorizationOutcome {
     let exact = if identity_params.is_empty() {
         qk_core::ExactDigest::V1(qk_core::exact_request_digest(call.config.dialect(), sql))
@@ -374,6 +403,7 @@ fn permit_for(
         offset,
         max_rows: request.max_rows,
         connection_key: call.connection_key.to_owned(),
+        operations: operations.to_owned(),
     }))
 }
 

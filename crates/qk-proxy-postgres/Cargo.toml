@@ -1,0 +1,20 @@
+[package]
+name = "qk-proxy-postgres"
+version = "0.1.0-beta.0"
+edition = "2021"
+
+[dependencies]
+qk-approval = { path = "../qk-approval" }
+qk-core = { path = "../qk-core" }
+qk-control-plane = { path = "../qk-control-plane" }
+qk-db = { path = "../qk-db" }
+bytes = "1"
+qk-sql = { path = "../qk-sql" }
+tokio = { version = "1", features = ["macros", "rt", "net", "time", "sync", "io-util", "signal"] }
+tokio-postgres = "0.7"
+
+[dev-dependencies]
+qk-daemon = { path = "../qk-daemon" }
+qk-store = { path = "../qk-store" }
+serde_json = "1"
+tokio-postgres = "0.7"

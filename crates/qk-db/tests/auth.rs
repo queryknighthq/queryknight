@@ -617,3 +617,41 @@ fn unknown_cursor_fails_authorization_without_a_permit() {
         describe(&outcome)
     );
 }
+
+#[tokio::test]
+async fn rejected_adapter_operation_never_receives_a_permit() {
+    let store = InMemoryApprovalStore::new();
+    let config = DbConfig::Postgres(SecretUrl::new("postgres://qk@localhost/db").expect("url"));
+    let trusted = TrustedContext {
+        integration: "proxy_pg".to_owned(),
+        environment: "production".to_owned(),
+        database: "main".to_owned(),
+        tool: "proxy_query".to_owned(),
+        session_id: None,
+    };
+    let policy = qk_core::parse_policy(
+        r#"
+version: 1
+defaults:
+  decision: allow
+environments:
+  production:
+    databases:
+      main:
+        allow:
+          - operations: [copy, set]
+"#,
+    )
+    .expect("allow fixture");
+    let mut request = AuthorizationRequest::new("COPY t TO STDOUT", Vec::new());
+    request.reject_operations.push(qk_sql::Operation::Copy);
+    let outcome = authorize(&store, None, &config, &trusted, &policy, &request);
+    assert!(
+        matches!(
+            &outcome,
+            AuthorizationOutcome::Blocked(reason) if reason.code == "UNSUPPORTED_OPERATION"
+        ),
+        "{}",
+        describe(&outcome)
+    );
+}

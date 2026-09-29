@@ -195,12 +195,45 @@ async fn real_daemon_exact_v2_once_session_and_scope_semantics() {
         ProviderDecision::Approved
     );
 
-    // Regression for the old shape-only approval laundering bug: same SQL
-    // shape and id, different ExactV2 bytes must remain waiting.
+    // PostgreSQL Simple Query carries no approvalId field. The shared
+    // provider can recover an exact Once retry by candidate shape followed
+    // by daemon exact-digest/scope verification, without local caching.
+    let wire_provider = DaemonApprovalProvider::new(
+        client.clone(),
+        Some(session_id.clone()),
+        "postgres://user@localhost/db".to_owned(),
+        None,
+    )
+    .with_exact_lookup_retry();
+    assert_eq!(
+        wire_provider.request(&first).unwrap().decision,
+        ProviderDecision::Approved
+    );
+
+    // Regression for shape-only approval laundering and candidate ordering:
+    // this newer approved digest must not hide the older exact grant.
     let changed = approval_request(sql, Some(session_id.clone()), b"43");
     assert_eq!(
         retry.request(&changed).unwrap().decision,
         ProviderDecision::Waiting
+    );
+    let changed_pending = wire_provider.request(&changed).unwrap();
+    assert_eq!(changed_pending.decision, ProviderDecision::Waiting);
+    client
+        .decide_approval(
+            changed_pending.id.as_str(),
+            ApprovalDecision::Approved,
+            qk_approval::DecisionSource::Ui,
+            Some(qk_approval::Scope::Once),
+        )
+        .unwrap();
+    assert_eq!(
+        wire_provider.request(&first).unwrap().decision,
+        ProviderDecision::Approved
+    );
+    assert_eq!(
+        wire_provider.request(&changed).unwrap().decision,
+        ProviderDecision::Approved
     );
 
     // All trusted dimensions are sent to the daemon verifier. A different
@@ -232,9 +265,7 @@ async fn real_daemon_exact_v2_once_session_and_scope_semantics() {
         ProviderDecision::Approved
     );
 
-    // New wire ExactV2 digests are opaque to the daemon: only digest/version
-    // are stored; no parameter bytes are supplied to this provider API.
-    assert_eq!(client.list_approvals().unwrap().len(), 2);
+    assert_eq!(client.list_approvals().unwrap().len(), 3);
     daemon.stop().await;
 }
 
@@ -460,5 +491,41 @@ async fn real_daemon_expired_exact_grant_stays_waiting() {
         provider.request(&request).unwrap().decision,
         ProviderDecision::Waiting
     );
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn waiting_provider_rechecks_daemon_and_verifies_exact_request() {
+    let mut daemon = TestDaemon::start().await;
+    let client = daemon.client();
+    let request = approval_request("DELETE FROM t WHERE id = $1", None, b"42");
+    let provider = DaemonApprovalProvider::new(client.clone(), None, "db".to_owned(), None)
+        .with_wait_timeout(Duration::from_secs(3));
+    let task = tokio::task::spawn_blocking(move || provider.request(&request));
+
+    let row = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(rows) = client.list_approvals() {
+                if let Some(row) = rows.first() {
+                    if row.status == ApprovalStatus::Waiting {
+                        break row.clone();
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("approval creation");
+    client
+        .decide_approval(
+            &row.id,
+            ApprovalDecision::Approved,
+            qk_approval::DecisionSource::Ui,
+            Some(qk_approval::Scope::Once),
+        )
+        .unwrap();
+    let response = task.await.expect("provider task").unwrap();
+    assert_eq!(response.decision, ProviderDecision::Approved);
     daemon.stop().await;
 }

@@ -18,6 +18,7 @@ mod daemon_cmd;
 mod inspect;
 mod mcp_cmd;
 mod policy;
+mod proxy_cmd;
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 
@@ -123,6 +124,12 @@ enum TopCommand {
         #[arg(long)]
         home: Option<std::path::PathBuf>,
     },
+    /// Start the PostgreSQL Simple Query wire proxy (default listen port 5434).
+    Proxy {
+        /// Loopback listener port.
+        #[arg(long)]
+        listen: Option<u16>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -223,6 +230,7 @@ fn run(cli: Cli) -> i32 {
         Some(TopCommand::Stop { home, port }) => daemon_cmd::stop(home, port),
         Some(TopCommand::Status { home, port }) => daemon_cmd::status(home, port),
         Some(TopCommand::Mcp { policy, home }) => mcp_cmd::run(policy, home),
+        Some(TopCommand::Proxy { listen }) => proxy_cmd::run(listen),
     }
 }
 

@@ -87,6 +87,18 @@ pub struct EvaluationResult {
     pub operation: Option<String>,
 }
 
+impl EvaluationResult {
+    /// Whether this evaluation contains the given top-level statement
+    /// operation. This reads evaluator-produced typed-name metadata; it does
+    /// not reparse SQL or infer operations from user strings.
+    #[must_use]
+    pub fn includes_operation(&self, operation: &Operation) -> bool {
+        self.operation
+            .as_deref()
+            .is_some_and(|names| names.split(',').any(|name| name == operation.name()))
+    }
+}
+
 /// Evaluate SQL against policy: the single decision path for every
 /// integration (MCP, CLI, proxy, OpenShell call this; never per-engine or
 /// per-transport variants).

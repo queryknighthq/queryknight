@@ -12,6 +12,9 @@ qk-core = { path = "../qk-core" }
 qk-sql = { path = "../qk-sql" }
 qk-daemon = { path = "../qk-daemon" }
 qk-mcp = { path = "../qk-mcp" }
+qk-proxy-postgres = { path = "../qk-proxy-postgres" }
+qk-db = { path = "../qk-db" }
+qk-control-plane = { path = "../qk-control-plane" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

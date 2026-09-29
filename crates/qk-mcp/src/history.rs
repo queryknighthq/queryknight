@@ -9,25 +9,7 @@
 
 use qk_control_plane::ControlPlaneClient;
 
-/// Frozen `classifySql` keyword map (history display metadata only —
-/// security analysis stays in `qk-sql`/`qk-core`).
-pub fn classify_for_history(sql: &str) -> (&'static str, &'static str) {
-    let keyword = sql
-        .trim_start()
-        .split(|c: char| c.is_whitespace())
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match keyword.as_str() {
-        "select" | "show" | "describe" | "desc" | "explain" | "with" => ("read", "low"),
-        "insert" | "update" | "replace" => ("write", "medium"),
-        "delete" => ("write", "high"),
-        "create" | "alter" | "rename" => ("ddl", "high"),
-        "drop" | "truncate" => ("destructive", "critical"),
-        "grant" | "revoke" => ("privilege", "critical"),
-        _ => ("unknown", "unknown"),
-    }
-}
+pub use qk_control_plane::classify_sql_for_history as classify_for_history;
 
 /// Best-effort history recorder: daemon endpoint plus session binding.
 /// `None` (daemon down) disables recording; tools run unchanged.

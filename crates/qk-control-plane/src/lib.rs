@@ -9,7 +9,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use qk_approval::{
     ApprovalId, ApprovalProvider, ApprovalRequest, ProviderDecision, ProviderError,
@@ -191,6 +191,13 @@ impl ApprovalDecisionStatus {
 pub struct ApprovalSummary {
     /// Opaque approval id.
     pub id: String,
+    /// Query shape used to locate an exact retry for wire protocols without
+    /// an approval-id field. This is only a candidate filter; verification
+    /// still requires the daemon's exact digest/scope endpoint.
+    pub fingerprint: String,
+    /// Binding kind, conservatively mapped.
+    #[serde(deserialize_with = "deserialize_binding_kind")]
+    pub binding_kind: ApprovalBindingKind,
     /// Human-facing risk label.
     pub risk: String,
     /// Human-facing operation summary.
@@ -208,6 +215,8 @@ impl Default for ApprovalSummary {
     fn default() -> Self {
         Self {
             id: String::new(),
+            fingerprint: String::new(),
+            binding_kind: ApprovalBindingKind::Unknown,
             risk: String::new(),
             operation_summary: String::new(),
             reason: String::new(),
@@ -361,7 +370,10 @@ impl ControlPlaneClient {
         Self::discover_with_url(home, configured.as_deref())
     }
 
-    fn discover_with_url(
+    /// Discover against an explicit loopback URL override. This is useful
+    /// when one process owns clients for multiple QueryKnight homes; the same
+    /// centralized home/token/pid resolution and loopback validation apply.
+    pub fn discover_with_url(
         home: Option<PathBuf>,
         daemon_url: Option<&str>,
     ) -> Result<Self, ControlPlaneError> {
@@ -439,6 +451,29 @@ impl ControlPlaneClient {
         Ok(())
     }
 
+    /// Record one SQL query using the frozen shared history classification
+    /// and fingerprint. The caller controls the trusted source identity.
+    pub fn record_query(
+        &self,
+        session_id: &str,
+        connection_key: &str,
+        source: &str,
+        sql: &str,
+    ) -> Result<(), ControlPlaneError> {
+        let (class, risk) = classify_sql_for_history(sql);
+        let fingerprint = qk_core::sql_fingerprint(sql);
+        let event = serde_json::json!({
+            "sessionId": session_id,
+            "connectionKey": connection_key,
+            "source": source,
+            "sql": sql,
+            "sqlFingerprint": fingerprint.as_str(),
+            "classification": {"class": class, "risk": risk},
+            "decision": "executed",
+        });
+        self.record_event(&event)
+    }
+
     /// List typed approval summaries for the MCP presentation layer.
     pub fn list_approvals(&self) -> Result<Vec<ApprovalSummary>, ControlPlaneError> {
         let (status, raw) = self.get("/approvals")?;
@@ -446,6 +481,29 @@ impl ControlPlaneClient {
             return Err(http_status_error(status));
         }
         serde_json::from_slice(&raw).map_err(|_| ControlPlaneError::InvalidResponse)
+    }
+
+    /// Return approved exact-bound rows with this shape as candidates for
+    /// wire protocols without an approval-id field. Every candidate must
+    /// still pass [`Self::verify_approval`] for the current digest and scope.
+    pub fn exact_candidates(
+        &self,
+        fingerprint: &QueryShapeFingerprint,
+    ) -> Result<Vec<ApprovalId>, ControlPlaneError> {
+        let rows = self.list_approvals()?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                row.fingerprint == fingerprint.as_str()
+                    && row.status == ApprovalStatus::Approved
+                    && matches!(
+                        row.binding_kind,
+                        ApprovalBindingKind::ExactV1 | ApprovalBindingKind::ExactV2
+                    )
+                    && !row.id.is_empty()
+            })
+            .map(|row| ApprovalId::new(row.id))
+            .collect())
     }
 
     /// Read typed status/fingerprint/binding metadata for an approval id.
@@ -726,6 +784,8 @@ pub struct DaemonApprovalProvider {
     session_id: Option<String>,
     connection_key: String,
     approval_id: Option<String>,
+    implicit_exact_retry: bool,
+    wait_timeout: Duration,
 }
 
 impl Debug for DaemonApprovalProvider {
@@ -737,6 +797,7 @@ impl Debug for DaemonApprovalProvider {
                 "approval_id",
                 &self.approval_id.as_ref().map(|_| "<opaque>"),
             )
+            .field("implicit_exact_retry", &self.implicit_exact_retry)
             .finish_non_exhaustive()
     }
 }
@@ -755,6 +816,63 @@ impl DaemonApprovalProvider {
             session_id,
             connection_key,
             approval_id,
+            implicit_exact_retry: false,
+            wait_timeout: Duration::ZERO,
+        }
+    }
+
+    /// Permit exact digest lookup when a wire protocol has no approval-id
+    /// field. Candidates are always re-verified by the daemon; nothing is
+    /// cached in process.
+    pub fn with_exact_lookup_retry(mut self) -> Self {
+        self.implicit_exact_retry = true;
+        self
+    }
+
+    /// Wait for daemon status changes for integrations that can keep a
+    /// request open. Wire protocols with retry-based approval should leave
+    /// this disabled.
+    pub fn with_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.wait_timeout = timeout;
+        self
+    }
+
+    fn wait_for_approval(&self, id: ApprovalId, input: &ApprovalRequest) -> ProviderResponse {
+        let deadline = Instant::now() + self.wait_timeout;
+        while Instant::now() < deadline {
+            if let Ok(row) = self.client.approval(&id) {
+                if row.fingerprint == input.fingerprint.as_str()
+                    && row.binding_kind != ApprovalBindingKind::LegacyShape
+                {
+                    if row.status == ApprovalStatus::Denied {
+                        return ProviderResponse {
+                            id,
+                            decision: ProviderDecision::Denied,
+                        };
+                    }
+                    let exact_binding = matches!(
+                        row.binding_kind,
+                        ApprovalBindingKind::ExactV1 | ApprovalBindingKind::ExactV2
+                    );
+                    if exact_binding
+                        && row.status == ApprovalStatus::Approved
+                        && self
+                            .client
+                            .verify_approval(&id, &input.exact, &input.scope)
+                            .unwrap_or(false)
+                    {
+                        return ProviderResponse {
+                            id,
+                            decision: ProviderDecision::Approved,
+                        };
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        ProviderResponse {
+            id,
+            decision: ProviderDecision::Waiting,
         }
     }
 }
@@ -792,9 +910,13 @@ impl ApprovalProvider for DaemonApprovalProvider {
                     }
                 }
             }
-            return Ok(ProviderResponse {
-                id: approval_id,
-                decision: ProviderDecision::Waiting,
+            return Ok(if self.wait_timeout.is_zero() {
+                ProviderResponse {
+                    id: approval_id,
+                    decision: ProviderDecision::Waiting,
+                }
+            } else {
+                self.wait_for_approval(approval_id, input)
             });
         }
         if let Some(session_id) = self.session_id.as_deref() {
@@ -809,13 +931,33 @@ impl ApprovalProvider for DaemonApprovalProvider {
                 });
             }
         }
+        if self.implicit_exact_retry {
+            if let Ok(candidates) = self.client.exact_candidates(&input.fingerprint) {
+                for id in candidates {
+                    if self
+                        .client
+                        .verify_approval(&id, &input.exact, &input.scope)
+                        .unwrap_or(false)
+                    {
+                        return Ok(ProviderResponse {
+                            id,
+                            decision: ProviderDecision::Approved,
+                        });
+                    }
+                }
+            }
+        }
         match self
             .client
             .create_approval(input, &self.connection_key, self.session_id.as_deref())
         {
-            Ok(id) => Ok(ProviderResponse {
-                id,
-                decision: ProviderDecision::Waiting,
+            Ok(id) => Ok(if self.wait_timeout.is_zero() {
+                ProviderResponse {
+                    id,
+                    decision: ProviderDecision::Waiting,
+                }
+            } else {
+                self.wait_for_approval(id, input)
             }),
             Err(_) => Err(ProviderError::Transport(
                 "control plane unavailable".to_owned(),
@@ -850,6 +992,26 @@ fn operation_summary(operation: Option<&str>, target: Option<&str>) -> String {
         _ => base.to_owned(),
     };
     summary.chars().take(200).collect()
+}
+
+/// Frozen history classification used only for activity display metadata.
+/// Policy/security classification remains in `qk-sql`/`qk-core`.
+pub fn classify_sql_for_history(sql: &str) -> (&'static str, &'static str) {
+    let keyword = sql
+        .trim_start()
+        .split(|character: char| character.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match keyword.as_str() {
+        "select" | "show" | "describe" | "desc" | "explain" | "with" => ("read", "low"),
+        "insert" | "update" | "replace" => ("write", "medium"),
+        "delete" => ("write", "high"),
+        "create" | "alter" | "rename" => ("ddl", "high"),
+        "drop" | "truncate" => ("destructive", "critical"),
+        "grant" | "revoke" => ("privilege", "critical"),
+        _ => ("unknown", "unknown"),
+    }
 }
 
 #[cfg(test)]

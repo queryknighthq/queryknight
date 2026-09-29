@@ -1508,9 +1508,12 @@ dependencies = [
  "assert_cmd",
  "clap",
  "predicates",
+ "qk-control-plane",
  "qk-core",
  "qk-daemon",
+ "qk-db",
  "qk-mcp",
+ "qk-proxy-postgres",
  "qk-sql",
  "rusqlite",
  "serde",
@@ -1617,6 +1620,23 @@ dependencies = [
 [[package]]
 name = "qk-metrics"
 version = "0.1.0"
+
+[[package]]
+name = "qk-proxy-postgres"
+version = "0.1.0-beta.0"
+dependencies = [
+ "bytes",
+ "qk-approval",
+ "qk-control-plane",
+ "qk-core",
+ "qk-daemon",
+ "qk-db",
+ "qk-sql",
+ "qk-store",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+]
 
 [[package]]
 name = "qk-sql"

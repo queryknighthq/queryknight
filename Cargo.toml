@@ -13,4 +13,5 @@ members = [
     "crates/qk-metrics",
     "crates/qk-audit",
     "crates/qk-control-plane",
+    "crates/qk-proxy-postgres",
 ]
