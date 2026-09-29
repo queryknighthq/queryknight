@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use qk_approval::{ApprovalId, ApprovalScope, DecisionSource, GrantStatus, Scope, StoredGrant};
-use qk_core::{parse_reason_code, ExactRequestDigest, QueryShapeFingerprint, ReasonCode};
+use qk_core::{parse_reason_code, QueryShapeFingerprint, ReasonCode};
 use rusqlite::{params, OptionalExtension};
 
 use crate::error::{classify_rusqlite, StoreError};
@@ -138,7 +138,12 @@ impl Store {
                     grant.decided_at_ms.map(|t| t as i64),
                     grant.decided_by.map(|source| source.as_str()),
                     grant.reuse.as_str(),
-                    &grant.exact.as_bytes()[..],
+                    match &grant.binding {
+                        qk_approval::ApprovalBinding::ExactV1(digest) => {
+                            Some(digest.as_bytes().as_slice())
+                        }
+                        _ => None,
+                    },
                     grant.scope.integration,
                     grant.scope.environment,
                     grant.scope.database,
@@ -290,7 +295,6 @@ impl Store {
         scope: &qk_approval::ApprovalScope,
         now_ms: u64,
     ) -> Result<Option<StoredGrant>, StoreError> {
-        use qk_approval::ApprovalBinding;
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(
@@ -302,7 +306,7 @@ impl Store {
                  FROM approvals
                  WHERE status = 'approved' AND scope = 'session'
                    AND session_id = ?1 AND fingerprint = ?2
-                   AND binding_kind = 'exact_v1'
+                   AND binding_kind IN ('exact_v1', 'shape_v1')
                  ORDER BY created_at DESC",
             )
             .map_err(classify_rusqlite)?;
@@ -316,7 +320,7 @@ impl Store {
                 Err(StoreError::InvalidRow(_)) => continue,
                 Err(error) => return Err(error),
             };
-            if grant.binding != ApprovalBinding::ExactV1 {
+            if !grant.binding.authorizable() {
                 continue;
             }
             if now_ms >= grant.expires_at_ms {
@@ -733,6 +737,20 @@ fn trim_debug(error: rusqlite::Error) -> String {
 /// Raw session row as read from SQLite, before timestamp validation.
 type RawSessionRow = (String, String, Option<String>, i64, Option<i64>, String);
 
+/// Fixed-size digest bytes or a typed row error (wrong length digests
+/// are corrupt rows, never silently truncated or padded).
+fn bytes_to_array(bytes: &[u8], id: &str) -> Result<[u8; 32], StoreError> {
+    if bytes.len() != 32 {
+        return Err(StoreError::InvalidRow(format!(
+            "approval {id}: bad exact digest length {}",
+            bytes.len()
+        )));
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(bytes);
+    Ok(digest)
+}
+
 fn grant_status_text(status: GrantStatus) -> &'static str {
     match status {
         GrantStatus::Waiting => "waiting",
@@ -820,18 +838,7 @@ impl GrantRow {
             )));
         }
         let exact = match self.exact_digest {
-            Some(bytes) => {
-                if bytes.len() != 32 {
-                    return Err(StoreError::InvalidRow(format!(
-                        "approval {}: bad exact digest length {}",
-                        self.id,
-                        bytes.len()
-                    )));
-                }
-                let mut digest = [0u8; 32];
-                digest.copy_from_slice(&bytes);
-                Some(ExactRequestDigest::from_bytes(digest))
-            }
+            Some(bytes) => Some(bytes_to_array(&bytes, &self.id)?),
             None => None,
         };
         let status = match self.status.as_str() {
@@ -882,34 +889,35 @@ impl GrantRow {
         };
         // Explicit binding kind wins. Absent (pre-v3 reads) falls back to
         // the nullability derivation, which mirrors the migration
-        // classifier: only fully complete rows qualify.
+        // classifier: exact bytes plus all scope dimensions, or legacy.
+        // Unknown kinds and inconsistent combinations (exact_v1 without
+        // digest bytes) are corrupt rows, never grants.
+        let digest_bytes = match exact {
+            Some(bytes) => Some(bytes_to_array(&bytes, &self.id)?),
+            None => None,
+        };
+        let complete = digest_bytes.is_some()
+            && self.integration.is_some()
+            && self.environment.is_some()
+            && self.database_name.is_some()
+            && self.agent_id.is_some()
+            && self.tool.is_some();
         let binding = match self.binding_kind.as_deref() {
-            Some("exact_v1") => qk_approval::ApprovalBinding::ExactV1,
-            Some("legacy_shape") => qk_approval::ApprovalBinding::LegacyShape,
-            None => {
-                let complete = exact.is_some()
-                    && self.integration.is_some()
-                    && self.environment.is_some()
-                    && self.database_name.is_some()
-                    && self.agent_id.is_some()
-                    && self.tool.is_some();
-                if complete {
-                    qk_approval::ApprovalBinding::ExactV1
-                } else {
-                    qk_approval::ApprovalBinding::LegacyShape
-                }
+            Some(kind) => {
+                qk_approval::ApprovalBinding::parse(kind, digest_bytes).ok_or_else(|| {
+                    StoreError::InvalidRow(format!("approval {}: bad binding {kind:?}", self.id))
+                })?
             }
-            Some(other) => {
-                return Err(StoreError::InvalidRow(format!(
-                    "approval {}: unknown binding kind {other:?}",
-                    self.id
-                )));
-            }
+            None => match (complete, digest_bytes) {
+                (true, Some(bytes)) => qk_approval::ApprovalBinding::ExactV1(
+                    qk_core::ExactRequestDigest::from_bytes(bytes),
+                ),
+                _ => qk_approval::ApprovalBinding::LegacyShape,
+            },
         };
         Ok(StoredGrant {
             id: ApprovalId::new(self.id),
             shape: QueryShapeFingerprint::new(self.fingerprint),
-            exact: exact.unwrap_or_else(ExactRequestDigest::unmatchable),
             binding,
             scope: ApprovalScope {
                 session_id: self.session_id,

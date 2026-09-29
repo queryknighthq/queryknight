@@ -134,7 +134,7 @@ pub fn resolve(
     // Store failures here fail closed; unknown or corrupt ids behave as
     // fresh (provider re-ask, never a grant).
     if let Some(id) = request.approval_id {
-        match retry_outcome(request, store, id, &exact, &scope) {
+        match retry_outcome(request, store, id, &shape, &exact, &scope) {
             Retry::Settled(resolved) => return resolved,
             Retry::Pending(resolved) => return resolved,
             Retry::Fresh => {}
@@ -188,8 +188,7 @@ pub fn resolve(
             let stored = StoredGrant {
                 id: response.id.clone(),
                 shape: shape.clone(),
-                exact,
-                binding: ApprovalBinding::ExactV1,
+                binding: ApprovalBinding::ExactV1(exact),
                 scope,
                 status: match response.decision {
                     ProviderDecision::Approved => GrantStatus::Approved,
@@ -298,6 +297,7 @@ fn retry_outcome(
     request: &ResolveRequest<'_>,
     store: &dyn ApprovalStore,
     id: &str,
+    shape: &QueryShapeFingerprint,
     exact: &ExactRequestDigest,
     scope: &ApprovalScope,
 ) -> Retry {
@@ -311,15 +311,18 @@ fn retry_outcome(
         Err(ApprovalStoreError::CorruptState(_)) => return Retry::Fresh,
         Err(_) => return Retry::StoreFailed(store_failure(request, "grant lookup failed")),
     };
-    // Exact-request binding: the grant must be fully bound, and any
-    // literal (or dialect, or scope) change alters the digest or scope, so
-    // the token cannot be reused for it. The reference mints a new
-    // approval row in this case; we proceed as a fresh request the same
-    // way.
-    if grant.binding != ApprovalBinding::ExactV1
-        || grant.exact != *exact
-        || !grant.scope.matches(scope)
-    {
+    // Token binding: `Exact` grants require digest equality (any literal,
+    // dialect, or whitespace change alters it); `Shape` grants (daemon
+    // flow, which never sees SQL) require shape equality instead. Scope
+    // must match fully either way, and legacy bindings never qualify. The
+    // reference mints a new approval row on mismatch; we proceed as a
+    // fresh request the same way.
+    let bound = match &grant.binding {
+        ApprovalBinding::ExactV1(digest) => digest == exact,
+        ApprovalBinding::ShapeV1 => grant.shape == *shape,
+        ApprovalBinding::LegacyShape => false,
+    };
+    if !bound || !grant.scope.matches(scope) {
         return Retry::Fresh;
     }
     if request.now_ms >= grant.expires_at_ms {
@@ -364,7 +367,7 @@ fn verify_session_grant(
     scope: &ApprovalScope,
     shape: &QueryShapeFingerprint,
 ) -> Option<ResolvedEvaluation> {
-    if grant.binding != ApprovalBinding::ExactV1
+    if !grant.binding.authorizable()
         || grant.status != GrantStatus::Approved
         || grant.reuse != Scope::Session
         || grant.shape != *shape

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use qk_approval::{ApprovalId, ApprovalScope, GrantStatus, Scope, StoredGrant};
 use qk_core::ReasonCode;
-use qk_sql::SqlDialect;
+
 use qk_store::{ConnectionRecord, SessionEvent, SessionRecord, Store, StoreError};
 
 const NOW: u64 = 1_000_000;
@@ -40,11 +40,10 @@ fn grant(id: &str) -> StoredGrant {
     StoredGrant {
         id: ApprovalId::new(id.to_owned()),
         shape: qk_core::sql_fingerprint("DELETE FROM customers WHERE id = 42"),
-        exact: qk_core::exact_request_digest(
-            SqlDialect::PostgreSql,
+        binding: qk_approval::ApprovalBinding::ExactV1(qk_core::exact_request_digest(
+            qk_sql::SqlDialect::PostgreSql,
             "DELETE FROM customers WHERE id = 42",
-        ),
-        binding: qk_approval::ApprovalBinding::ExactV1,
+        )),
         scope: scope(),
         status: GrantStatus::Waiting,
         reuse: Scope::Once,
@@ -370,7 +369,13 @@ fn v2_complete_row_promoted_not_reapproved() {
         qk_store::SCHEMA_VERSION
     );
     let grant = store.get_grant("qka_modern").expect("get").expect("row");
-    assert_eq!(grant.binding, qk_approval::ApprovalBinding::ExactV1);
+    assert_eq!(
+        grant.binding,
+        qk_approval::ApprovalBinding::ExactV1(qk_core::exact_request_digest(
+            qk_sql::SqlDialect::PostgreSql,
+            "DELETE FROM customers WHERE id = 42",
+        ))
+    );
     let shape = qk_core::QueryShapeFingerprint::new("0d2e6c16b5960f15".to_owned());
     let found = store
         .find_session_grant("session-1", &shape, &scope(), NOW)
@@ -557,7 +562,7 @@ fn grant_round_trip_all_fields() {
     store.insert_grant(&full, NOW).expect("insert");
     let back = store.get_grant("qka-full").expect("get").expect("row");
     assert_eq!(back, full);
-    assert_eq!(back.binding, qk_approval::ApprovalBinding::ExactV1);
+    assert!(back.binding.authorizable());
 }
 
 #[test]

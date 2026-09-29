@@ -149,8 +149,10 @@ fn approval_cannot_override_hard_denials() {
             .insert_grant(StoredGrant {
                 id: qk_approval::ApprovalId::new("qka-live".to_owned()),
                 shape: qk_core::sql_fingerprint(sql),
-                exact: qk_core::exact_request_digest(qk_sql::SqlDialect::PostgreSql, sql),
-                binding: ApprovalBinding::ExactV1,
+                binding: ApprovalBinding::ExactV1(qk_core::exact_request_digest(
+                    qk_sql::SqlDialect::PostgreSql,
+                    sql,
+                )),
                 scope: qk_approval::ApprovalScope {
                     session_id: Some("session-1".to_owned()),
                     integration: "mcp".to_owned(),
@@ -713,7 +715,6 @@ fn legacy_grant_never_authorizes_at_resolver() {
     let mut legacy = StoredGrant {
         id: qk_approval::ApprovalId::new("qka-legacy".to_owned()),
         shape: qk_core::sql_fingerprint(SQL),
-        exact: qk_core::exact_request_digest(qk_sql::SqlDialect::PostgreSql, SQL),
         binding: ApprovalBinding::LegacyShape,
         scope: qk_approval::ApprovalScope {
             session_id: context.session_id.clone(),
@@ -801,7 +802,6 @@ fn resolver_rejects_leaking_legacy_grant() {
         grant: StoredGrant {
             id: qk_approval::ApprovalId::new("qka-leak".to_owned()),
             shape: qk_core::sql_fingerprint(SQL),
-            exact: qk_core::exact_request_digest(qk_sql::SqlDialect::PostgreSql, SQL),
             binding: ApprovalBinding::LegacyShape,
             scope: qk_approval::ApprovalScope {
                 session_id: context.session_id.clone(),

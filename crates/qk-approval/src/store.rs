@@ -23,14 +23,18 @@ pub enum GrantStatus {
     Denied,
 }
 
-/// Binding completeness of a stored grant. Legacy and incomplete rows are
-/// historical state only: the type system separates them from fully-bound
-/// grants so no lookup path can accidentally treat one as the other.
+/// Binding completeness of a stored grant. The type system separates
+/// authorizable bindings from historical state so no lookup path can
+/// accidentally treat one as the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalBinding {
-    /// Complete modern binding: exact digest plus all scope dimensions.
-    /// The only kind eligible for authorization.
-    ExactV1,
+    /// Exact token binding: carries the full request digest. Retry
+    /// requires digest equality; session reuse matches by shape.
+    ExactV1(ExactRequestDigest),
+    /// Shape binding for daemon-issued rows (frozen semantics: the daemon
+    /// never sees SQL, so it binds shape plus full scope). Retry and
+    /// session reuse both match by shape; scope dimensions still bind.
+    ShapeV1,
     /// Migrated legacy state (or otherwise incomplete binding): visible
     /// for history and introspection, never authorization-capable.
     LegacyShape,
@@ -41,28 +45,51 @@ impl ApprovalBinding {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::ExactV1 => "exact_v1",
+            Self::ExactV1(_) => "exact_v1",
+            Self::ShapeV1 => "shape_v1",
             Self::LegacyShape => "legacy_shape",
+        }
+    }
+
+    /// True for bindings eligible for authorization (`ExactV1` with a
+    /// matching digest, `ShapeV1` with a matching shape).
+    /// `LegacyShape` is historical state only.
+    #[must_use]
+    pub fn authorizable(&self) -> bool {
+        !matches!(self, Self::LegacyShape)
+    }
+
+    /// Parse a stored binding kind with its exact digest bytes (when the
+    /// row carries them). Unknown kinds and inconsistent combinations
+    /// (e.g. `exact_v1` without digest bytes) return `None` so callers
+    /// reject the row.
+    pub fn parse(kind: &str, exact_digest: Option<[u8; 32]>) -> Option<Self> {
+        match (kind, exact_digest) {
+            ("exact_v1", Some(bytes)) => Some(Self::ExactV1(ExactRequestDigest::from_bytes(bytes))),
+            ("shape_v1", _) => Some(Self::ShapeV1),
+            ("legacy_shape", _) => Some(Self::LegacyShape),
+            _ => None,
         }
     }
 }
 
 /// One stored approval row.
 ///
-/// Every grant carries both identities: `exact` binds approval-id retries
-/// to the precise request bytes, while `shape` serves explicitly
-/// shape-scoped session grants (and compatibility display). Storing both
-/// is required because shape cannot be derived back from a one-way exact
-/// digest when a waiting grant is later upgraded to session scope.
+/// Every grant carries its query shape plus a binding that states exactly
+/// how it may authorize: `Exact` binds approval-id retries to precise
+/// request bytes, `ShapeV1` binds daemon-issued rows by shape plus full
+/// scope (frozen semantics: the daemon never sees SQL), and `LegacyShape`
+/// marks quarantined history. Storing shape alongside is required because
+/// shape cannot be derived back from a one-way exact digest when a waiting
+/// grant is later upgraded to session scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredGrant {
     /// Approval id (provider-assigned or generated).
     pub id: ApprovalId,
-    /// Normalized query-shape identity (compat + session-shape binding).
+    /// Normalized query-shape identity (compat, display, session-shape
+    /// binding).
     pub shape: QueryShapeFingerprint,
-    /// Exact request identity (approval-token binding).
-    pub exact: ExactRequestDigest,
-    /// Binding completeness; only `ExactV1` can authorize.
+    /// How this grant may authorize. Only authorizable kinds ever grant.
     pub binding: ApprovalBinding,
     /// Scope the grant binds to.
     pub scope: ApprovalScope,
@@ -244,7 +271,7 @@ impl ApprovalStore for InMemoryApprovalStore {
             .map_err(|_| Self::poisoned())?
             .values()
             .find(|grant| {
-                grant.binding == ApprovalBinding::ExactV1
+                grant.binding.authorizable()
                     && grant.status == GrantStatus::Approved
                     && grant.reuse == Scope::Session
                     && grant.shape == *shape
@@ -290,8 +317,10 @@ mod tests {
         StoredGrant {
             id: ApprovalId::new("qka-1".to_owned()),
             shape: sql_fingerprint("SELECT 1"),
-            exact: exact_request_digest(SqlDialect::PostgreSql, "SELECT 1"),
-            binding: ApprovalBinding::ExactV1,
+            binding: ApprovalBinding::ExactV1(exact_request_digest(
+                SqlDialect::PostgreSql,
+                "SELECT 1",
+            )),
             scope: scope(),
             status: GrantStatus::Waiting,
             reuse: Scope::Once,
