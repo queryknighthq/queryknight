@@ -61,11 +61,20 @@ packages/cli/                    Compiled binary entry (`bun build ... --compile
   ui.ts                         Terminal dashboard
 
 packages/adapters/{mysql,postgres,sqlite}/
-  Each implements DatabaseAdapter: connect/disconnect/ping, listSchemas/listTables/describeTable (information_schema normalized), execute, analyze (thin wrapper over core analyzeSql with fixed dialect), estimateImpact (EXPLAIN for UPDATE/DELETE only; non-writes return undefined without touching DB), dumpSchema (SHOW CREATE TABLE / pg_dump output / sqlite ddl), sample (ORDER BY RAND()/random()).
+## PostgreSQL proxy audit (source-verified)
 
-packages/proxies/{mysql,postgres}/
-  Loopback TCP proxies (node:net). MySQL: handshake relay, COM_QUERY, COM_STMT_PREPARE|EXECUTE|CLOSE, prepared-id->SQL template map (classify template, binary params unread). Postgres: simple Query (Q) + extended Parse/Bind/Execute/Sync. Same core safety + approval pipeline as MCP; pause/reject without corrupting protocol state; no transaction semantic changes; no blind write retry. Local leg may be plaintext 127.0.0.1; upstream TLS as configured.
+The exact TypeScript proxy behavior, limitations, frozen error framing, and
+pre-implementation Rust protocol-state table are documented in
+[`proxy-postgres.md`](proxy-postgres.md). In particular, the reference's
+extended-protocol handling authorizes Parse rather than bound Execute values,
+does not track transaction status, and relays GSS/COPY/FunctionCall/replication
+without a request-bound authorization gate. The Rust proxy is a hardening
+port, not a byte-for-byte reproduction of those unsafe paths.
 
+The PostgreSQL Rust ingress uses `proxy_pg` as trusted integration identity,
+one backend session per frontend, and a fresh `ExecutionPermit` before every
+executable Q/Execute. It is not a generic proxy framework. MySQL and OpenShell
+remain separate/deferred.
 packages/integrations/openshell/  NVIDIA OpenShell supervisor-middleware (dependency-free, gRPC optional peer dep)
   inspector.ts                  parseInspectorConfig, baseContext, inspectHttpRequest/inspectWebSocketMessage, WaitingProvider (approvals always waiting), approvalAction deny|allow_with_findings, toReasonCode
   sql-extract.ts                SQL extraction: raw-SQL lead regex, MCP JSON-RPC tools/call, OpenAI tool_calls, generic sql/query/statement fields; caps 8 candidates / 200k chars; strips leading -- and /* */ comments
