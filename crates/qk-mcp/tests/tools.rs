@@ -297,6 +297,40 @@ async fn malformed_arguments_are_protocol_errors() {
 }
 
 #[tokio::test]
+async fn observer_receives_outcome_without_changing_text() {
+    use std::sync::Arc;
+    let (server, _dir) = live_server().await;
+    // Baseline text without observation wiring differences.
+    let plain = server
+        .db_query_impl(query("SELECT id FROM users ORDER BY id LIMIT 1"))
+        .await
+        .expect("query");
+    // Inject a memory sink and re-run: identical text, one event.
+    let memory = Arc::new(qk_audit::MemorySink::new());
+    let mut stateful = server;
+    stateful
+        .state_mut()
+        .set_observer(qk_audit::Observer::new(vec![memory.clone()]));
+    let observed = stateful
+        .db_query_impl(query("SELECT id FROM users ORDER BY id LIMIT 1"))
+        .await
+        .expect("query");
+    assert_eq!(observed, plain);
+    assert_eq!(memory.len(), 1);
+    let event = &memory.events()[0];
+    assert_eq!(event.integration, "mcp");
+    assert_eq!(event.operation, "select");
+    assert!(event.sql.is_none());
+    // Metrics flowed too.
+    assert!(stateful
+        .state()
+        .observer()
+        .metrics()
+        .render()
+        .contains("queryknight_requests_total"));
+}
+
+#[tokio::test]
 async fn unknown_fields_ignored_like_zod_strip() {
     // Frozen: extra JSON keys are stripped, not rejected.
     let args: DbQueryArgs = serde_json::from_value(serde_json::json!({

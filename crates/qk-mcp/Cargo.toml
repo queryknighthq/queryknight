@@ -9,6 +9,8 @@ qk-sql = { path = "../qk-sql" }
 qk-approval = { path = "../qk-approval" }
 qk-db = { path = "../qk-db" }
 qk-daemon = { path = "../qk-daemon" }
+qk-audit = { path = "../qk-audit" }
+qk-metrics = { path = "../qk-metrics" }
 rmcp = { version = "3", features = ["transport-io"] }
 base64 = "0.22"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util", "signal"] }

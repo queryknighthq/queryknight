@@ -59,6 +59,7 @@ pub struct McpState {
     /// history-less execution and frozen unavailable texts).
     endpoint: Option<DaemonEndpoint>,
     history: Option<HistoryRecorder>,
+    observer: qk_audit::Observer,
 }
 
 impl McpState {
@@ -83,6 +84,7 @@ impl McpState {
             policy,
             endpoint,
             history,
+            observer: qk_audit::Observer::new(vec![]),
         })
     }
 
@@ -102,7 +104,18 @@ impl McpState {
             policy,
             endpoint: None,
             history,
+            observer: qk_audit::Observer::new(vec![]),
         })
+    }
+
+    /// Shared observer (audit sinks + metrics).
+    pub fn observer(&self) -> &qk_audit::Observer {
+        &self.observer
+    }
+
+    /// Replace the observer (tests inject memory sinks here).
+    pub fn set_observer(&mut self, observer: qk_audit::Observer) {
+        self.observer = observer;
     }
 
     fn trusted(&self) -> TrustedContext {
@@ -311,6 +324,11 @@ impl QueryKnightServer {
         &self.state
     }
 
+    /// Mutable state (tests inject observers/sinks here).
+    pub fn state_mut(&mut self) -> &mut McpState {
+        Arc::get_mut(&mut self.state).expect("unshared server state")
+    }
+
     /// Registered tools for schema-snapshot tests.
     pub fn tools_snapshot(&self) -> Vec<rmcp::model::Tool> {
         let mut tools = self.tool_router.list_all();
@@ -431,6 +449,44 @@ impl QueryKnightServer {
         ))
     }
 
+    /// Observe one guarded outcome: exactly one audit event plus
+    /// metric increments. Sink failures go to stderr (bounded,
+    /// secret-free) and never affect results.
+    fn observe_outcome(&self, sql: &str, started: SystemTime, outcome: &ExecutionOutcome) {
+        let trusted = self.state.trusted();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let observation = qk_audit::Observation::from_outcome(
+            qk_audit::new_event_id(),
+            now_ms,
+            started
+                .elapsed()
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or(0),
+            None,
+            None,
+            trusted.integration,
+            trusted.environment,
+            Some(trusted.database),
+            None,
+            trusted.session_id,
+            None,
+            Some(trusted.tool),
+            self.state.connection.config.dialect(),
+            sql.to_owned(),
+            outcome,
+        );
+        for failure in self
+            .state
+            .observer()
+            .observe(&observation, qk_audit::SqlLogLevel::Fingerprint)
+        {
+            eprintln!("audit sink failed: {failure}");
+        }
+    }
+
     /// Handler entry (public for integration tests).
     pub async fn db_query_impl(&self, args: DbQueryArgs) -> Result<String, McpError> {
         validate_query(&args)?;
@@ -462,6 +518,7 @@ impl QueryKnightServer {
                 },
             )
             .await;
+        self.observe_outcome(&args.sql, started, &outcome);
         self.finish_query(args.sql, started, outcome)
     }
 
@@ -479,7 +536,8 @@ impl QueryKnightServer {
             .map(|elapsed| elapsed.as_millis() as u64)
             .ok();
         match outcome {
-            ExecutionOutcome::Executed(result) => {
+            ExecutionOutcome::Executed(report) => {
+                let result = &report.result;
                 self.record(HistoryEvent {
                     sql,
                     decision: Some("executed".to_owned()),
@@ -491,7 +549,7 @@ impl QueryKnightServer {
                     estimated_tokens_avoided: result.estimated_tokens_avoided,
                     ..Default::default()
                 });
-                Ok(format_query(&result))
+                Ok(format_query(result))
             }
             ExecutionOutcome::Blocked(reason) => {
                 self.record(HistoryEvent {
@@ -544,9 +602,10 @@ impl QueryKnightServer {
             .service
             .explain_guarded(&call, &args.sql, &args.params.unwrap_or_default())
             .await;
+        self.observe_outcome(&args.sql, started, &outcome);
         match outcome {
-            ExecutionOutcome::Executed(result) => {
-                let plan = result.rows.first().and_then(|row| row.first());
+            ExecutionOutcome::Executed(report) => {
+                let plan = report.result.rows.first().and_then(|row| row.first());
                 let text = match plan {
                     Some(qk_db::DbValue::Text(text)) => text.clone(),
                     _ => String::new(),
@@ -591,18 +650,22 @@ impl QueryKnightServer {
             policy: &self.state.policy,
         };
         let (schema, name) = parse_table_ref(&args.table, args.schema.as_deref());
+        let limit = args.limit.unwrap_or(20) as usize;
+        // The exact generated SELECT (pure constructor — same text the
+        // service evaluates and executes).
+        let sample_sql = self
+            .state
+            .adapter
+            .sample_sql(schema.as_deref(), &name, limit);
         let outcome = self
             .state
             .service
-            .sample_guarded(
-                &call,
-                schema.as_deref(),
-                &name,
-                args.limit.unwrap_or(20) as usize,
-            )
+            .sample_guarded(&call, schema.as_deref(), &name, limit)
             .await;
+        self.observe_outcome(&sample_sql, started, &outcome);
         match outcome {
-            ExecutionOutcome::Executed(result) => {
+            ExecutionOutcome::Executed(report) => {
+                let result = &report.result;
                 self.record(HistoryEvent {
                     sql: format!("SAMPLE {}", args.table),
                     decision: Some("executed".to_owned()),
@@ -613,7 +676,7 @@ impl QueryKnightServer {
                     rows_returned: Some(result.rows_shown),
                     ..Default::default()
                 });
-                Ok(format_query(&result))
+                Ok(format_query(result))
             }
             ExecutionOutcome::Blocked(reason) => Ok(format_blocked(&format!(
                 "{} [{}]",
@@ -740,9 +803,11 @@ impl QueryKnightServer {
         let Some(endpoint) = self.state.endpoint.clone() else {
             return Ok("daemon unavailable; start queryknight".to_owned());
         };
-        let views = endpoint.list_approvals().map_err(|_: crate::daemon::DaemonFailure| {
-            protocol_error(ErrorKind::Daemon("approvals listing failed".to_owned()))
-        })?;
+        let views = endpoint
+            .list_approvals()
+            .map_err(|_: crate::daemon::DaemonFailure| {
+                protocol_error(ErrorKind::Daemon("approvals listing failed".to_owned()))
+            })?;
         let waiting: Vec<&serde_json::Value> = views
             .iter()
             .filter(|view| view.get("status").and_then(|status| status.as_str()) == Some("waiting"))
@@ -774,9 +839,12 @@ impl QueryKnightServer {
             ApprovalStatus::Approved => "approved",
             ApprovalStatus::Denied => "denied",
         };
-        let decided = endpoint.decide(&args.id, status).map_err(|_: crate::daemon::DaemonFailure| {
-            protocol_error(ErrorKind::Daemon("approval decision failed".to_owned()))
-        })?;
+        let decided =
+            endpoint
+                .decide(&args.id, status)
+                .map_err(|_: crate::daemon::DaemonFailure| {
+                    protocol_error(ErrorKind::Daemon("approval decision failed".to_owned()))
+                })?;
         Ok(format!("approval {}: {decided}", args.id))
     }
 

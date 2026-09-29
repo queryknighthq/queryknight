@@ -121,9 +121,10 @@ async fn select_round_trip_with_value_shapes() {
     let outcome = db
         .guarded("SELECT id, name, score, data, meta, created FROM users ORDER BY id")
         .await;
-    let ExecutionOutcome::Executed(result) = outcome else {
+    let ExecutionOutcome::Executed(report) = outcome else {
         panic!("expected executed, got {outcome:?}");
     };
+    let result = &report.result;
     assert_eq!(
         result.columns,
         vec!["id", "name", "score", "data", "meta", "created"]
@@ -161,15 +162,17 @@ async fn bounded_mutations_report_affected_rows() {
     let outcome = db
         .guarded("UPDATE users SET name = 'bob' WHERE id = 1")
         .await;
-    let ExecutionOutcome::Executed(result) = outcome else {
+    let ExecutionOutcome::Executed(report) = outcome else {
         panic!("expected executed, got {outcome:?}");
     };
+    let result = &report.result;
     assert_eq!(result.rows_affected, Some(1));
     assert!(result.rows.is_empty());
     let outcome = db.guarded("DELETE FROM users WHERE id = 1").await;
-    let ExecutionOutcome::Executed(result) = outcome else {
+    let ExecutionOutcome::Executed(report) = outcome else {
         panic!("expected executed, got {outcome:?}");
     };
+    let result = &report.result;
     assert_eq!(result.rows_affected, Some(1));
 }
 
@@ -179,9 +182,10 @@ async fn duplicate_columns_preserved_positionally() {
     let outcome = db
         .guarded("SELECT id, id FROM users ORDER BY id LIMIT 1")
         .await;
-    let ExecutionOutcome::Executed(result) = outcome else {
+    let ExecutionOutcome::Executed(report) = outcome else {
         panic!("expected executed, got {outcome:?}");
     };
+    let result = &report.result;
     assert_eq!(result.columns, vec!["id", "id"]);
     assert_eq!(result.rows[0].len(), 2);
 }
@@ -249,9 +253,10 @@ async fn truncation_flags_and_pages() {
             .expect("bulk insert");
     }
     let outcome = setup.guarded("SELECT id FROM users ORDER BY id").await;
-    let ExecutionOutcome::Executed(result) = outcome else {
+    let ExecutionOutcome::Executed(report) = outcome else {
         panic!("expected executed, got {outcome:?}");
     };
+    let result = &report.result;
     assert!(result.truncated);
     assert_eq!(result.rows_shown, 50);
     assert!(result.cursor.is_some());

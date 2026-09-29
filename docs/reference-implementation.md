@@ -696,6 +696,62 @@ Source: `packages/mcp/src/{index.ts, tools.ts, format.ts, engine.ts}`,
 - `withTimeout`: `QUERYKNIGHT_DB_TIMEOUT_MS ?? 30000`, race with
   `may still be running server-side` text, AbortSignal support.
 
+## Observability audit (observability phase, verified against source 2026-09-30)
+
+Source: `packages/core/src/{audit.ts, ocsf.ts, metrics.ts,
+fingerprint.ts, redact.ts, evaluate.ts}`, OpenShell
+`inspector.ts`/`service.ts` (only non-core consumers).
+
+- Levels: `SqlLogLevel = none|fingerprint|metadata|full_sql`;
+  default `fingerprint` (safe); `MAX_SQL_LOG_CHARS = 20000`.
+  `none` = ids+fingerprint only; `metadata` adds literal-stripped
+  `normalizeSql` + tables + columns; `full_sql` adds raw SQL
+  (secrets possible, opt-in).
+- `normalizeSql`: single/double-quoted literals -> `?`, bare
+  numbers -> `?`, whitespace collapsed, lowercased;
+  `sqlFingerprint` = sha256 hex sliced to 16.
+- `AuditEvent` JSON names: timestamp, event_id, request_id?,
+  agent_id?, session_id?, integration, environment, database?,
+  user?, tool?, dialect, statements, operation, kinds, tables,
+  columns?, fingerprint, normalized_sql?, sql?, decision,
+  reason_code, matched_policy?, approval_id?, duration_ms,
+  parser_ok, enforced.
+- `buildAuditEvent(ctx, sql, result, {level, requestId})` reads the
+  TS `Evaluation` (eventId = `crypto.randomUUID()`, ISO timestamp,
+  `enforced = mode !== 'observe'`).
+- `evaluate({auditSink})` calls the sink post-evaluation inside
+  try/catch (sink failures swallowed — enforcement never breaks).
+  Only OpenShell wires `auditSink` (array push) and
+  `recordEvaluation`; MCP/daemon/proxies emit nothing.
+- Observe mode: `mode === 'observe'` turns non-allow into `allow`
+  with `OBSERVED_<code>` + `enforced: false` — Deny→Allow security
+  semantics, NOT ported (stop-and-report; fixture stays deferred).
+- OCSF 1.5.0, Application Activity / API Activity, class 6003:
+  deny 7/Deny/High(4)/Failure(2); require_approval
+  0/Unknown/Low(2)/Unknown(0); allow 6/Allow/Informational(1)/
+  Success(1). `metadata.product` QueryKnight+version;
+  `actor.user.name` from agent_id ?? user; `api.operation =
+  "<integration>:<operation>"`; full decision under `unmapped.qk_*`;
+  `undefined` fields omitted. Emitted for decisions (including
+  deny/pending), never labeled as successful DB activity.
+- Metrics (`MetricsRegistry`, zero-dep, insertion-order maps):
+  `queryknight_requests_total{integration,environment,database,
+  operation}`, `queryknight_decisions_total{+decision,reason_code}`,
+  `queryknight_policy_denials_total{+reason_code}` (deny only),
+  `queryknight_parse_errors_total{integration,dialect}`,
+  `queryknight_approval_requests_total{+result
+  approved|denied|waiting}` (waiting covers pending/unavailable/
+  error), `queryknight_evaluation_duration_seconds` histogram
+  buckets `[0.005,0.01,0.05,0.1,0.5,1,5]` over `durationMs/1000`.
+  Render: `# TYPE <name> counter|histogram` (NO HELP), samples,
+  cumulative buckets + `+Inf`, `_sum`, `_count`; labels sorted,
+  escaping `\` and `"` only; empty renders `""`. No gauges, no
+  reset, no `/metrics` endpoint anywhere.
+- `redact()`: `//user:password@` -> `//user:***@` (display edges
+  only).
+- Daemon `query_events` history (raw SQL, per-session log) is a
+  separate record from security audit; nothing links them.
+
 ## External compatibility surfaces (freeze list)
 
 1. `evaluate(ctx, sql, opts)` signature + Evaluation JSON shape + all reason codes.

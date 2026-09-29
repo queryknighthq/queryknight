@@ -72,7 +72,11 @@ impl DaemonEndpoint {
         roundtrip(&self.addr, Some(&self.token), "POST", path, Some(body))
     }
 
-    fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value, DaemonFailure> {
+    fn post_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, DaemonFailure> {
         let (code, raw) = self.post(path, &body.to_string())?;
         if code / 100 != 2 {
             return Err(DaemonFailure);
@@ -207,8 +211,12 @@ fn roundtrip(
     body: Option<&str>,
 ) -> Result<(u16, Vec<u8>), DaemonFailure> {
     let mut stream = TcpStream::connect_timeout(addr, TIMEOUT).map_err(|_| DaemonFailure)?;
-    stream.set_read_timeout(Some(TIMEOUT)).map_err(|_| DaemonFailure)?;
-    stream.set_write_timeout(Some(TIMEOUT)).map_err(|_| DaemonFailure)?;
+    stream
+        .set_read_timeout(Some(TIMEOUT))
+        .map_err(|_| DaemonFailure)?;
+    stream
+        .set_write_timeout(Some(TIMEOUT))
+        .map_err(|_| DaemonFailure)?;
     let mut request =
         format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
     if let Some(token) = token {
@@ -222,9 +230,13 @@ fn roundtrip(
         ));
     }
     request.push_str("\r\n");
-    stream.write_all(request.as_bytes()).map_err(|_| DaemonFailure)?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|_| DaemonFailure)?;
     if let Some(body) = body {
-        stream.write_all(body.as_bytes()).map_err(|_| DaemonFailure)?;
+        stream
+            .write_all(body.as_bytes())
+            .map_err(|_| DaemonFailure)?;
     }
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).map_err(|_| DaemonFailure)?;
@@ -232,7 +244,10 @@ fn roundtrip(
 }
 
 fn parse_response(raw: &[u8]) -> Result<(u16, Vec<u8>), DaemonFailure> {
-    let head_end = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or(DaemonFailure)?;
+    let head_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or(DaemonFailure)?;
     let head = std::str::from_utf8(&raw[..head_end]).map_err(|_| DaemonFailure)?;
     let mut lines = head.lines();
     let code: u16 = lines

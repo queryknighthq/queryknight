@@ -35,7 +35,7 @@ pub use result::{
     SchemaInfo, TableInfo, TableKind, TableRef,
 };
 pub use service::{
-    ApprovalSetup, BlockedReason, ExecuteRequest, ExecutionOutcome, ExecutionService, ExplainCall,
-    GuardedCall, PendingApproval, TrustedContext, DEFAULT_TIMEOUT,
+    ApprovalSetup, BlockedReason, ExecuteRequest, ExecutedReport, ExecutionOutcome,
+    ExecutionService, ExplainCall, GuardedCall, PendingApproval, TrustedContext, DEFAULT_TIMEOUT,
 };
 pub use value::{DbValue, MAX_SAFE_INTEGER};

@@ -115,3 +115,9 @@ INV-037: MCP is an untrusted protocol adapter. Tool arguments may select only ex
 
 INV-038: MCP stdout is reserved exclusively for protocol traffic; diagnostics or secrets must never contaminate the stdio transport.
   No banners, `println!`, tracing-to-stdout, or panic text on stdout; stderr carries diagnostics without tokens, passwords, or raw SQL by default. Pinned by a real-process stdio test asserting every stdout line is valid JSON-RPC. Corpus: qk-cli stdio integration tests.
+
+INV-039: Audit and metrics are observational only. Failure, backpressure, formatting errors, or sink unavailability must never broaden authorization, bypass approval, or cause database execution to be repeated.
+  Observation derives from already-typed outcomes after the fact; sinks return errors for visibility only (stderr, bounded); Allow stays executed-once, Deny stays denied, pending stays pending. Corpus: sink-failure isolation tests (allow/deny under failing sinks), history-failure no-re-execution tests, exactly-once observation tests.
+
+INV-040: Secrets and raw SQL literals are excluded from observability output unless an explicit configured audit level requires full SQL capture.
+  Default `fingerprint` level carries ids + shape hash only; `metadata` adds literal-stripped normalization; only `full_sql` carries raw text (explicit opt-in). Credentials, tokens, and exact digests never appear at any level. Corpus: secret-SQL tests at every level (event JSON, OCSF JSON, Debug), credential-URL tests, token-absence tests.

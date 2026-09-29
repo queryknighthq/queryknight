@@ -540,9 +540,10 @@ async fn direct_allow_executes_exactly_once() {
     let adapter = FakeAdapter::with_rows(vec![vec![DbValue::Int(1)]]);
     let store = InMemoryApprovalStore::new();
     let outcome = run(&service, &adapter, "SELECT 1", &store, None).await;
-    let ExecutionOutcome::Executed(result) = outcome else {
+    let ExecutionOutcome::Executed(report) = outcome else {
         panic!("expected executed");
     };
+    let result = &report.result;
     assert_eq!(result.rows_shown, 1);
     assert!(!result.truncated);
     assert_eq!(adapter.calls(), 1);
@@ -716,9 +717,10 @@ async fn row_cap_probes_and_pages_with_cursor() {
     let adapter = FakeAdapter::with_rows(rows);
     let store = InMemoryApprovalStore::new();
     let outcome = run(&service, &adapter, "SELECT * FROM t", &store, None).await;
-    let ExecutionOutcome::Executed(result) = outcome else {
+    let ExecutionOutcome::Executed(report) = outcome else {
         panic!("expected executed, got {outcome:?}");
     };
+    let result = &report.result;
     // Fetched maxRows+1 to detect the cap; showed maxRows.
     assert_eq!(result.rows_shown, 50);
     assert!(result.truncated);
@@ -769,9 +771,10 @@ async fn byte_budget_truncates_with_flag() {
     let adapter = FakeAdapter::with_rows(rows);
     let store = InMemoryApprovalStore::new();
     let outcome = run(&service, &adapter, "SELECT * FROM t", &store, None).await;
-    let ExecutionOutcome::Executed(result) = outcome else {
+    let ExecutionOutcome::Executed(report) = outcome else {
         panic!("expected executed, got {outcome:?}");
     };
+    let result = &report.result;
     assert!(result.truncated);
     assert!(result.rows_shown < 3);
     assert!(result.cursor.is_some());

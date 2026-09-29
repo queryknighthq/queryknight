@@ -1488,6 +1488,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "qk-audit"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "qk-approval",
+ "qk-core",
+ "qk-db",
+ "qk-metrics",
+ "qk-sql",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "qk-cli"
 version = "0.1.0-beta.0"
 dependencies = [
@@ -1572,9 +1586,11 @@ dependencies = [
  "base64 0.22.1",
  "predicates",
  "qk-approval",
+ "qk-audit",
  "qk-core",
  "qk-daemon",
  "qk-db",
+ "qk-metrics",
  "qk-sql",
  "rmcp",
  "rusqlite",
@@ -1583,6 +1599,10 @@ dependencies = [
  "serde_json",
  "tokio",
 ]
+
+[[package]]
+name = "qk-metrics"
+version = "0.1.0"
 
 [[package]]
 name = "qk-sql"

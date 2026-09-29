@@ -19,9 +19,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use qk_approval::{ApprovalProvider, ApprovalStore, ResolutionOutcome, ResolveRequest};
+use qk_approval::{ApprovalId, ApprovalProvider, ApprovalStore, ResolutionOutcome, ResolveRequest};
 use qk_core::{
     evaluate, Decision, EvaluateOptions, EvaluationRequest, ExecutionContext, PolicyFile,
+    ReasonCode,
 };
 
 use crate::adapter::{DatabaseAdapter, Param};
@@ -127,11 +128,13 @@ pub struct ExecuteRequest {
 }
 
 /// Machine-readable execution outcome. Policy/approval results are
-/// outcomes, never errors; database failures are typed errors.
+/// outcomes, never errors; database failures are typed errors. Every
+/// variant carries the audit facts observers need (decision, reason,
+/// policy path, approval identity) — observers never re-derive them.
 #[derive(Debug, Clone)]
 pub enum ExecutionOutcome {
-    /// The statement executed; bounded result attached.
-    Executed(BudgetedResult),
+    /// The statement executed; bounded result plus authorization facts.
+    Executed(ExecutedReport),
     /// Policy denied or resolution refused execution. The adapter was
     /// never contacted.
     Blocked(BlockedReason),
@@ -143,13 +146,32 @@ pub enum ExecutionOutcome {
     Failed(DbError),
 }
 
+/// Executed statement: bounded result plus the authorization facts
+/// that permitted it (direct allow or resolved approval).
+#[derive(Debug, Clone)]
+pub struct ExecutedReport {
+    /// Bounded agent-facing result.
+    pub result: BudgetedResult,
+    /// Approval id that authorized execution, when via approval.
+    pub approval_id: Option<ApprovalId>,
+    /// Final reason code (`AllowRule`-family or `APPROVAL_GRANTED`).
+    pub reason_code: ReasonCode,
+    /// Decisive policy path, when the evaluation named one.
+    pub matched_policy: Option<String>,
+}
+
 /// Why execution was refused without database contact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockedReason {
+    /// Final verdict (always `Deny` here; explicit so observers never
+    /// infer it).
+    pub decision: Decision,
     /// Machine reason code (policy code or approval outcome).
     pub code: String,
     /// Human diagnostic (bounded, secret-free).
     pub message: String,
+    /// Decisive policy path, when the evaluation named one.
+    pub matched_policy: Option<String>,
 }
 
 /// A waiting approval the agent must resolve out of band.
@@ -237,8 +259,10 @@ impl ExecutionService {
             && evaluation.decision != Decision::RequireApproval
         {
             return ExecutionOutcome::Blocked(BlockedReason {
+                decision: Decision::Deny,
                 code: evaluation.reason_code.as_str().to_owned(),
                 message: evaluation.message.clone(),
+                matched_policy: evaluation.matched_policy.clone(),
             });
         }
         // Non-denied evaluations may enrich the pending approval
@@ -258,14 +282,27 @@ impl ExecutionService {
                 .unwrap_or(None)
                 .map(|estimate| estimate.estimated_rows);
         }
+        // Authorization facts travel with the outcome for observers
+        // (no re-derivation downstream).
+        let mut authz = AuthzFacts {
+            approval_id: None,
+            reason_code: evaluation.reason_code,
+            matched_policy: evaluation.matched_policy.clone(),
+        };
         if evaluation.decision == Decision::RequireApproval {
             match self.resolve_approval(call, &evaluation, &sql, impact, request) {
-                Resolve::Executable => {}
+                Resolve::Executable(resolved) => {
+                    authz = AuthzFacts {
+                        approval_id: resolved.approval_id,
+                        reason_code: resolved.reason_code,
+                        matched_policy: resolved.matched_policy,
+                    };
+                }
                 Resolve::Outcome(outcome) => return outcome,
             }
         }
         // ONLY explicit executable Allow reaches the adapter.
-        self.run_authorized(call, &sql, &params, request, offset)
+        self.run_authorized(call, &sql, &params, request, offset, authz)
             .await
     }
 
@@ -297,8 +334,10 @@ impl ExecutionService {
             }
             _ => {
                 return ExecutionOutcome::Blocked(BlockedReason {
+                    decision: Decision::Deny,
                     code: evaluation.reason_code.as_str().to_owned(),
                     message: evaluation.message.clone(),
+                    matched_policy: evaluation.matched_policy.clone(),
                 });
             }
         }
@@ -312,17 +351,22 @@ impl ExecutionService {
         )
         .await
         {
-            Ok(Ok(plan)) => ExecutionOutcome::Executed(BudgetedResult {
-                columns: vec!["plan".to_owned()],
-                rows: vec![vec![crate::value::DbValue::Text(plan)]],
-                rows_affected: None,
-                rows_shown: 1,
-                estimated_rows_matched: None,
-                truncated: false,
-                bytes_returned: 0,
-                estimated_tokens_returned: 0,
-                estimated_tokens_avoided: None,
-                cursor: None,
+            Ok(Ok(plan)) => ExecutionOutcome::Executed(ExecutedReport {
+                result: BudgetedResult {
+                    columns: vec!["plan".to_owned()],
+                    rows: vec![vec![crate::value::DbValue::Text(plan)]],
+                    rows_affected: None,
+                    rows_shown: 1,
+                    estimated_rows_matched: None,
+                    truncated: false,
+                    bytes_returned: 0,
+                    estimated_tokens_returned: 0,
+                    estimated_tokens_avoided: None,
+                    cursor: None,
+                },
+                approval_id: None,
+                reason_code: evaluation.reason_code,
+                matched_policy: evaluation.matched_policy.clone(),
             }),
             Ok(Err(error)) => ExecutionOutcome::Failed(error),
             Err(_) => ExecutionOutcome::Failed(timeout_error()),
@@ -443,11 +487,13 @@ impl ExecutionService {
         match resolved.outcome {
             ResolutionOutcome::ExistingGrant | ResolutionOutcome::ProviderApproved => {
                 if resolved.decision == Decision::Allow {
-                    Resolve::Executable
+                    Resolve::Executable(resolved)
                 } else {
                     Resolve::Outcome(ExecutionOutcome::Blocked(BlockedReason {
+                        decision: Decision::Deny,
                         code: resolved.reason_code.as_str().to_owned(),
                         message: resolved.message.clone(),
+                        matched_policy: resolved.matched_policy.clone(),
                     }))
                 }
             }
@@ -466,8 +512,10 @@ impl ExecutionService {
             | ResolutionOutcome::ProviderError
             | ResolutionOutcome::NotRequired => {
                 Resolve::Outcome(ExecutionOutcome::Blocked(BlockedReason {
+                    decision: Decision::Deny,
                     code: resolved.reason_code.as_str().to_owned(),
                     message: resolved.message.clone(),
+                    matched_policy: resolved.matched_policy.clone(),
                 }))
             }
         }
@@ -482,6 +530,7 @@ impl ExecutionService {
         params: &[serde_json::Value],
         request: &ExecuteRequest,
         offset: u64,
+        authz: AuthzFacts,
     ) -> ExecutionOutcome {
         if is_multi_statement(sql) {
             return ExecutionOutcome::Failed(DbError::new(
@@ -526,6 +575,7 @@ impl ExecutionService {
                 sql: trimmed,
                 params: params.to_vec(),
                 connection_key: call.connection_key.to_owned(),
+                authz,
             },
         )
         .await
@@ -540,17 +590,22 @@ impl ExecutionService {
     ) -> ExecutionOutcome {
         if !shape.select {
             // Mutations bypass paging (rowsAffected instead).
-            return ExecutionOutcome::Executed(BudgetedResult {
-                columns: executed.columns,
-                rows: Vec::new(),
-                rows_affected: executed.rows_affected,
-                rows_shown: 0,
-                estimated_rows_matched: None,
-                truncated: false,
-                bytes_returned: 0,
-                estimated_tokens_returned: 0,
-                estimated_tokens_avoided: None,
-                cursor: None,
+            return ExecutionOutcome::Executed(ExecutedReport {
+                result: BudgetedResult {
+                    columns: executed.columns,
+                    rows: Vec::new(),
+                    rows_affected: executed.rows_affected,
+                    rows_shown: 0,
+                    estimated_rows_matched: None,
+                    truncated: false,
+                    bytes_returned: 0,
+                    estimated_tokens_returned: 0,
+                    estimated_tokens_avoided: None,
+                    cursor: None,
+                },
+                approval_id: shape.authz.approval_id,
+                reason_code: shape.authz.reason_code,
+                matched_policy: shape.authz.matched_policy,
             });
         }
         let fetched = executed.rows;
@@ -593,27 +648,40 @@ impl ExecutionService {
         } else {
             None
         };
-        ExecutionOutcome::Executed(BudgetedResult {
-            columns: executed.columns,
-            rows_shown: rows.len(),
-            rows,
-            rows_affected: executed.rows_affected,
-            estimated_rows_matched,
-            truncated,
-            bytes_returned: bytes,
-            estimated_tokens_returned: tokens,
-            estimated_tokens_avoided,
-            cursor,
+        ExecutionOutcome::Executed(ExecutedReport {
+            result: BudgetedResult {
+                columns: executed.columns,
+                rows_shown: rows.len(),
+                rows,
+                rows_affected: executed.rows_affected,
+                estimated_rows_matched,
+                truncated,
+                bytes_returned: bytes,
+                estimated_tokens_returned: tokens,
+                estimated_tokens_avoided,
+                cursor,
+            },
+            approval_id: shape.authz.approval_id,
+            reason_code: shape.authz.reason_code,
+            matched_policy: shape.authz.matched_policy,
         })
     }
 }
 
-/// Internal resolution verdict: executable or a final outcome.
+/// Internal resolution verdict: executable (carrying the resolved
+/// authorization facts) or a final outcome.
 enum Resolve {
     /// Explicit executable Allow: the adapter may be called.
-    Executable,
+    Executable(qk_approval::ResolvedEvaluation),
     /// Final non-executable outcome (no adapter contact).
     Outcome(ExecutionOutcome),
+}
+
+/// Authorization facts accompanying an execution.
+struct AuthzFacts {
+    approval_id: Option<ApprovalId>,
+    reason_code: ReasonCode,
+    matched_policy: Option<String>,
 }
 
 /// Shaping inputs for a SELECT result.
@@ -624,6 +692,7 @@ struct RawShape {
     sql: String,
     params: Vec<serde_json::Value>,
     connection_key: String,
+    authz: AuthzFacts,
 }
 
 fn offset_add(offset: u64, shown: usize) -> u64 {
