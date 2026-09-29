@@ -104,6 +104,16 @@ pub struct StoredGrant {
     pub reason_code: ReasonCode,
     /// Human message from evaluation.
     pub message: String,
+    /// Raw schema-snapshot JSON (before image) for display; never matched.
+    pub schema_ddl: Option<String>,
+    /// Raw schema-diff JSON (after image) for display; never matched.
+    pub schema_diff: Option<String>,
+    /// Risk text for human display (daemon-provided; no authorization
+    /// role, never matched).
+    pub risk: String,
+    /// Operation summary for human display (daemon-provided; no
+    /// authorization role, never matched).
+    pub operation_summary: String,
     /// Decisive policy path, when any.
     pub matched_policy: Option<String>,
     /// Milliseconds since Unix epoch of the decision, when decided.
@@ -327,6 +337,10 @@ mod tests {
             expires_at_ms: 1_000_000,
             reason_code: ReasonCode::RequireApproval,
             message: "m".to_owned(),
+            risk: "high".to_owned(),
+            operation_summary: "delete t".to_owned(),
+            schema_ddl: None,
+            schema_diff: None,
             matched_policy: None,
             decided_at_ms: None,
             decided_by: None,

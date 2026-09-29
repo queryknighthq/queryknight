@@ -74,6 +74,38 @@ pub struct EventView {
     pub error_code: Option<String>,
 }
 
+impl EventRecord {
+    /// Read a full record row. Timestamps validate like views; metrics
+    /// stay nullable by schema.
+    pub(crate) fn read(row: &Row) -> Result<Self, crate::StoreError> {
+        use crate::error::classify_rusqlite;
+        use crate::store::as_u64;
+        let started_at: i64 = row.get(9).map_err(classify_rusqlite)?;
+        let duration: Option<i64> = row.get(10).map_err(classify_rusqlite)?;
+        Ok(Self {
+            id: row.get(0).map_err(classify_rusqlite)?,
+            session_id: row.get(1).map_err(classify_rusqlite)?,
+            connection_id: row.get(2).map_err(classify_rusqlite)?,
+            source: row.get(3).map_err(classify_rusqlite)?,
+            fingerprint: row.get(4).map_err(classify_rusqlite)?,
+            sql: row.get(5).map_err(classify_rusqlite)?,
+            query_class: row.get(6).map_err(classify_rusqlite)?,
+            risk: row.get(7).map_err(classify_rusqlite)?,
+            decision: row.get(8).map_err(classify_rusqlite)?,
+            started_at_ms: as_u64(started_at, "query_events.started_at")?,
+            duration_ms: duration
+                .map(|value| as_u64(value, "query_events.duration_ms"))
+                .transpose()?,
+            rows_returned: row.get(11).map_err(classify_rusqlite)?,
+            rows_affected: row.get(12).map_err(classify_rusqlite)?,
+            bytes_returned: row.get(13).map_err(classify_rusqlite)?,
+            estimated_tokens_returned: row.get(14).map_err(classify_rusqlite)?,
+            estimated_tokens_avoided: row.get(15).map_err(classify_rusqlite)?,
+            error_code: row.get(16).map_err(classify_rusqlite)?,
+        })
+    }
+}
+
 impl EventView {
     /// Read a listing row. Negative timestamps fail the conversion and
     /// surface as `InvalidRow` at the call site; everything else reads

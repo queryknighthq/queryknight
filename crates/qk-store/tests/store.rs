@@ -53,6 +53,10 @@ fn grant(id: &str) -> StoredGrant {
         matched_policy: Some("production.main.approval_required[0]".to_owned()),
         decided_at_ms: None,
         decided_by: None,
+        risk: "high".to_owned(),
+        operation_summary: "delete customers".to_owned(),
+        schema_ddl: None,
+        schema_diff: None,
     }
 }
 

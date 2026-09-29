@@ -116,11 +116,12 @@ impl Store {
                    operation_summary, created_at, expires_at, decided_at,
                    decision_source, scope, exact_digest, integration,
                    environment, database_name, agent_id, tool, reason_code,
-                   matched_policy, decided_by, binding_kind
+                   matched_policy, decided_by, binding_kind,
+                   schema_ddl, schema_diff
                  ) VALUES (
                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                   ?22
+                   ?22, ?23, ?24
                  )",
                 params![
                     grant.id.as_str(),
@@ -128,11 +129,8 @@ impl Store {
                     grant.shape.as_str(),
                     grant_status_text(grant.status),
                     grant.message,
-                    // Risk and operation summary are daemon display fields
-                    // with no authorization role; stored empty for schema
-                    // compatibility with readers expecting NOT NULL.
-                    "",
-                    "",
+                    grant.risk,
+                    grant.operation_summary,
                     now_ms as i64,
                     grant.expires_at_ms as i64,
                     grant.decided_at_ms.map(|t| t as i64),
@@ -153,6 +151,8 @@ impl Store {
                     grant.matched_policy,
                     grant.decided_by.map(|source| source.as_str()),
                     grant.binding.as_str(),
+                    grant.schema_ddl,
+                    grant.schema_diff,
                 ],
             )
             .map_err(classify_rusqlite)?;
@@ -170,7 +170,8 @@ impl Store {
                         expires_at, decided_at, decision_source, scope,
                         exact_digest, integration, environment, database_name,
                         agent_id, tool, reason_code, matched_policy, decided_by,
-                        binding_kind
+                        binding_kind, schema_ddl, schema_diff, risk,
+                        operation_summary
                  FROM approvals WHERE id = ?1",
             )
             .map_err(classify_rusqlite)?;
@@ -193,8 +194,8 @@ impl Store {
                         expires_at, decided_at, decision_source, scope,
                         exact_digest, integration, environment, database_name,
                         agent_id, tool, reason_code, matched_policy, decided_by,
-                        binding_kind,
-                        binding_kind
+                        binding_kind, schema_ddl, schema_diff, risk,
+                        operation_summary
                  FROM approvals ORDER BY created_at DESC",
             )
             .map_err(classify_rusqlite)?;
@@ -263,7 +264,7 @@ impl Store {
         }
         // Deterministic loser classification (no timing assumptions).
         let row: Option<GrantRow> = conn
-            .prepare("SELECT id, session_id, fingerprint, status, reason, created_at, expires_at, decided_at, decision_source, scope, exact_digest, integration, environment, database_name, agent_id, tool, reason_code, matched_policy, decided_by FROM approvals WHERE id = ?1")
+            .prepare("SELECT id, session_id, fingerprint, status, reason, created_at, expires_at, decided_at, decision_source, scope, exact_digest, integration, environment, database_name, agent_id, tool, reason_code, matched_policy, decided_by, binding_kind, schema_ddl, schema_diff, risk, operation_summary FROM approvals WHERE id = ?1")
             .map_err(classify_rusqlite)?
             .query_row([id], GrantRow::read)
             .optional()
@@ -302,7 +303,8 @@ impl Store {
                         expires_at, decided_at, decision_source, scope,
                         exact_digest, integration, environment, database_name,
                         agent_id, tool, reason_code, matched_policy, decided_by,
-                        binding_kind
+                        binding_kind, schema_ddl, schema_diff, risk,
+                        operation_summary
                  FROM approvals
                  WHERE status = 'approved' AND scope = 'session'
                    AND session_id = ?1 AND fingerprint = ?2
@@ -344,7 +346,8 @@ impl Store {
                         expires_at, decided_at, decision_source, scope,
                         exact_digest, integration, environment, database_name,
                         agent_id, tool, reason_code, matched_policy, decided_by,
-                        binding_kind
+                        binding_kind, schema_ddl, schema_diff, risk,
+                        operation_summary
                  FROM approvals WHERE binding_kind = 'legacy_shape'
                  ORDER BY created_at DESC",
             )
@@ -365,6 +368,28 @@ impl Store {
             }
         }
         Ok(grants)
+    }
+
+    /// Attach the after-image schema diff to an approval. Unknown ids are
+    /// `NotFound`. Content is stored verbatim (display data, validated as
+    /// an array by the caller, never matched).
+    pub fn record_schema_diff(
+        &self,
+        id: &str,
+        diff_json: Option<String>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        let changed = conn
+            .execute(
+                "UPDATE approvals SET schema_diff = ?1 WHERE id = ?2",
+                params![diff_json, id],
+            )
+            .map_err(classify_rusqlite)?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound(format!("approval {id}")))
+        }
     }
 
     /// Flip due waiting rows to expired. Returns the flipped count.
@@ -573,6 +598,41 @@ impl Store {
         Ok(views)
     }
 
+    /// List one session's full event records in chronological order, for
+    /// server-side aggregation (summaries). Same ordering as
+    /// [`Store::list_session_events`]; full columns instead of the view
+    /// subset.
+    pub fn list_session_event_records(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::events::EventRecord>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT id, session_id, connection_id, source, sql_fingerprint, sql,
+                        query_class, risk, decision, started_at, duration_ms,
+                        rows_returned, rows_affected, bytes_returned,
+                        estimated_tokens_returned, estimated_tokens_avoided, error_code
+                 FROM query_events WHERE session_id = ?1
+                 ORDER BY started_at DESC, rowid DESC LIMIT ?2",
+            )
+            .map_err(classify_rusqlite)?;
+        let mut rows = statement
+            .query(params![session_id, limit as i64])
+            .map_err(classify_rusqlite)?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().map_err(classify_rusqlite)? {
+            match crate::events::EventRecord::read(row) {
+                Ok(record) => records.push(record),
+                Err(StoreError::InvalidRow(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        records.reverse();
+        Ok(records)
+    }
+
     /// List one session's events in chronological order (reference orders
     /// newest-first then reverses).
     pub fn list_session_events(
@@ -625,6 +685,41 @@ impl Store {
         )
         .map_err(classify_rusqlite)?;
         Ok(())
+    }
+
+    /// List connections ordered by name (deterministic; the reference
+    /// preserves JSON file order, which has no database equivalent).
+    pub fn list_connections(&self) -> Result<Vec<crate::sessions::ConnectionRecord>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT id, name, engine, environment, source, database, host_label
+                 FROM connections ORDER BY name",
+            )
+            .map_err(classify_rusqlite)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(crate::sessions::ConnectionRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    engine: row.get(2)?,
+                    environment: row.get(3)?,
+                    source: row.get(4)?,
+                    database: row.get(5)?,
+                    host_label: row.get(6)?,
+                })
+            })
+            .map_err(classify_rusqlite)?;
+        let mut connections = Vec::new();
+        for row in rows {
+            match row {
+                Ok(connection) => connections.push(connection),
+                Err(_) => {
+                    return Err(StoreError::InvalidRow("connection row".to_owned()));
+                }
+            }
+        }
+        Ok(connections)
     }
 
     /// Fetch one connection row.
@@ -798,6 +893,10 @@ struct GrantRow {
     matched_policy: Option<String>,
     decided_by: Option<String>,
     binding_kind: Option<String>,
+    schema_ddl: Option<String>,
+    schema_diff: Option<String>,
+    risk: String,
+    operation_summary: String,
 }
 
 impl GrantRow {
@@ -822,6 +921,10 @@ impl GrantRow {
             matched_policy: row.get(17)?,
             decided_by: row.get(18)?,
             binding_kind: row.get(19).unwrap_or(None),
+            schema_ddl: row.get(20).unwrap_or(None),
+            schema_diff: row.get(21).unwrap_or(None),
+            risk: row.get(22)?,
+            operation_summary: row.get(23)?,
         })
     }
 
@@ -918,6 +1021,10 @@ impl GrantRow {
         Ok(StoredGrant {
             id: ApprovalId::new(self.id),
             shape: QueryShapeFingerprint::new(self.fingerprint),
+            risk: self.risk,
+            operation_summary: self.operation_summary,
+            schema_ddl: self.schema_ddl,
+            schema_diff: self.schema_diff,
             binding,
             scope: ApprovalScope {
                 session_id: self.session_id,

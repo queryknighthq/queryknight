@@ -169,6 +169,10 @@ fn approval_cannot_override_hard_denials() {
                 matched_policy: None,
                 decided_at_ms: Some(NOW),
                 decided_by: None,
+                risk: String::new(),
+                operation_summary: String::new(),
+                schema_ddl: None,
+                schema_diff: None,
             })
             .expect("insert");
         let resolved = resolve_with(
@@ -732,6 +736,10 @@ fn legacy_grant_never_authorizes_at_resolver() {
         matched_policy: None,
         decided_at_ms: Some(NOW),
         decided_by: None,
+        risk: String::new(),
+        operation_summary: String::new(),
+        schema_ddl: None,
+        schema_diff: None,
     };
     legacy.scope.session_id = Some("session-1".to_owned());
     store.insert_grant(legacy).expect("plant legacy");
@@ -816,6 +824,10 @@ fn resolver_rejects_leaking_legacy_grant() {
             expires_at_ms: NOW + 60_000,
             reason_code: ReasonCode::RequireApproval,
             message: "m".to_owned(),
+            risk: String::new(),
+            operation_summary: String::new(),
+            schema_ddl: None,
+            schema_diff: None,
             matched_policy: None,
             decided_at_ms: Some(NOW),
             decided_by: None,
