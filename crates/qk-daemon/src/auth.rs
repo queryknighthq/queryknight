@@ -28,6 +28,13 @@ impl AuthToken {
     fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
+
+    /// Raw token text for lifecycle use only (token-file persistence,
+    /// loopback probe `Authorization` header). Callers must never log,
+    /// format into errors, or serialize this value.
+    pub fn as_secret(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for AuthToken {

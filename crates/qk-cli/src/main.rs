@@ -1,5 +1,6 @@
-//! QueryKnight standalone binary: local, pure policy commands over the
-//! real Rust core (`qk-sql` + `qk-core`). No daemon, no network, no DB.
+//! QueryKnight standalone binary: local policy commands over the real
+//! Rust core (`qk-sql` + `qk-core`), plus the standalone daemon
+//! lifecycle (`start` / `stop` / `status`) over `qk-daemon`.
 //!
 //! Exit codes (frozen contract):
 //!
@@ -13,6 +14,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod daemon_cmd;
 mod inspect;
 mod policy;
 
@@ -79,6 +81,37 @@ enum TopCommand {
     Policy {
         #[command(subcommand)]
         action: Option<PolicyAction>,
+    },
+    /// Start the daemon (frozen reference shape; background by default).
+    Start {
+        /// Listen port (`QUERYKNIGHT_PORT`, default 47821; 0 is ephemeral).
+        #[arg(long)]
+        port: Option<u16>,
+        /// State directory (`QUERYKNIGHT_HOME`, default ~/.queryknight).
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
+        /// Run in the foreground (canonical implementation; the default
+        /// `start` spawns this detached and polls for readiness).
+        #[arg(long, action = ArgAction::SetTrue)]
+        foreground: bool,
+    },
+    /// Stop the daemon (verified ownership, graceful SIGTERM).
+    Stop {
+        /// State directory (`QUERYKNIGHT_HOME`, default ~/.queryknight).
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
+        /// Probe port (default: pid file's port, else `QUERYKNIGHT_PORT`).
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Show daemon status (pid evidence plus control-plane probe).
+    Status {
+        /// State directory (`QUERYKNIGHT_HOME`, default ~/.queryknight).
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
+        /// Probe port (default: pid file's port, else `QUERYKNIGHT_PORT`).
+        #[arg(long)]
+        port: Option<u16>,
     },
 }
 
@@ -172,6 +205,13 @@ fn run(cli: Cli) -> i32 {
                 db,
             }) => policy::test(policy, cases, dialect, env, db),
         },
+        Some(TopCommand::Start {
+            port,
+            home,
+            foreground,
+        }) => daemon_cmd::start(home, port, foreground),
+        Some(TopCommand::Stop { home, port }) => daemon_cmd::stop(home, port),
+        Some(TopCommand::Status { home, port }) => daemon_cmd::status(home, port),
     }
 }
 

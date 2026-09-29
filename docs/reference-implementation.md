@@ -423,6 +423,82 @@ grants approve a statement shape once per session.
   `operation`; unavailable preserves them; waiting passes the policy
   result through with `approvalId` added.
 
+## Daemon runtime audit (lifecycle phase, verified against source 2026-09-29)
+
+Source: `packages/daemon/src/index.ts`, `packages/cli/src/index.ts`
+(`start`/`stop`/`status`), `packages/core/src/paths.ts`,
+`packages/core/src/history.ts` (`HistoryClient::status`), `packages/daemon/src/store.ts`.
+
+1. CLI commands: top-level `start`, `stop`, `status` (no `daemon`
+   subgroup, no `restart`, no foreground flag).
+2. Foreground/background: no foreground mode. `start` spawns the daemon
+   detached (`spawn(process.execPath, [daemon/index.ts], {detached: true,
+   stdio: ['ignore', logFd, logFd]})`, `child.unref()`), then polls
+   `history.status()` 20x50ms; success prints
+   `daemon started (log: <home>/daemon.log)`, failure prints
+   `daemon failed to start; last log lines from <log>:` + last 15 lines,
+   exit 1.
+3. Default host/port: `127.0.0.1:47821` (`QUERYKNIGHT_PORT`).
+4. State dir: `QUERYKNIGHT_HOME ?? ~/.queryknight` (`queryknightHome()`).
+5. SQLite path: `<home>/queryknight.db` (WAL: `PRAGMA journal_mode = WAL`).
+6. Token file: `<home>/session.token`.
+7. Token format: `randomBytes(24).toString('base64url')` + `"\n"`
+   (32 base64url chars, no padding).
+8. Generation: `node:crypto randomBytes` (CSPRNG).
+9. Reuse/rotation: reuse if `readFileSync(...).trim()` is non-empty (any
+   content, no validation); generate only when absent/empty; no rotation
+   endpoint (delete file + restart rotates).
+10. Token-file permissions: `writeFileSync(path, token, {mode: 0o600})`
+    on creation only; no directory permission handling, no chmod of
+    existing files.
+11. PID file: `<home>/daemon.pid`, format `<pid>\n<port>\n`, written
+    after `Bun.serve` succeeds (port-in-use throws first, leaving no pid).
+12. Stale PID: no detection. `start` ignores the pid file (HTTP probe
+    only); `stop` with a stale file calls `process.kill(deadPid)`
+    which throws, and the stale file is NOT unlinked on that path
+    (unlink is in a try/catch but the throw happens before it).
+13. Already-running: HTTP `GET /status` probe only (`daemon already
+    running`, exit 0). No lock file, no pid check.
+14. Daemon log: `<home>/daemon.log`, opened `'a'` (append forever, no
+    rotation/truncation).
+15. stdout/stderr: child stdout+stderr both redirect to the log fd;
+    the daemon itself logs via `console.error` (startup line
+    `queryknight daemon 127.0.0.1:<port>`, proxy line with redacted URL).
+16. Append always; never truncated.
+17. Signal handling: none in the daemon. SIGTERM/SIGINT default-kill
+    (Bun). No graceful drain, no pid-file removal on exit.
+18. Shutdown: abrupt. In-flight requests are dropped; no connection
+    draining.
+19. SQLite close/checkpoint: `HistoryStore.close()` exists but is never
+    called on the daemon path; close relies on process exit. No
+    checkpoint call (WAL files persist; replay on next open).
+20. Startup failure cleanup: none beyond pid-after-serve ordering.
+    A bound-but-crashed-later daemon leaves a stale pid file.
+21. Port-in-use: `Bun.serve` throws (EADDRINUSE); the CLI reports the
+    log tail. No occupant identification, no state mutations.
+22. Status: `GET /status` -> `{ok:true, pid}` over HTTP; CLI prints
+    `daemon up pid=<pid>` or `daemon down` (exit 1). No pid-file read.
+23. Stop: read first pid-file line, `process.kill(pid, 'SIGTERM')`,
+    best-effort unlink, print `daemon stopped`. No ownership check, no
+    wait, no escalation. Missing pid file -> `daemon not running`
+    (exit 0).
+24. Restart: absent (compose `stop` + `start` manually).
+25. Autostart: `QUERYKNIGHT_AUTOSTART_PROXY_URL` autostarts a MySQL
+    (127.0.0.1:3308) or Postgres (127.0.0.1:5434) *query proxy* inside
+    the daemon process -- it is NOT OS service autostart (no
+    launchd/systemd/Scheduled-Tasks integration anywhere).
+26. Platform differences: none (homedir/path join only; `process.kill`
+    SIGTERM is POSIX-meaningful, best-effort elsewhere).
+27. Env overrides: `QUERYKNIGHT_HOME`, `QUERYKNIGHT_PORT`,
+    `QUERYKNIGHT_DAEMON_URL` (client base, default
+    `http://127.0.0.1:47821`), `QUERYKNIGHT_AUTOSTART_PROXY_URL`.
+    No CLI flags for the daemon path; no stored settings.
+28. Filenames: `queryknight.db` (+ `-wal`/`-shm`), `session.token`,
+    `daemon.pid`, `daemon.log`.
+29. UI/token bootstrap: UI takes `?token=` once into
+    `localStorage qk_token`, then Bearer; `HistoryClient` reads
+    `session.token` per request. (UI serving itself is deferred in Rust.)
+
 ## External compatibility surfaces (freeze list)
 
 1. `evaluate(ctx, sql, opts)` signature + Evaluation JSON shape + all reason codes.

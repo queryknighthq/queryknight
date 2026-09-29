@@ -10,9 +10,11 @@ path = "src/main.rs"
 [dependencies]
 qk-core = { path = "../qk-core" }
 qk-sql = { path = "../qk-sql" }
+qk-daemon = { path = "../qk-daemon" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync", "io-util"] }
 
 [dev-dependencies]
 assert_cmd = "2"

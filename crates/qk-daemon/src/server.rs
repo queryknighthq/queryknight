@@ -167,20 +167,16 @@ pub fn router(state: DaemonState, token: AuthToken) -> Router {
         .with_state(state)
 }
 
-/// Serve on the configured bind address. Refuses non-loopback binds
-/// unless explicitly allowed. Returns the bound address for tests and
-/// lifecycle layers; serving runs until the returned handle is aborted.
-pub async fn serve(
-    config: DaemonConfig,
-    state: DaemonState,
-) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), DaemonError> {
-    if !config.bind.is_loopback() && !config.allow_remote {
-        return Err(DaemonError::Internal(
-            "refusing non-loopback bind without explicit opt-in".to_owned(),
-        ));
-    }
+/// Grace period for in-flight requests during shutdown: connections
+/// get a bounded opportunity to complete, then are dropped. There are no
+/// long-lived server requests (decide is immediate; clients poll), so
+/// this only covers ordinary in-flight work.
+pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Assemble the serving app (frozen middleware order) without binding.
+fn serve_app(config: &DaemonConfig, state: DaemonState) -> axum::Router {
     // Timeouts surface as 408 without touching handler semantics.
-    let app = router(state, config.token.clone())
+    router(state, config.token.clone())
         .layer(
             tower::ServiceBuilder::new()
                 .layer(axum::error_handling::HandleErrorLayer::new(
@@ -192,10 +188,51 @@ pub async fn serve(
         )
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             config.body_limit_bytes,
+        ))
+}
+
+/// Check the loopback bind rule shared by every serve path.
+fn check_bind(config: &DaemonConfig) -> Result<(), DaemonError> {
+    if !config.bind.is_loopback() && !config.allow_remote {
+        return Err(DaemonError::Internal(
+            "refusing non-loopback bind without explicit opt-in".to_owned(),
         ));
-    let listener = tokio::net::TcpListener::bind((config.bind, config.port))
+    }
+    Ok(())
+}
+
+/// Bind the configured listener without serving: lets lifecycle layers
+/// publish "running" state only after the port is actually held.
+pub async fn bind_listener(config: &DaemonConfig) -> Result<tokio::net::TcpListener, DaemonError> {
+    check_bind(config)?;
+    tokio::net::TcpListener::bind((config.bind, config.port))
         .await
-        .map_err(|e| DaemonError::Internal(format!("bind failed: {e}")))?;
+        .map_err(|e| DaemonError::Internal(format!("bind failed: {e}")))
+}
+
+/// Serve an already-bound listener until `shutdown` resolves, then drain
+/// in-flight requests for at most [`SHUTDOWN_GRACE`] before returning.
+pub async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), DaemonError> {
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown);
+    match tokio::time::timeout(SHUTDOWN_GRACE, server).await {
+        Ok(result) => result.map_err(|e| DaemonError::Internal(format!("serve failed: {e}"))),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Serve on the configured bind address. Refuses non-loopback binds
+/// unless explicitly allowed. Returns the bound address for tests and
+/// lifecycle layers; serving runs until the returned handle is aborted.
+pub async fn serve(
+    config: DaemonConfig,
+    state: DaemonState,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), DaemonError> {
+    let listener = bind_listener(&config).await?;
+    let app = serve_app(&config, state);
     let addr: SocketAddr = listener
         .local_addr()
         .map_err(|e| DaemonError::Internal(format!("local address failed: {e}")))?;
@@ -203,4 +240,22 @@ pub async fn serve(
         axum::serve(listener, app).await.ok();
     });
     Ok((addr, handle))
+}
+
+/// Serve with graceful shutdown: bind, then serve until `shutdown`
+/// resolves. Returns the bound address once the listener is held, so
+/// callers can publish readiness before serving completes. The frozen
+/// loopback rule applies unchanged.
+pub async fn serve_with_shutdown(
+    config: &DaemonConfig,
+    state: DaemonState,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<std::net::SocketAddr, DaemonError> {
+    let listener = bind_listener(config).await?;
+    let addr: SocketAddr = listener
+        .local_addr()
+        .map_err(|e| DaemonError::Internal(format!("local address failed: {e}")))?;
+    let app = serve_app(config, state);
+    serve_listener(listener, app, shutdown).await?;
+    Ok(addr)
 }
