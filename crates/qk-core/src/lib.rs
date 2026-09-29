@@ -19,7 +19,8 @@ pub use decision::{parse_reason_code, Decision, ReasonCode};
 pub use error::PolicyLoadError;
 pub use evaluate::{evaluate, EvaluateOptions, EvaluationRequest, EvaluationResult};
 pub use fingerprint::{
-    exact_request_digest, normalize_sql, sql_fingerprint, ExactRequestDigest, QueryShapeFingerprint,
+    exact_request_digest, exact_request_digest_v2, normalize_sql, sql_fingerprint, DigestParam,
+    ExactDigest, ExactRequestDigest, ExactRequestDigestV2, QueryShapeFingerprint,
 };
 pub use glob::{check_glob, glob_match};
 /// Policy-file verdict type (config level), aliased to avoid clashing with

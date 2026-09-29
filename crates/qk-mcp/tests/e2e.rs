@@ -34,6 +34,7 @@ static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::ne
 struct World {
     server: QueryKnightServer,
     home: std::path::PathBuf,
+    addr: std::net::SocketAddr,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<Result<(), qk_daemon::runtime::RuntimeError>>>,
 }
@@ -59,7 +60,7 @@ impl World {
             })
             .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx)
+        let addr = tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx)
             .await
             .expect("daemon ready")
             .expect("addr");
@@ -83,6 +84,7 @@ impl World {
         World {
             server: QueryKnightServer::new(state),
             home,
+            addr,
             shutdown: Some(shutdown_tx),
             task: Some(task),
         }
@@ -165,20 +167,152 @@ async fn approval_flow_retry_and_literal_change() {
         .query("UPDATE t SET v = 'two' WHERE id = 1", Some(id.clone()))
         .await;
     assert!(text.contains("Rows affected: 1"), "got:\n{text}");
-    // Changed literal under the same approved SHAPE executes: daemon
-    // approvals bind shape fingerprints (frozen TS semantics, INV-024
-    // literal-variant sharing). Exact-digest strictness applies where
-    // exact tokens exist (qk-db layer, pinned separately) — here the
-    // full path still re-ran (evaluate → provider re-check → fresh
-    // exact binding for the current SQL).
+    // Changed literal under the same approval ID must NOT reuse it:
+    // the daemon row binds the exact original request (INV-041), so
+    // the retry pends for a FRESH approval instead of executing.
+    // (Session scope remains intentionally shape-wide — pinned in the
+    // session end-to-end below.)
     let replay = world
         .query("UPDATE t SET v = 'THREE' WHERE id = 1", Some(id))
         .await;
     assert!(
-        replay.contains("Rows affected: 1"),
-        "shape-bound retry must execute, got:\n{replay}"
+        replay.starts_with("Blocked: waiting for approval"),
+        "literal change must not reuse exact token, got:\n{replay}"
     );
+    assert!(!replay.contains("Rows affected"));
     let _ = before;
+    world.stop().await;
+}
+
+/// Explicit Session approval reuses shape-wide (params AND literals
+/// may vary); a different shape still pends fresh. The session grant
+/// is decided out-of-band with session scope (UI-equivalent path via
+/// the daemon API directly — the MCP decide tool is once-only).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_approval_reuses_shape_wide() {
+    use qk_daemon::runtime::probe::{probe_get, probe_post, ProbeTarget};
+    use qk_daemon::AuthToken;
+    let world = World::start().await;
+    let target = ProbeTarget::new("127.0.0.1", world.addr.port()).expect("loopback");
+    let token = AuthToken::new(
+        std::fs::read_to_string(world.home.join("session.token"))
+            .expect("token")
+            .trim()
+            .to_owned(),
+    );
+    let timeout = std::time::Duration::from_secs(5);
+    // Pending for a parameterized write...
+    let pending = world
+        .server
+        .db_query_impl(DbQueryArgs {
+            sql: "DELETE FROM t WHERE id = ?".to_owned(),
+            params: Some(vec![serde_json::json!(42)]),
+            max_rows: None,
+            cursor: None,
+            approval_id: None,
+        })
+        .await
+        .expect("pending text");
+    let id = pending_id(&pending);
+    // ...decided with SESSION scope out of band...
+    let body =
+        serde_json::json!({"status": "approved", "source": "ui", "scope": "session"}).to_string();
+    let (code, _) = probe_post(
+        &target,
+        &format!("/approvals/{id}/decide"),
+        &token,
+        &body,
+        timeout,
+    )
+    .await
+    .expect("decide");
+    assert_eq!(code, 200);
+    // ...then the same shape with DIFFERENT params reuses the grant
+    // without human involvement (no new daemon row).
+    let (_, before) = probe_get(&target, "/approvals", Some(&token), timeout)
+        .await
+        .expect("list");
+    let text = world
+        .server
+        .db_query_impl(DbQueryArgs {
+            sql: "DELETE FROM t WHERE id = ?".to_owned(),
+            params: Some(vec![serde_json::json!(999)]),
+            max_rows: None,
+            cursor: None,
+            approval_id: None,
+        })
+        .await
+        .expect("session reuse executes");
+    assert!(text.contains("Rows affected:"), "got:\n{text}");
+    let (_, after) = probe_get(&target, "/approvals", Some(&token), timeout)
+        .await
+        .expect("list");
+    assert_eq!(before.len(), after.len(), "no duplicate approval row");
+    // A different shape still pends fresh.
+    let other = world
+        .server
+        .db_query_impl(DbQueryArgs {
+            sql: "DELETE FROM t WHERE v = ?".to_owned(),
+            params: Some(vec![serde_json::json!("one")]),
+            max_rows: None,
+            cursor: None,
+            approval_id: None,
+        })
+        .await
+        .expect("pending text");
+    assert!(
+        other.starts_with("Blocked: waiting for approval"),
+        "got:\n{other}"
+    );
+    world.stop().await;
+}
+
+/// Parameterized ONCE approval: same params re-execute, changed
+/// params pend fresh (adapter call counts prove it). This is the
+/// ExactV2 end-to-end counterpart of the literal test above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn param_change_does_not_reuse_once() {
+    let world = World::start().await;
+    let args = |params: Vec<serde_json::Value>, approval_id: Option<String>| DbQueryArgs {
+        sql: "UPDATE t SET v = ? WHERE id = 1".to_owned(),
+        params: Some(params),
+        max_rows: None,
+        cursor: None,
+        approval_id,
+    };
+    let pending = world
+        .server
+        .db_query_impl(args(vec![serde_json::json!(42)], None))
+        .await
+        .expect("pending text");
+    let id = pending_id(&pending);
+    let decided = world
+        .server
+        .approvals_decide_impl(ApprovalsDecideArgs {
+            id: id.clone(),
+            status: ApprovalStatus::Approved,
+        })
+        .await
+        .expect("decide");
+    assert_eq!(decided, format!("approval {id}: approved"));
+    // Exact same params → executes.
+    let text = world
+        .server
+        .db_query_impl(args(vec![serde_json::json!(42)], Some(id.clone())))
+        .await
+        .expect("retry executes");
+    assert!(text.contains("Rows affected: 1"), "got:\n{text}");
+    // Changed params, same id → pends fresh, never executes.
+    let replay = world
+        .server
+        .db_query_impl(args(vec![serde_json::json!(43)], Some(id)))
+        .await
+        .expect("pending text");
+    assert!(
+        replay.starts_with("Blocked: waiting for approval"),
+        "param change must not reuse, got:\n{replay}"
+    );
+    assert!(!replay.contains("Rows affected"));
     world.stop().await;
 }
 
@@ -245,6 +379,47 @@ async fn hostile_sql_never_executes() {
     }
     assert_eq!(world.count().await, before);
     world.stop().await;
+}
+
+/// Sentinel parameter secret must not appear in audit, OCSF,
+/// metrics, or MCP text (the frozen audit model carries no params).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn param_secret_absent_from_observability() {
+    use std::sync::Arc;
+    let world = World::start().await;
+    let memory = Arc::new(qk_audit::MemorySink::new());
+    let mut server = world.server;
+    server
+        .state_mut()
+        .set_observer(qk_audit::Observer::new(vec![memory.clone()]));
+    let text = server
+        .db_query_impl(DbQueryArgs {
+            sql: "SELECT * FROM t WHERE v = ?".to_owned(),
+            params: Some(vec![serde_json::json!("PARAM_SECRET_8675309")]),
+            max_rows: None,
+            cursor: None,
+            approval_id: None,
+        })
+        .await
+        .expect("query text");
+    assert!(!text.contains("PARAM_SECRET"), "MCP text leaked");
+    assert_eq!(memory.len(), 1);
+    let event = &memory.events()[0];
+    let event_json = serde_json::to_string(event).expect("event");
+    assert!(!event_json.contains("PARAM_SECRET"), "audit leaked");
+    let ocsf = serde_json::to_string(&qk_audit::to_ocsf(event, "0.1.0-beta.0")).expect("ocsf");
+    assert!(!ocsf.contains("PARAM_SECRET"), "OCSF leaked");
+    let metrics = server.state().observer().metrics().render();
+    assert!(!metrics.contains("PARAM_SECRET"), "metrics leaked");
+    World {
+        server,
+        home: world.home,
+        addr: world.addr,
+        shutdown: world.shutdown,
+        task: world.task,
+    }
+    .stop()
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

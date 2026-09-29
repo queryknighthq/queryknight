@@ -140,6 +140,9 @@ impl Store {
                         qk_approval::ApprovalBinding::ExactV1(digest) => {
                             Some(digest.as_bytes().as_slice())
                         }
+                        qk_approval::ApprovalBinding::ExactV2(digest) => {
+                            Some(digest.as_bytes().as_slice())
+                        }
                         _ => None,
                     },
                     grant.scope.integration,
@@ -308,7 +311,7 @@ impl Store {
                  FROM approvals
                  WHERE status = 'approved' AND scope = 'session'
                    AND session_id = ?1 AND fingerprint = ?2
-                   AND binding_kind IN ('exact_v1', 'shape_v1')
+                   AND binding_kind IN ('exact_v1', 'exact_v2', 'shape_v1')
                  ORDER BY created_at DESC",
             )
             .map_err(classify_rusqlite)?;

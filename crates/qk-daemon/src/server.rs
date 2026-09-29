@@ -168,6 +168,10 @@ pub fn router(state: DaemonState, token: AuthToken) -> Router {
             "/approvals/{id}/schema-diff",
             post(crate::routes::approvals::schema_diff),
         )
+        .route(
+            "/approvals/{id}/verify",
+            post(crate::routes::approvals::verify),
+        )
         .fallback(fallback_404)
         .layer(middleware::map_response(map_method_not_allowed))
         .layer(middleware::from_fn(gatekeeper))

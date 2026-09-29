@@ -471,12 +471,19 @@ impl ExecutionService {
         request: &ExecuteRequest,
     ) -> Resolve {
         let context = call.auth.execution_context();
+        // Exact identity covers the actual driver-bound params (empty
+        // means no params → Exact V1; anything else → Exact V2).
+        // qk-db owns this construction from trusted dialect + exact SQL
+        // + bound values; MCP never precomputes digests.
+        let digest_params: Vec<qk_core::DigestParam> =
+            request.params.iter().map(param_to_digest).collect();
         let resolved = qk_approval::resolve(
             &ResolveRequest {
                 evaluation,
                 context: &context,
                 dialect: call.config.dialect(),
                 sql,
+                params: &digest_params,
                 approval_id: request.approval_id.as_deref(),
                 ttl_ms: call.approval.ttl_ms,
                 now_ms: call.approval.now_ms,
@@ -707,6 +714,33 @@ fn url_of(config: &DbConfig) -> &crate::config::SecretUrl {
 
 fn to_driver_params(params: &[serde_json::Value]) -> Result<Vec<Param>, DbError> {
     params.iter().map(Param::from_json).collect()
+}
+
+/// Canonical digest parameter from a JSON scalar: the same typed
+/// value the driver will bind (integers keep integer precision —
+/// never routed through f64 for identity).
+fn param_to_digest(value: &serde_json::Value) -> qk_core::DigestParam {
+    use qk_core::DigestParam;
+    match value {
+        serde_json::Value::Null => DigestParam::Null,
+        serde_json::Value::Bool(value) => DigestParam::Bool(*value),
+        serde_json::Value::Number(value) => {
+            if let Some(int) = value.as_i64() {
+                DigestParam::Int(int)
+            } else if let Some(uint) = value.as_u64() {
+                DigestParam::UInt(uint)
+            } else if let Some(float) = value.as_f64() {
+                DigestParam::FloatBits(float.to_bits())
+            } else {
+                DigestParam::Text(value.to_string())
+            }
+        }
+        serde_json::Value::String(text) => DigestParam::Text(text.clone()),
+        // Compound values cannot bind as params (rejected later by
+        // to_driver_params); digest them by canonical JSON text so
+        // they still perturb identity deterministically.
+        other => DigestParam::Text(other.to_string()),
+    }
 }
 
 fn to_params(params: &[serde_json::Value]) -> Vec<Param> {

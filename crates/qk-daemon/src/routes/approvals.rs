@@ -13,7 +13,7 @@ use qk_approval::{ApprovalBinding, DecisionSource, GrantStatus, Scope, StoredGra
 
 use crate::dto::{
     ApprovalView, CreateApprovalRequest, DecideApprovalRequest, DecideStatus, DecisionSourceWire,
-    SchemaDiffRequest, ScopeWire,
+    SchemaDiffRequest, ScopeWire, VerifyApprovalRequest,
 };
 use crate::error::DaemonError;
 use crate::ids::generate_approval_id;
@@ -25,6 +25,32 @@ use crate::state::{store_op, DaemonState};
 /// because matching never reads these columns).
 fn parse_schema_json(raw: Option<&String>) -> Option<serde_json::Value> {
     raw.and_then(|text| serde_json::from_str(text).ok())
+}
+
+/// Parse a 64-hex digest (400 on malformed; the value itself never
+/// enters logs or error details beyond its shape).
+fn parse_digest(hex: &str) -> Result<qk_core::ExactRequestDigest, DaemonError> {
+    hex_to_32(hex)
+        .map(qk_core::ExactRequestDigest::from_bytes)
+        .ok_or_else(|| DaemonError::Invalid("exactDigest must be 64 hex characters".to_owned()))
+}
+
+/// Parse a 64-hex V2 digest (400 on malformed).
+fn parse_digest_v2(hex: &str) -> Result<qk_core::ExactRequestDigestV2, DaemonError> {
+    hex_to_32(hex)
+        .map(qk_core::ExactRequestDigestV2::from_bytes)
+        .ok_or_else(|| DaemonError::Invalid("exactDigest must be 64 hex characters".to_owned()))
+}
+
+fn hex_to_32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(bytes)
 }
 
 fn view_of(grant: &StoredGrant) -> ApprovalView {
@@ -97,11 +123,31 @@ pub async fn create(
         }
     }
     let timeout_ms = body.timeout_ms.unwrap_or(60_000);
+    // Exact binding for trusted service paths (MCP provider): digest
+    // plus kind must agree; UI/human rows omit both (shape_v1).
+    // Malformed digests are 400 (never stored, never logged raw).
+    let binding = match (body.binding_kind.as_deref(), body.exact_digest.as_deref()) {
+        (None, None) => ApprovalBinding::ShapeV1,
+        (Some("exact_v1"), Some(hex)) => ApprovalBinding::ExactV1(parse_digest(hex)?),
+        (Some("exact_v2"), Some(hex)) => ApprovalBinding::ExactV2(parse_digest_v2(hex)?),
+        (Some(kind), _) => {
+            // Echo bounded (never reflect unbounded input).
+            let shown: String = kind.chars().take(32).collect();
+            return Err(DaemonError::Invalid(format!(
+                "unsupported bindingKind: {shown}"
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(DaemonError::Invalid(
+                "exactDigest requires bindingKind".to_owned(),
+            ));
+        }
+    };
     let now = now_ms();
     let grant = StoredGrant {
         id: qk_approval::ApprovalId::new(generate_approval_id()),
         shape: qk_core::QueryShapeFingerprint::new(fingerprint),
-        binding: ApprovalBinding::ShapeV1,
+        binding,
         scope: qk_approval::ApprovalScope {
             session_id: body.session_id,
             integration: body.integration.unwrap_or_default(),
@@ -173,6 +219,50 @@ pub async fn decide(
 
 /// POST /approvals/:id/schema-diff: attach the after-image diff. Unknown
 /// ids are 404 JSON; non-array bodies are 400.
+/// POST /approvals/:id/verify: exact-reuse proof for trusted service
+/// paths. Checks id + approved/live status + fully-bound binding +
+/// version + digest bytes + full scope + expiry, answering
+/// `{match: bool}`. Unknown ids are text `not found` (frozen); legacy
+/// and shape rows never match (quarantine + no-digest). The digest
+/// travels in the POST body only — never URLs, logs, or views.
+pub async fn verify(
+    State(state): State<DaemonState>,
+    Path(id): Path<String>,
+    Json(body): Json<VerifyApprovalRequest>,
+) -> Result<Json<serde_json::Value>, DaemonError> {
+    let want_version = match body.version.as_str() {
+        "exact_v1" | "exact_v2" => body.version.clone(),
+        _ => {
+            return Err(DaemonError::Invalid(
+                "version must be exact_v1 or exact_v2".to_owned(),
+            ));
+        }
+    };
+    let want_digest = hex_to_32(&body.digest)
+        .ok_or_else(|| DaemonError::Invalid("digest must be 64 hex characters".to_owned()))?;
+    let grant = store_op(&state.store, move |store| store.get_grant(&id))
+        .await?
+        .ok_or_else(|| DaemonError::NotFound("approval not found".to_owned()))?;
+    let now = now_ms();
+    let live = grant.status == qk_approval::GrantStatus::Approved && now < grant.expires_at_ms;
+    let (bound_version, bound_bytes) = match &grant.binding {
+        qk_approval::ApprovalBinding::ExactV1(digest) => ("exact_v1", digest.as_bytes()),
+        qk_approval::ApprovalBinding::ExactV2(digest) => ("exact_v2", digest.as_bytes()),
+        _ => ("", &[0u8; 32]),
+    };
+    let scope_ok = grant.scope.session_id.as_deref() == body.session_id.as_deref()
+        && grant.scope.integration == body.integration.clone().unwrap_or_default()
+        && grant.scope.environment == body.environment.clone().unwrap_or_default()
+        && grant.scope.database == body.database.clone().unwrap_or_default()
+        && grant.scope.agent_id == body.agent_id.clone().unwrap_or_default()
+        && grant.scope.tool == body.tool.clone().unwrap_or_default();
+    let matched = live && bound_version == want_version && *bound_bytes == want_digest && scope_ok;
+    Ok(Json(serde_json::json!({"match": matched})))
+}
+
+/// POST /approvals/:id/schema-diff: attach the after-image schema
+/// diff (display only; never authorization input). Unknown ids are
+/// text `not found` (frozen).
 pub async fn schema_diff(
     State(state): State<DaemonState>,
     Path(id): Path<String>,
@@ -207,16 +297,18 @@ pub async fn allows(
         return Ok(Json(serde_json::json!({"allowed": false})));
     }
     let now = now_ms();
-    // An explicit empty scope matches nothing with dimensions; only
-    // dimension-less legacy rows could match it, and those are
-    // structurally excluded from authorization.
+    // Scope dims are optional (absent means `""`, preserving the
+    // historical bare session+fingerprint check, which matches only
+    // dimension-less rows). Trusted service paths pass full dims so
+    // real session grants are found.
+    let dim = |key: &str| params.get(key).cloned().unwrap_or_default();
     let empty = qk_approval::ApprovalScope {
         session_id: Some(session_id.clone()),
-        integration: String::new(),
-        environment: String::new(),
-        database: String::new(),
-        agent_id: String::new(),
-        tool: String::new(),
+        integration: dim("integration"),
+        environment: dim("environment"),
+        database: dim("database"),
+        agent_id: dim("agentId"),
+        tool: dim("tool"),
     };
     let shape = qk_core::QueryShapeFingerprint::new(fingerprint);
     let allowed = store_op(&state.store, move |store| {

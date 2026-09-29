@@ -35,6 +35,11 @@ pub struct ApprovalRequest {
     pub column: Option<String>,
     /// Statement kinds, when present.
     pub operation: Option<String>,
+    /// Exact execution identity for this request (versioned digest
+    /// over dialect, SQL, and bound params). Providers that persist
+    /// remotely (daemon verify path) forward it opaquely; human and
+    /// in-process providers ignore it. Never logged or displayed.
+    pub exact: qk_core::ExactDigest,
 }
 
 /// A provider's verdict on one request.
@@ -247,6 +252,10 @@ mod tests {
             table: None,
             column: None,
             operation: None,
+            exact: qk_core::ExactDigest::V1(qk_core::exact_request_digest(
+                qk_sql::SqlDialect::Sqlite,
+                "SELECT 1",
+            )),
         }
     }
 

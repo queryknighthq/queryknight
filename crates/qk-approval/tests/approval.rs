@@ -3,10 +3,11 @@
 //! ever transition `RequireApproval` (INV-024).
 
 use qk_approval::{
-    resolve, ApprovalBinding, ApprovalIdGenerator, ApprovalProvider, ApprovalRequest,
-    ApprovalStore, CountingIdGenerator, DenyByDefaultProvider, ErrorProvider, GrantStatus,
-    InMemoryApprovalStore, ProviderDecision, ProviderError, ProviderResponse, ResolutionOutcome,
-    ResolveRequest, Scope, StoredGrant, TestProvider, UnavailableProvider, DEFAULT_APPROVAL_TTL_MS,
+    resolve, ApprovalBinding, ApprovalId, ApprovalIdGenerator, ApprovalProvider, ApprovalRequest,
+    ApprovalScope, ApprovalStore, CountingIdGenerator, DenyByDefaultProvider, ErrorProvider,
+    GrantStatus, InMemoryApprovalStore, ProviderDecision, ProviderError, ProviderResponse,
+    ResolutionOutcome, ResolveRequest, Scope, StoredGrant, TestProvider, UnavailableProvider,
+    DEFAULT_APPROVAL_TTL_MS,
 };
 use qk_core::{
     evaluate, parse_policy, Decision, EvaluateOptions, EvaluationRequest, EvaluationResult,
@@ -63,6 +64,7 @@ fn resolve_with(
             context,
             dialect: qk_sql::SqlDialect::PostgreSql,
             sql,
+            params: &[],
             approval_id,
             ttl_ms: DEFAULT_APPROVAL_TTL_MS,
             now_ms: NOW,
@@ -503,6 +505,7 @@ fn expiry_and_unknown_ids() {
             context: &context,
             dialect: qk_sql::SqlDialect::PostgreSql,
             sql: SQL,
+            params: &[],
             approval_id: Some(id.as_str()),
             ttl_ms: DEFAULT_APPROVAL_TTL_MS,
             now_ms: expired_at,
@@ -570,6 +573,7 @@ fn dialect_change_breaks_exact_binding() {
             context: &context,
             dialect: qk_sql::SqlDialect::MySql,
             sql: SQL,
+            params: &[],
             approval_id: Some(id.as_str()),
             ttl_ms: DEFAULT_APPROVAL_TTL_MS,
             now_ms: NOW,
@@ -842,4 +846,281 @@ fn resolver_rejects_leaking_legacy_grant() {
         1,
         "rejected legacy falls through to provider"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Exact request identity matrix (INV-041): V1 SQL-only preserved, V2
+// binds ordered params; versions never cross-match.
+// ---------------------------------------------------------------------------
+
+use qk_core::{DigestParam, ExactDigest};
+
+fn resolve_with_params(
+    evaluation: &EvaluationResult,
+    context: &ExecutionContext,
+    sql: &str,
+    params: &[DigestParam],
+    approval_id: Option<&str>,
+    store: &dyn ApprovalStore,
+    provider: Option<&dyn ApprovalProvider>,
+) -> qk_approval::ResolvedEvaluation {
+    resolve(
+        &ResolveRequest {
+            evaluation,
+            context,
+            dialect: qk_sql::SqlDialect::PostgreSql,
+            sql,
+            params,
+            approval_id,
+            ttl_ms: DEFAULT_APPROVAL_TTL_MS,
+            now_ms: NOW,
+        },
+        store,
+        provider,
+    )
+}
+
+fn approved_grant(id: &str, sql: &str, binding: ApprovalBinding, reuse: Scope) -> StoredGrant {
+    StoredGrant {
+        id: ApprovalId::new(id.to_owned()),
+        shape: qk_core::sql_fingerprint(sql),
+        binding,
+        scope: ApprovalScope {
+            session_id: Some("session-1".to_owned()),
+            integration: "mcp".to_owned(),
+            environment: "production".to_owned(),
+            database: "main".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            tool: "db_query".to_owned(),
+        },
+        status: GrantStatus::Approved,
+        reuse,
+        expires_at_ms: NOW + 60_000,
+        reason_code: ReasonCode::RequireApproval,
+        message: "m".to_owned(),
+        risk: String::new(),
+        operation_summary: String::new(),
+        schema_ddl: None,
+        schema_diff: None,
+        matched_policy: None,
+        decided_at_ms: Some(NOW),
+        decided_by: None,
+    }
+}
+
+#[test]
+fn v1_identity_stable_without_params() {
+    // Same no-param SQL/dialect re-resolves against a stored V1 row
+    // (existing approvals keep working).
+    let (evaluation, context, _) = require_approval();
+    let store = InMemoryApprovalStore::new();
+    let digest = qk_core::exact_request_digest(qk_sql::SqlDialect::PostgreSql, SQL);
+    store
+        .insert_grant(approved_grant(
+            "qka-v1",
+            SQL,
+            ApprovalBinding::ExactV1(digest),
+            Scope::Once,
+        ))
+        .expect("plant");
+    let resolved = resolve_with(&evaluation, &context, SQL, Some("qka-v1"), &store, None);
+    assert_eq!(resolved.outcome, ResolutionOutcome::ExistingGrant);
+    assert_eq!(resolved.decision, Decision::Allow);
+}
+
+#[test]
+fn v1_row_never_satisfies_v2_request() {
+    // Pre-fix parameterized row (SQL-only digest) must not authorize a
+    // modern request carrying actual bound params.
+    let (evaluation, context, _) = require_approval();
+    let store = InMemoryApprovalStore::new();
+    let digest = qk_core::exact_request_digest(qk_sql::SqlDialect::PostgreSql, SQL);
+    store
+        .insert_grant(approved_grant(
+            "qka-old",
+            SQL,
+            ApprovalBinding::ExactV1(digest),
+            Scope::Once,
+        ))
+        .expect("plant");
+    let params = [DigestParam::Int(42)];
+    let resolved = resolve_with_params(
+        &evaluation,
+        &context,
+        SQL,
+        &params,
+        Some("qka-old"),
+        &store,
+        None,
+    );
+    assert_ne!(resolved.outcome, ResolutionOutcome::ExistingGrant);
+    // Falls through to provider (None → unavailable), never executes.
+    assert_eq!(resolved.outcome, ResolutionOutcome::ProviderUnavailable);
+}
+
+#[test]
+fn v2_param_change_rejects() {
+    let (evaluation, context, _) = require_approval();
+    let store = InMemoryApprovalStore::new();
+    let params = [DigestParam::Int(42)];
+    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::PostgreSql, SQL, &params);
+    store
+        .insert_grant(approved_grant(
+            "qka-v2",
+            SQL,
+            ApprovalBinding::ExactV2(digest),
+            Scope::Once,
+        ))
+        .expect("plant");
+    // Same params → reuse.
+    let resolved = resolve_with_params(
+        &evaluation,
+        &context,
+        SQL,
+        &params,
+        Some("qka-v2"),
+        &store,
+        None,
+    );
+    assert_eq!(resolved.outcome, ResolutionOutcome::ExistingGrant);
+    // Changed value → fresh (provider re-ask, never the old row).
+    let other = [DigestParam::Int(43)];
+    let resolved = resolve_with_params(
+        &evaluation,
+        &context,
+        SQL,
+        &other,
+        Some("qka-v2"),
+        &store,
+        None,
+    );
+    assert_ne!(resolved.outcome, ResolutionOutcome::ExistingGrant);
+    // Changed type → fresh.
+    let text = [DigestParam::Text("42".to_owned())];
+    let resolved = resolve_with_params(
+        &evaluation,
+        &context,
+        SQL,
+        &text,
+        Some("qka-v2"),
+        &store,
+        None,
+    );
+    assert_ne!(resolved.outcome, ResolutionOutcome::ExistingGrant);
+    // Dropped params (V1 request) → fresh: versions never cross-match.
+    let resolved = resolve_with(&evaluation, &context, SQL, Some("qka-v2"), &store, None);
+    assert_ne!(resolved.outcome, ResolutionOutcome::ExistingGrant);
+}
+
+#[test]
+fn v2_dialect_change_rejects() {
+    let (evaluation, context, _) = require_approval();
+    let store = InMemoryApprovalStore::new();
+    let params = [DigestParam::Int(42)];
+    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::PostgreSql, SQL, &params);
+    store
+        .insert_grant(approved_grant(
+            "qka-v2d",
+            SQL,
+            ApprovalBinding::ExactV2(digest),
+            Scope::Once,
+        ))
+        .expect("plant");
+    let resolved = resolve(
+        &ResolveRequest {
+            evaluation: &evaluation,
+            context: &context,
+            dialect: qk_sql::SqlDialect::MySql,
+            sql: SQL,
+            params: &params,
+            approval_id: Some("qka-v2d"),
+            ttl_ms: DEFAULT_APPROVAL_TTL_MS,
+            now_ms: NOW,
+        },
+        &store,
+        None,
+    );
+    assert_ne!(resolved.outcome, ResolutionOutcome::ExistingGrant);
+}
+
+#[test]
+fn session_v2_reuses_param_variants() {
+    // Explicit session scope stays shape-wide: different params and
+    // literals reuse the live session grant.
+    let (evaluation, context, _) = require_approval();
+    let store = InMemoryApprovalStore::new();
+    let params = [DigestParam::Int(42)];
+    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::PostgreSql, SQL, &params);
+    store
+        .insert_grant(approved_grant(
+            "qka-sess",
+            SQL,
+            ApprovalBinding::ExactV2(digest),
+            Scope::Session,
+        ))
+        .expect("plant");
+    // No approval id at all: session path authorizes by shape+scope.
+    let other = [DigestParam::Int(999)];
+    let resolved = resolve_with_params(&evaluation, &context, SQL, &other, None, &store, None);
+    assert_eq!(resolved.decision, Decision::Allow);
+    // Literal variant, same shape: also reuses.
+    let variant = SQL.replace("42", "43");
+    let resolved = resolve_with_params(&evaluation, &context, &variant, &[], None, &store, None);
+    assert_eq!(resolved.decision, Decision::Allow);
+    // Different shape: no reuse (provider re-ask → unavailable here).
+    let resolved = resolve_with_params(
+        &evaluation,
+        &context,
+        "DELETE FROM orders WHERE id = 1",
+        &[],
+        None,
+        &store,
+        None,
+    );
+    assert_ne!(resolved.decision, Decision::Allow);
+}
+
+#[test]
+fn session_scope_change_rejects() {
+    let (evaluation, _, _) = require_approval();
+    let store = InMemoryApprovalStore::new();
+    let digest = qk_core::exact_request_digest(qk_sql::SqlDialect::PostgreSql, SQL);
+    store
+        .insert_grant(approved_grant(
+            "qka-s",
+            SQL,
+            ApprovalBinding::ExactV1(digest),
+            Scope::Session,
+        ))
+        .expect("plant");
+    // Same shape but a different session: no reuse.
+    let mut other = context();
+    other.session_id = Some("session-2".to_owned());
+    let resolved = resolve_with(&evaluation, &other, SQL, None, &store, None);
+    assert_ne!(resolved.decision, Decision::Allow);
+}
+
+#[test]
+fn binding_helpers() {
+    let v1 = ApprovalBinding::ExactV1(qk_core::exact_request_digest(
+        qk_sql::SqlDialect::Sqlite,
+        "SELECT 1",
+    ));
+    assert!(v1.is_fully_bound() && !v1.is_legacy());
+    assert_eq!(v1.version(), "exact_v1");
+    let v2 = ApprovalBinding::ExactV2(qk_core::exact_request_digest_v2(
+        qk_sql::SqlDialect::Sqlite,
+        "SELECT 1",
+        &[DigestParam::Int(1)],
+    ));
+    assert!(v2.is_fully_bound() && !v2.is_legacy());
+    assert_eq!(v2.version(), "exact_v2");
+    assert!(!ApprovalBinding::LegacyShape.is_fully_bound());
+    assert!(ApprovalBinding::LegacyShape.is_legacy());
+    assert!(!ApprovalBinding::ShapeV1.is_fully_bound());
+    assert_eq!(ExactDigest::V1(v1_digest()).version(), "exact_v1");
+
+    fn v1_digest() -> qk_core::ExactRequestDigest {
+        qk_core::exact_request_digest(qk_sql::SqlDialect::Sqlite, "SELECT 1")
+    }
 }

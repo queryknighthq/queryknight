@@ -81,6 +81,7 @@ fn resolve_approval(
             context,
             dialect,
             sql,
+            params: &[],
             approval_id: None,
             ttl_ms: DEFAULT_APPROVAL_TTL_MS,
             now_ms: 1_000,

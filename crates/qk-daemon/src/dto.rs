@@ -40,9 +40,26 @@ pub struct ApprovalView {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Unified before/after diff (after execution).
     pub schema_diff: Option<serde_json::Value>,
-    /// Binding kind (`exact_v1` or `legacy_shape`): additive visibility
-    /// for quarantined rows, which can never authorize.
+    /// Binding kind (`exact_v1`, `exact_v2`, `shape_v1`, or
+    /// `legacy_shape`): additive visibility for quarantined rows,
+    /// which can never authorize. The digest VALUE is never exposed
+    /// (internal authorization material; see INV-041).
     pub binding_kind: &'static str,
+    /// Integration scope dimension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
+    /// Environment scope dimension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    /// Database scope dimension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    /// Agent scope dimension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Tool scope dimension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
 }
 
 impl ApprovalView {
@@ -75,9 +92,15 @@ impl ApprovalView {
             schema_diff,
             binding_kind: match grant.binding {
                 ApprovalBinding::ExactV1(_) => "exact_v1",
+                ApprovalBinding::ExactV2(_) => "exact_v2",
                 ApprovalBinding::ShapeV1 => "shape_v1",
                 ApprovalBinding::LegacyShape => "legacy_shape",
             },
+            integration: Some(grant.scope.integration.clone()),
+            environment: Some(grant.scope.environment.clone()),
+            database: Some(grant.scope.database.clone()),
+            agent_id: Some(grant.scope.agent_id.clone()),
+            tool: Some(grant.scope.tool.clone()),
         }
     }
 }
@@ -112,6 +135,39 @@ pub struct CreateApprovalRequest {
     /// Agent scope dimension.
     pub agent_id: Option<String>,
     /// Tool scope dimension.
+    pub tool: Option<String>,
+    /// Exact execution digest as 64 hex chars (opaque binding for
+    /// trusted service paths; stored, never returned in views).
+    /// Required with `binding_kind` `exact_v1`/`exact_v2`, forbidden
+    /// with `shape_v1`.
+    pub exact_digest: Option<String>,
+    /// Binding kind override (`exact_v1`, `exact_v2`; default
+    /// `shape_v1` for UI/human rows that carry no SQL identity).
+    pub binding_kind: Option<String>,
+}
+
+/// Verify-approval request body: proves an approval id authorizes an
+/// exact request WITHOUT exposing digests in URLs, logs, or views.
+/// The digest travels in this POST body only (trusted loopback path).
+/// Scope dims default to `""` (matching store defaults) when absent.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyApprovalRequest {
+    /// Expected digest as 64 hex chars.
+    pub digest: String,
+    /// Expected version (`exact_v1` or `exact_v2`).
+    pub version: String,
+    /// Expected session scope dimension.
+    pub session_id: Option<String>,
+    /// Expected integration scope dimension.
+    pub integration: Option<String>,
+    /// Expected environment scope dimension.
+    pub environment: Option<String>,
+    /// Expected database scope dimension.
+    pub database: Option<String>,
+    /// Expected agent scope dimension.
+    pub agent_id: Option<String>,
+    /// Expected tool scope dimension.
     pub tool: Option<String>,
 }
 

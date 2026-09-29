@@ -110,8 +110,10 @@ impl DaemonEndpoint {
         value.as_array().cloned().ok_or(DaemonFailure)
     }
 
-    /// `GET /approvals/{id}` → (status, fingerprint, binding kind).
-    pub fn get_approval(&self, id: &str) -> Option<(String, String, String)> {
+    /// `GET /approvals/{id}` → status, fingerprint, binding kind,
+    /// and scope dimensions (digest values never cross: exact proof
+    /// goes through [`DaemonEndpoint::verify_approval`]).
+    pub fn get_approval(&self, id: &str) -> Option<ApprovalRow> {
         if id.contains(['/', '?', '#', ' ']) {
             return None;
         }
@@ -120,15 +122,66 @@ impl DaemonEndpoint {
             return None;
         }
         let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-        Some((
-            value.get("status")?.as_str()?.to_owned(),
-            value.get("fingerprint")?.as_str()?.to_owned(),
+        let text = |key: &str| {
             value
+                .get(key)
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_owned()
+        };
+        Some(ApprovalRow {
+            status: text("status"),
+            fingerprint: text("fingerprint"),
+            binding_kind: value
                 .get("bindingKind")
                 .and_then(|kind| kind.as_str())
                 .unwrap_or("legacy_shape")
                 .to_owned(),
-        ))
+            session_id: value
+                .get("sessionId")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned),
+            integration: text("integration"),
+            environment: text("environment"),
+            database: text("database"),
+            agent_id: text("agentId"),
+            tool: text("tool"),
+        })
+    }
+
+    /// `POST /approvals/{id}/verify {digest, version, scope...}` →
+    /// whether the row authorizes the exact request. Digest travels
+    /// in the POST body only (never URLs, logs, or views).
+    pub fn verify_approval(
+        &self,
+        id: &str,
+        digest_hex: &str,
+        version: &str,
+        scope: &qk_approval::ApprovalScope,
+    ) -> bool {
+        if id.contains(['/', '?', '#', ' ']) {
+            return false;
+        }
+        let value = match self.post_json(
+            &format!("/approvals/{id}/verify"),
+            &serde_json::json!({
+                "digest": digest_hex,
+                "version": version,
+                "sessionId": scope.session_id,
+                "integration": scope.integration,
+                "environment": scope.environment,
+                "database": scope.database,
+                "agentId": scope.agent_id,
+                "tool": scope.tool,
+            }),
+        ) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        value
+            .get("match")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
     }
 
     /// `POST /approvals/{id}/decide {status, source: "mcp"}`.
@@ -147,12 +200,23 @@ impl DaemonEndpoint {
             .ok_or(DaemonFailure)
     }
 
-    /// `GET /allows?sessionId=&fingerprint=` session-shape check.
-    pub fn session_allows(&self, session_id: &str, fingerprint: &str) -> bool {
+    /// `GET /allows` session-shape check with full scope dims (absent
+    /// dims would only match dimension-less rows).
+    pub fn session_allows(
+        &self,
+        session_id: &str,
+        fingerprint: &str,
+        scope: &qk_approval::ApprovalScope,
+    ) -> bool {
         let (code, raw) = match self.get(&format!(
-            "/allows?sessionId={}&fingerprint={}",
+            "/allows?sessionId={}&fingerprint={}&integration={}&environment={}&database={}&agentId={}&tool={}",
             percent_encode(session_id),
-            percent_encode(fingerprint)
+            percent_encode(fingerprint),
+            percent_encode(&scope.integration),
+            percent_encode(&scope.environment),
+            percent_encode(&scope.database),
+            percent_encode(&scope.agent_id),
+            percent_encode(&scope.tool),
         )) {
             Ok(response) => response,
             Err(DaemonFailure) => return false,
@@ -272,11 +336,37 @@ fn parse_response(raw: &[u8]) -> Result<(u16, Vec<u8>), DaemonFailure> {
     Ok((code, body[..length].to_vec()))
 }
 
-/// Daemon-backed approval provider (mirrors the frozen
-/// `DaemonApprovalProvider`): retry ids resolve against daemon rows
-/// (approved only with matching shape fingerprint; exact binding is
-/// still enforced locally by `qk-approval`), fresh requests create
-/// daemon rows (always waiting — the `wait:false` agent flow), and a
+/// Daemon row projection needed for retry validation (status and
+/// shape for the verdict gate; scope for the equality check; the
+/// digest itself is verified opaquely via `verify_approval`).
+#[derive(Debug, Clone)]
+pub struct ApprovalRow {
+    /// Row status (`waiting`, `approved`, `denied`).
+    pub status: String,
+    /// Shape fingerprint.
+    pub fingerprint: String,
+    /// Binding kind (`exact_v1`, `exact_v2`, `shape_v1`, legacy).
+    pub binding_kind: String,
+    /// Session scope dimension.
+    pub session_id: Option<String>,
+    /// Integration scope dimension.
+    pub integration: String,
+    /// Environment scope dimension.
+    pub environment: String,
+    /// Database scope dimension.
+    pub database: String,
+    /// Agent scope dimension.
+    pub agent_id: String,
+    /// Tool scope dimension.
+    pub tool: String,
+}
+
+/// Daemon-backed approval provider: retry ids resolve against daemon
+/// rows with FULL exact validation (approved/live status, shape AND
+/// digest-version-digest match via the opaque verify endpoint, full
+/// scope equality) — id + fingerprint alone never authorize
+/// (INV-041). Fresh requests create daemon rows carrying the exact
+/// binding (always waiting — the `wait:false` agent flow), and a
 /// session-allow pre-check reuses daemon session grants without
 /// minting duplicate rows (mirrors `hasSessionAllow`).
 pub struct DaemonApprovalProvider {
@@ -306,26 +396,33 @@ impl DaemonApprovalProvider {
 impl ApprovalProvider for DaemonApprovalProvider {
     fn request(&self, input: &ApprovalRequest) -> Result<ProviderResponse, ProviderError> {
         let fingerprint = input.fingerprint.as_str().to_owned();
-        // Retry path: an approved daemon row with a matching shape
-        // fingerprint resolves without creating a second row. Anything
-        // else (waiting/denied/missing/mismatched) maps explicitly —
-        // never a silent fresh row on a retry id.
+        // Retry path: the daemon row must prove the FULL exact
+        // identity (status, shape, binding version, digest bytes,
+        // scope, expiry) via the opaque verify endpoint. Shape or
+        // status alone never authorize (INV-041); legacy rows read as
+        // waiting so the agent seeks a fresh approval (INV-027).
         if let Some(id) = self.approval_id.as_deref() {
-            if let Some((status, row_fingerprint, binding)) = self.endpoint.get_approval(id) {
-                // Quarantine holds at the protocol boundary: migrated
-                // legacy rows never authorize, even when approved and
-                // fingerprint-matching (INV-027). They read as waiting
-                // so the agent is told to seek a fresh approval.
-                if row_fingerprint == fingerprint && binding != "legacy_shape" {
-                    let decision = match status.as_str() {
-                        "approved" => ProviderDecision::Approved,
-                        "denied" => ProviderDecision::Denied,
-                        _ => ProviderDecision::Waiting,
-                    };
-                    return Ok(ProviderResponse {
-                        id: ApprovalId::new(id.to_owned()),
-                        decision,
-                    });
+            if let Some(row) = self.endpoint.get_approval(id) {
+                if row.fingerprint == fingerprint && row.binding_kind != "legacy_shape" {
+                    if row.status == "denied" {
+                        return Ok(ProviderResponse {
+                            id: ApprovalId::new(id.to_owned()),
+                            decision: ProviderDecision::Denied,
+                        });
+                    }
+                    if row.status == "approved"
+                        && self.endpoint.verify_approval(
+                            id,
+                            &input.exact.to_hex(),
+                            input.exact.version(),
+                            &input.scope,
+                        )
+                    {
+                        return Ok(ProviderResponse {
+                            id: ApprovalId::new(id.to_owned()),
+                            decision: ProviderDecision::Approved,
+                        });
+                    }
                 }
             }
             return Ok(ProviderResponse {
@@ -337,14 +434,20 @@ impl ApprovalProvider for DaemonApprovalProvider {
         // minting a duplicate row. The id is local-only (never shown
         // to agents); resolution still inserts the exact-bound grant.
         if let Some(session_id) = self.session_id.as_deref() {
-            if self.endpoint.session_allows(session_id, &fingerprint) {
+            if self
+                .endpoint
+                .session_allows(session_id, &fingerprint, &input.scope)
+            {
                 return Ok(ProviderResponse {
                     id: ApprovalId::new(format!("local-session-{session_id}")),
                     decision: ProviderDecision::Approved,
                 });
             }
         }
-        // Fresh request: create the daemon row (always waiting).
+        // Fresh request: create the daemon row carrying the exact
+        // binding (always waiting). The digest crosses this trusted
+        // internal boundary in the POST body only — never URLs, logs,
+        // or views.
         let body = serde_json::json!({
             "connectionKey": self.connection_key,
             "sessionId": self.session_id,
@@ -353,6 +456,13 @@ impl ApprovalProvider for DaemonApprovalProvider {
             "risk": risk_for(input.reason_code.as_str(), input.operation.as_deref()),
             "operationSummary": operation_summary(input.operation.as_deref(), input.table.as_deref().or(input.column.as_deref())),
             "timeoutMs": 60_000,
+            "bindingKind": input.exact.version(),
+            "exactDigest": input.exact.to_hex(),
+            "integration": input.scope.integration,
+            "environment": input.scope.environment,
+            "database": input.scope.database,
+            "agentId": input.scope.agent_id,
+            "tool": input.scope.tool,
         });
         match self.endpoint.request_approval(&body) {
             Ok(id) => Ok(ProviderResponse {

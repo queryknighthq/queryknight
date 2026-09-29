@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
-use qk_core::{ExactRequestDigest, QueryShapeFingerprint, ReasonCode};
+use qk_core::{ExactRequestDigest, ExactRequestDigestV2, QueryShapeFingerprint, ReasonCode};
 
 use crate::id::ApprovalId;
 use crate::scope::{ApprovalScope, DecisionSource, Scope};
@@ -28,9 +28,15 @@ pub enum GrantStatus {
 /// accidentally treat one as the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalBinding {
-    /// Exact token binding: carries the full request digest. Retry
-    /// requires digest equality; session reuse matches by shape.
+    /// Exact token binding (SQL-only identity): carries the full V1
+    /// request digest. Retry requires version + digest equality;
+    /// session reuse matches by shape.
     ExactV1(ExactRequestDigest),
+    /// Exact token binding (parameter-aware identity): carries the
+    /// full V2 digest over dialect, SQL, and ordered params. Retry
+    /// requires version + digest equality; session reuse matches by
+    /// shape. V1 and V2 digests are never comparable.
+    ExactV2(ExactRequestDigestV2),
     /// Shape binding for daemon-issued rows (frozen semantics: the daemon
     /// never sees SQL, so it binds shape plus full scope). Retry and
     /// session reuse both match by shape; scope dimensions still bind.
@@ -46,13 +52,35 @@ impl ApprovalBinding {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::ExactV1(_) => "exact_v1",
+            Self::ExactV2(_) => "exact_v2",
             Self::ShapeV1 => "shape_v1",
             Self::LegacyShape => "legacy_shape",
         }
     }
 
-    /// True for bindings eligible for authorization (`ExactV1` with a
-    /// matching digest, `ShapeV1` with a matching shape).
+    /// True for fully-bound exact bindings (either digest version).
+    /// Session authorization accepts these (shape + scope govern
+    /// reuse); legacy rows never qualify.
+    #[must_use]
+    pub fn is_fully_bound(&self) -> bool {
+        matches!(self, Self::ExactV1(_) | Self::ExactV2(_))
+    }
+
+    /// True for quarantined historical state.
+    #[must_use]
+    pub fn is_legacy(&self) -> bool {
+        matches!(self, Self::LegacyShape)
+    }
+
+    /// Binding version name (`exact_v1` / `exact_v2` / `shape_v1` /
+    /// `legacy_shape`).
+    #[must_use]
+    pub fn version(&self) -> &'static str {
+        self.as_str()
+    }
+
+    /// True for bindings eligible for authorization (exact bindings
+    /// with a matching digest, `ShapeV1` with a matching shape).
     /// `LegacyShape` is historical state only.
     #[must_use]
     pub fn authorizable(&self) -> bool {
@@ -66,6 +94,9 @@ impl ApprovalBinding {
     pub fn parse(kind: &str, exact_digest: Option<[u8; 32]>) -> Option<Self> {
         match (kind, exact_digest) {
             ("exact_v1", Some(bytes)) => Some(Self::ExactV1(ExactRequestDigest::from_bytes(bytes))),
+            ("exact_v2", Some(bytes)) => {
+                Some(Self::ExactV2(ExactRequestDigestV2::from_bytes(bytes)))
+            }
             ("shape_v1", _) => Some(Self::ShapeV1),
             ("legacy_shape", _) => Some(Self::LegacyShape),
             _ => None,

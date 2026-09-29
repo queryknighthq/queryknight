@@ -62,13 +62,13 @@ approval id, table identifiers.
   `Then retry db_query with the same SQL and approvalId="<id>".`
 - Retry re-runs the full guarded path (evaluate → store/session
   checks → provider re-verification against the live daemon row →
-  fresh exact binding for the current SQL → execute). Daemon rows
-  bind shape fingerprints (frozen TS semantics): literal variants of
-  an approved shape execute, per INV-024 literal-variant sharing.
-  Exact-digest rejection applies where exact tokens exist (local
-  `ExactV1` grants in `qk-db`, pinned there) — the daemon provider
-  never mints exact identity from a shape approval, it only relays
-  the human verdict for the currently evaluated statement.
+  execute). The daemon row must prove the FULL exact identity
+  (approved/live status, binding version, digest bytes via the
+  opaque `POST .../verify`, full scope, expiry) — id + fingerprint
+  alone never authorize (INV-041). Changed literals or params fail
+  verification and pend for a fresh approval; only explicit Session
+  grants stay shape-wide (via `/allows`), and legacy rows read as
+  waiting (INV-027).
 - `approvals_list` without daemon: `daemon unavailable; start
   queryknight`. Decide result: `approval <id>: <status>`.
 
@@ -109,3 +109,40 @@ Migrated `legacy_shape` daemon rows never authorize via MCP (7th
 divergence): the provider reads them as waiting so the agent seeks a
 fresh approval, even when approved and fingerprint-matching. INV-027
 holds at every layer.
+
+## Approval-binding gap (hardening phase, traced 2026-09-30, fixed in-code)
+
+Current Rust flow for `MCP db_query -> qk-db -> qk-approval ->
+daemon provider -> qk-daemon/qk-store -> approvals_decide -> retry`:
+
+1. `ExactRequestDigest` is created in `qk-approval::resolve` from
+   `(dialect, sql)` ONLY (`exact_request_digest`, v1 domain
+   `queryknight:approval-request:v1`). `ResolveRequest` has no
+   params field, so `DELETE ... WHERE id = ?` + `[42]` and `+ [999]`
+   share one digest.
+2. It is persisted two places: local `ApprovalStore` rows
+   (`exact_digest` 32-byte column, `binding_kind = exact_v1`) and
+   NOT AT ALL in daemon rows (MCP-created rows are `shape_v1` with
+   only the 16-hex shape fingerprint; the daemon create DTO has no
+   digest/binding fields).
+3. It disappears at three boundaries: (a) `qk-db` never forwards
+   bound params to `resolve`; (b) the daemon API cannot store or
+   return a digest; (c) the provider retry verdict is
+   `id + approved + shape-fingerprint` only.
+4. A changed literal reuses an approval ID because the provider
+   returns `Approved` on shape match and `resolve` then mints a
+   brand-new local `ExactV1` grant for the CURRENT sql — laundering
+   a shape approval into exact authority (§17 pattern, now
+   forbidden).
+5. Retry is therefore authorized by daemon status + shape
+   fingerprint, NOT by exact digest. Session vs Once differ only in
+   daemon `scope` param and the `/allows` pre-check; neither binds
+   params.
+6. Fix: versioned digests (V1 SQL-only preserved, V2
+   dialect+sql+params), digest + binding persisted through the
+   daemon DTO, provider-side verify against the daemon row
+   (internal `POST .../verify`, digest in body never URL/logs),
+   scope comparison from new view fields, and resolve-side
+   version-aware matching. Session scope remains intentionally
+   shape-wide; Once becomes exact-request-strict (deliberate TS
+   divergence, INV-041).

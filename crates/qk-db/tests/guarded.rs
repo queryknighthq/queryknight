@@ -1028,3 +1028,181 @@ fn redacted_config_never_leaks_password() {
     let error = DbError::new(DbErrorKind::Connection, "connection refused");
     assert!(!format!("{error}").contains("s3cret"));
 }
+
+// ---------------------------------------------------------------------------
+// Exact request identity with bound params (INV-041).
+// ---------------------------------------------------------------------------
+
+fn v2_grant(
+    id: &str,
+    sql: &str,
+    params: &[qk_core::DigestParam],
+    reuse: qk_approval::Scope,
+) -> qk_approval::StoredGrant {
+    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::Sqlite, sql, params);
+    qk_approval::StoredGrant {
+        id: qk_approval::ApprovalId::new(id.to_owned()),
+        shape: qk_core::sql_fingerprint(sql),
+        binding: qk_approval::ApprovalBinding::ExactV2(digest),
+        scope: qk_approval::ApprovalScope {
+            session_id: Some("session-1".to_owned()),
+            integration: "test".to_owned(),
+            environment: "production".to_owned(),
+            database: "main".to_owned(),
+            agent_id: String::new(),
+            tool: "db_query".to_owned(),
+        },
+        status: qk_approval::GrantStatus::Approved,
+        reuse,
+        expires_at_ms: NOW + 60_000,
+        reason_code: qk_core::ReasonCode::RequireApproval,
+        message: "m".to_owned(),
+        matched_policy: None,
+        decided_at_ms: Some(NOW),
+        decided_by: None,
+        risk: String::new(),
+        operation_summary: String::new(),
+        schema_ddl: None,
+        schema_diff: None,
+    }
+}
+
+fn param_request(
+    sql: &str,
+    params: Vec<serde_json::Value>,
+    approval_id: Option<String>,
+) -> ExecuteRequest {
+    ExecuteRequest {
+        sql: sql.to_owned(),
+        params,
+        max_rows: None,
+        cursor: None,
+        approval_id,
+    }
+}
+
+#[tokio::test]
+async fn once_param_change_does_not_reuse() {
+    // UPDATE ... WHERE id = ? is approval-gated; approve [42], then
+    // retry [43] with the same id: must NOT execute.
+    let service = ExecutionService::new();
+    let adapter = FakeAdapter::with_rows(vec![]);
+    let store = InMemoryApprovalStore::new();
+    let sql = "UPDATE t SET a = 1 WHERE id = ?";
+    let config = sqlite_config();
+    let auth = auth();
+    let policy = policy();
+    // Seed an approved V2 grant for [42] (as if a prior call resolved it).
+    let params42 = [qk_core::DigestParam::Int(42)];
+    store
+        .insert_grant(v2_grant("qka-p", sql, &params42, qk_approval::Scope::Once))
+        .expect("plant");
+    // Exact same params → reuse + execute once.
+    let appr = approval(&store, None);
+    let outcome = guarded(
+        &service,
+        &adapter,
+        &config,
+        &param_request(sql, vec![serde_json::json!(42)], Some("qka-p".to_owned())),
+        &auth,
+        &appr,
+        &policy,
+    )
+    .await;
+    assert!(
+        matches!(outcome, ExecutionOutcome::Executed(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(adapter.calls(), 1);
+    // Changed param → fresh (provider re-ask; none here → blocked).
+    let appr = approval(&store, None);
+    let outcome = guarded(
+        &service,
+        &adapter,
+        &config,
+        &param_request(sql, vec![serde_json::json!(43)], Some("qka-p".to_owned())),
+        &auth,
+        &appr,
+        &policy,
+    )
+    .await;
+    assert!(
+        blocked(&outcome) || matches!(outcome, ExecutionOutcome::PendingApproval(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(adapter.calls(), 1);
+}
+
+#[tokio::test]
+async fn old_v1_parameterized_row_does_not_authorize_v2() {
+    // Pre-fix row: SQL-only digest for a placeholder statement. A
+    // modern request with real bound params must not match it.
+    let service = ExecutionService::new();
+    let adapter = FakeAdapter::with_rows(vec![]);
+    let store = InMemoryApprovalStore::new();
+    let sql = "UPDATE t SET a = 1 WHERE id = ?";
+    let digest = qk_core::exact_request_digest(qk_sql::SqlDialect::Sqlite, sql);
+    let mut grant = v2_grant("qka-oldv1", sql, &[], qk_approval::Scope::Once);
+    grant.binding = qk_approval::ApprovalBinding::ExactV1(digest);
+    store.insert_grant(grant).expect("plant");
+    let config = sqlite_config();
+    let auth = auth();
+    let appr = approval(&store, None);
+    let policy = policy();
+    let outcome = guarded(
+        &service,
+        &adapter,
+        &config,
+        &param_request(
+            sql,
+            vec![serde_json::json!(42)],
+            Some("qka-oldv1".to_owned()),
+        ),
+        &auth,
+        &appr,
+        &policy,
+    )
+    .await;
+    assert!(
+        blocked(&outcome) || matches!(outcome, ExecutionOutcome::PendingApproval(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(adapter.calls(), 0);
+}
+
+#[tokio::test]
+async fn session_v2_reuses_param_variants_at_service() {
+    let service = ExecutionService::new();
+    let adapter = FakeAdapter::with_rows(vec![vec![DbValue::Int(1)]]);
+    let store = InMemoryApprovalStore::new();
+    let sql = "UPDATE t SET a = 1 WHERE id = ?";
+    let params42 = [qk_core::DigestParam::Int(42)];
+    store
+        .insert_grant(v2_grant(
+            "qka-sv2",
+            sql,
+            &params42,
+            qk_approval::Scope::Session,
+        ))
+        .expect("plant");
+    let config = sqlite_config();
+    let auth = auth();
+    let appr = approval(&store, None);
+    let policy = policy();
+    // Different params, same shape+scope: session reuse executes.
+    let outcome = guarded(
+        &service,
+        &adapter,
+        &config,
+        &param_request(sql, vec![serde_json::json!(999)], None),
+        &auth,
+        &appr,
+        &policy,
+    )
+    .await;
+    assert!(
+        matches!(outcome, ExecutionOutcome::Executed(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(adapter.calls(), 1);
+}

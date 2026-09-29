@@ -121,3 +121,6 @@ INV-039: Audit and metrics are observational only. Failure, backpressure, format
 
 INV-040: Secrets and raw SQL literals are excluded from observability output unless an explicit configured audit level requires full SQL capture.
   Default `fingerprint` level carries ids + shape hash only; `metadata` adds literal-stripped normalization; only `full_sql` carries raw text (explicit opt-in). Credentials, tokens, and exact digests never appear at any level. Corpus: secret-SQL tests at every level (event JSON, OCSF JSON, Debug), credential-URL tests, token-absence tests.
+
+INV-041: An exact approval token is bound to the complete executable request identity, including SQL dialect, exact SQL text, ordered bound parameter values, and trusted approval scope. Query-shape authorization is permitted only for an explicit live Session grant.
+  No-parameter requests bind Exact V1 (SQL-only, preserved); parameterized requests bind Exact V2 (framed dialect/SQL/typed params); versions never cross-match. Retry requires id, approved/live status, fully-bound binding, version + digest equality (verified opaquely against the daemon row, never via URL/logs/views), full scope equality, and valid expiry. Legacy rows never authorize. Corpus: qk-core digest matrix, qk-approval/qk-db retry matrices, qk-store reopen/migration tests, daemon verify tests, MCP exact/session end-to-end.

@@ -702,3 +702,120 @@ async fn remote_bind_refused_without_opt_in() {
     ));
     assert!(qk_daemon::serve(config, state).await.is_err());
 }
+
+#[tokio::test]
+async fn approval_exact_binding_and_verify() {
+    let (app, _) = test_app();
+    // Malformed digest / kind rejected before storage.
+    for body in [
+        serde_json::json!({
+            "fingerprint": "0d2e6c16b5960f15", "reason": "r",
+            "risk": "high", "operationSummary": "s",
+            "bindingKind": "exact_v1", "exactDigest": "xyz",
+        }),
+        serde_json::json!({
+            "fingerprint": "0d2e6c16b5960f15", "reason": "r",
+            "risk": "high", "operationSummary": "s",
+            "bindingKind": "bogus",
+        }),
+        serde_json::json!({
+            "fingerprint": "0d2e6c16b5960f15", "reason": "r",
+            "risk": "high", "operationSummary": "s",
+            "exactDigest": "0".repeat(64),
+        }),
+    ] {
+        let (status, _, _) = call(app.clone(), request("POST", "/approvals", Some(body))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    // Create an exact_v1 row with a digest (trusted service path).
+    let digest = "ab".repeat(32);
+    let (status, body, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            "/approvals",
+            Some(serde_json::json!({
+                "fingerprint": "0d2e6c16b5960f15", "reason": "r",
+                "risk": "high", "operationSummary": "s",
+                "bindingKind": "exact_v1", "exactDigest": digest,
+                "sessionId": "session-1", "integration": "mcp",
+                "environment": "production", "database": "main",
+                "tool": "db_query",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let created = json(&body);
+    let id = created["id"].as_str().expect("id").to_owned();
+    assert_eq!(created["bindingKind"], "exact_v1");
+    // The digest VALUE never appears in the view.
+    assert!(created.get("exactDigest").is_none());
+    assert!(!body.windows(digest.len()).any(|w| w == digest.as_bytes()));
+    // Scope dims are visible for provider-side equality checks.
+    assert_eq!(created["integration"], "mcp");
+    assert_eq!(created["sessionId"], "session-1");
+    // Approve it, then verify the exact identity.
+    let (status, _, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &format!("/approvals/{id}/decide"),
+            Some(serde_json::json!({"status": "approved"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let scope = serde_json::json!({
+        "sessionId": "session-1", "integration": "mcp",
+        "environment": "production", "database": "main",
+        "agentId": "", "tool": "db_query",
+    });
+    let verify = |digest: &str, version: &str, scope: &serde_json::Value| {
+        let mut body = serde_json::json!({"digest": digest, "version": version});
+        for (key, value) in scope.as_object().expect("scope") {
+            body[key] = value.clone();
+        }
+        request("POST", &format!("/approvals/{id}/verify"), Some(body))
+    };
+    // Full match → true.
+    let (status, body, _) = call(app.clone(), verify(&digest, "exact_v1", &scope)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["match"], true);
+    // Wrong digest bytes → false (not an error).
+    let (status, body, _) = call(app.clone(), verify(&"cd".repeat(32), "exact_v1", &scope)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["match"], false);
+    // Wrong version → false.
+    let (status, body, _) = call(app.clone(), verify(&digest, "exact_v2", &scope)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["match"], false);
+    // Wrong scope → false.
+    let mut scope2 = scope.clone();
+    scope2["sessionId"] = serde_json::json!("session-2");
+    let (status, body, _) = call(app.clone(), verify(&digest, "exact_v1", &scope2)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["match"], false);
+    // Malformed verify body → 400; unknown id → frozen text 404.
+    let (status, _, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            &format!("/approvals/{id}/verify"),
+            Some(serde_json::json!({"digest": "zz", "version": "exact_v1"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body, _) = call(
+        app.clone(),
+        request(
+            "POST",
+            "/approvals/nope/verify",
+            Some(serde_json::json!({"digest": digest, "version": "exact_v1"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"not found");
+}

@@ -913,3 +913,101 @@ fn unicode_event_round_trip() {
     assert_eq!(back[0].sql, unicode.sql);
     assert_eq!(back[0].error_code, unicode.error_code);
 }
+
+// ---------------------------------------------------------------------------
+// Exact V2 persistence: parameterized approvals survive close/reopen
+// with version-aware matching; old V1 placeholder rows never satisfy
+// V2 requests (migration/security regression, INV-041).
+// ---------------------------------------------------------------------------
+
+fn v2_grant(id: &str, sql: &str, params: &[qk_core::DigestParam]) -> StoredGrant {
+    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::Sqlite, sql, params);
+    StoredGrant {
+        id: ApprovalId::new(id.to_owned()),
+        shape: qk_core::sql_fingerprint(sql),
+        binding: qk_approval::ApprovalBinding::ExactV2(digest),
+        scope: scope(),
+        status: GrantStatus::Approved,
+        reuse: Scope::Once,
+        expires_at_ms: FAR_FUTURE,
+        reason_code: ReasonCode::RequireApproval,
+        message: "m".to_owned(),
+        matched_policy: None,
+        decided_at_ms: Some(NOW),
+        decided_by: None,
+        risk: String::new(),
+        operation_summary: String::new(),
+        schema_ddl: None,
+        schema_diff: None,
+    }
+}
+
+#[test]
+fn exact_v2_round_trip_close_reopen() {
+    let path = temp_path("v2reopen");
+    let sql = "UPDATE t SET a = 1 WHERE id = ?";
+    let params = [qk_core::DigestParam::Int(42)];
+    {
+        let store = Store::open(&path).expect("open");
+        store
+            .insert_grant(&v2_grant("qka-v2", sql, &params), NOW)
+            .expect("insert");
+    }
+    // Reopen: the row validates with its version intact.
+    let store = Store::open(&path).expect("reopen");
+    let row = store.get_grant("qka-v2").expect("read").expect("present");
+    assert!(matches!(
+        row.binding,
+        qk_approval::ApprovalBinding::ExactV2(_)
+    ));
+    assert_eq!(row.status, GrantStatus::Approved);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn old_v1_placeholder_row_stays_inert() {
+    // Simulate a pre-fix row: SQL-only digest for placeholder SQL.
+    // Reads validate (backward compatible), but the stored binding is
+    // V1 — V2 requests never match it (enforced in resolve; the row
+    // itself is untouched).
+    let path = temp_path("v1old");
+    let sql = "UPDATE t SET a = 1 WHERE id = ?";
+    let digest = qk_core::exact_request_digest(qk_sql::SqlDialect::Sqlite, sql);
+    let mut grant = v2_grant("qka-old", sql, &[]);
+    grant.binding = qk_approval::ApprovalBinding::ExactV1(digest);
+    {
+        let store = Store::open(&path).expect("open");
+        store.insert_grant(&grant, NOW).expect("insert");
+    }
+    let store = Store::open(&path).expect("reopen");
+    let row = store.get_grant("qka-old").expect("read").expect("present");
+    assert!(matches!(
+        row.binding,
+        qk_approval::ApprovalBinding::ExactV1(_)
+    ));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn session_v2_grant_found_by_shape() {
+    let path = temp_path("sessv2");
+    let sql = "DELETE FROM t WHERE id = ?";
+    let params = [qk_core::DigestParam::Int(7)];
+    let mut grant = v2_grant("qka-sv2", sql, &params);
+    grant.reuse = Scope::Session;
+    {
+        let store = Store::open(&path).expect("open");
+        store.insert_grant(&grant, NOW).expect("insert");
+    }
+    let store = Store::open(&path).expect("reopen");
+    // Same shape, different params: session lookup still finds it
+    // (shape + scope govern session reuse, not param identity).
+    let shape = qk_core::sql_fingerprint(sql);
+    let found = store
+        .find_session_grant("session-1", &shape, &scope(), NOW)
+        .expect("lookup")
+        .expect("session grant found");
+    assert_eq!(found.id.as_str(), "qka-sv2");
+    assert!(found.binding.is_fully_bound());
+    let _ = std::fs::remove_file(&path);
+}

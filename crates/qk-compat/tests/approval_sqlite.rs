@@ -70,6 +70,7 @@ fn resolve_against(
             context,
             dialect: qk_sql::SqlDialect::PostgreSql,
             sql,
+            params: &[],
             approval_id,
             ttl_ms: DEFAULT_APPROVAL_TTL_MS,
             now_ms: NOW,

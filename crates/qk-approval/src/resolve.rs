@@ -19,8 +19,8 @@
 //! for non-approval evaluations.
 
 use qk_core::{
-    exact_request_digest, sql_fingerprint, Decision, EvaluationResult, ExactRequestDigest,
-    ExecutionContext, QueryShapeFingerprint, ReasonCode,
+    exact_request_digest, exact_request_digest_v2, sql_fingerprint, Decision, DigestParam,
+    EvaluationResult, ExactDigest, ExecutionContext, QueryShapeFingerprint, ReasonCode,
 };
 use qk_sql::SqlDialect;
 
@@ -48,6 +48,10 @@ pub struct ResolveRequest<'a> {
     pub dialect: SqlDialect,
     /// Untrusted SQL under evaluation (hashed, never stored raw).
     pub sql: &'a str,
+    /// Ordered bound parameters for exact identity (empty slice means
+    /// no params → Exact V1; non-empty → Exact V2). qk-db constructs
+    /// these from the actual driver-bound values.
+    pub params: &'a [DigestParam],
     /// Retry token: a previously issued approval id, if any.
     pub approval_id: Option<&'a str>,
     /// Lifetime for newly stored grants.
@@ -122,8 +126,19 @@ pub fn resolve(
     // from the evaluation call, SQL from the request): a compromised
     // provider can never weaken the binding because providers never mint
     // identities, only verdicts under caller-stored bindings.
+    // Version strategy (INV-041): no bound params produce Exact V1
+    // (preserving existing approvals); any bound params produce Exact
+    // V2 over dialect, SQL, and ordered values.
     let shape = sql_fingerprint(request.sql);
-    let exact = exact_request_digest(request.dialect, request.sql);
+    let exact = if request.params.is_empty() {
+        ExactDigest::V1(exact_request_digest(request.dialect, request.sql))
+    } else {
+        ExactDigest::V2(exact_request_digest_v2(
+            request.dialect,
+            request.sql,
+            request.params,
+        ))
+    };
     let scope = scope_of(request.context);
 
     // Retry path: a live grant with matching EXACT digest and scope
@@ -182,13 +197,20 @@ pub fn resolve(
         table: evaluation.table.clone(),
         column: evaluation.column.clone(),
         operation: evaluation.operation.clone(),
+        // Exact execution identity for providers that persist
+        // remotely (daemon verify path). Human/provider code never
+        // validates hashes; the daemon compares opaquely.
+        exact,
     };
     match provider.request(&approval_request) {
         Ok(response) => {
             let stored = StoredGrant {
                 id: response.id.clone(),
                 shape: shape.clone(),
-                binding: ApprovalBinding::ExactV1(exact),
+                binding: match exact {
+                    ExactDigest::V1(digest) => ApprovalBinding::ExactV1(digest),
+                    ExactDigest::V2(digest) => ApprovalBinding::ExactV2(digest),
+                },
                 scope,
                 status: match response.decision {
                     ProviderDecision::Approved => GrantStatus::Approved,
@@ -302,7 +324,7 @@ fn retry_outcome(
     store: &dyn ApprovalStore,
     id: &str,
     shape: &QueryShapeFingerprint,
-    exact: &ExactRequestDigest,
+    exact: &ExactDigest,
     scope: &ApprovalScope,
 ) -> Retry {
     let evaluation = request.evaluation;
@@ -315,16 +337,19 @@ fn retry_outcome(
         Err(ApprovalStoreError::CorruptState(_)) => return Retry::Fresh,
         Err(_) => return Retry::StoreFailed(store_failure(request, "grant lookup failed")),
     };
-    // Token binding: `Exact` grants require digest equality (any literal,
-    // dialect, or whitespace change alters it); `Shape` grants (daemon
-    // flow, which never sees SQL) require shape equality instead. Scope
-    // must match fully either way, and legacy bindings never qualify. The
-    // reference mints a new approval row on mismatch; we proceed as a
-    // fresh request the same way.
-    let bound = match &grant.binding {
-        ApprovalBinding::ExactV1(digest) => digest == exact,
-        ApprovalBinding::ShapeV1 => grant.shape == *shape,
-        ApprovalBinding::LegacyShape => false,
+    // Token binding: exact grants require VERSION plus digest
+    // equality (any literal, param, dialect, or whitespace change
+    // alters it; V1 rows never satisfy V2 requests and vice versa —
+    // old parameterized V1 rows cannot authorize new V2 requests);
+    // `Shape` grants (daemon flow, which never sees SQL) require shape
+    // equality instead. Scope must match fully either way, and legacy
+    // bindings never qualify. The reference mints a new approval row
+    // on mismatch; we proceed as a fresh request the same way.
+    let bound = match (&grant.binding, &exact) {
+        (ApprovalBinding::ExactV1(digest), ExactDigest::V1(want)) => digest == want,
+        (ApprovalBinding::ExactV2(digest), ExactDigest::V2(want)) => digest == want,
+        (ApprovalBinding::ShapeV1, _) => grant.shape == *shape,
+        _ => false,
     };
     if !bound || !grant.scope.matches(scope) {
         return Retry::Fresh;
