@@ -3,10 +3,10 @@
 //! ever transition `RequireApproval` (INV-024).
 
 use qk_approval::{
-    resolve, ApprovalIdGenerator, ApprovalProvider, ApprovalRequest, ApprovalStore,
-    CountingIdGenerator, DenyByDefaultProvider, ErrorProvider, GrantStatus, InMemoryApprovalStore,
-    ProviderDecision, ProviderError, ProviderResponse, ResolutionOutcome, ResolveRequest, Scope,
-    StoredGrant, TestProvider, UnavailableProvider, DEFAULT_APPROVAL_TTL_MS,
+    resolve, ApprovalBinding, ApprovalIdGenerator, ApprovalProvider, ApprovalRequest,
+    ApprovalStore, CountingIdGenerator, DenyByDefaultProvider, ErrorProvider, GrantStatus,
+    InMemoryApprovalStore, ProviderDecision, ProviderError, ProviderResponse, ResolutionOutcome,
+    ResolveRequest, Scope, StoredGrant, TestProvider, UnavailableProvider, DEFAULT_APPROVAL_TTL_MS,
 };
 use qk_core::{
     evaluate, parse_policy, Decision, EvaluateOptions, EvaluationRequest, EvaluationResult,
@@ -149,7 +149,7 @@ fn approval_cannot_override_hard_denials() {
             id: qk_approval::ApprovalId::new("qka-live".to_owned()),
             shape: qk_core::sql_fingerprint(sql),
             exact: qk_core::exact_request_digest(qk_sql::SqlDialect::PostgreSql, sql),
-            legacy_shape_only: false,
+            binding: ApprovalBinding::ExactV1,
             scope: qk_approval::ApprovalScope {
                 session_id: Some("session-1".to_owned()),
                 integration: "mcp".to_owned(),

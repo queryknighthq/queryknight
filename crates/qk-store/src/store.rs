@@ -116,10 +116,11 @@ impl Store {
                    operation_summary, created_at, expires_at, decided_at,
                    decision_source, scope, exact_digest, integration,
                    environment, database_name, agent_id, tool, reason_code,
-                   matched_policy, decided_by
+                   matched_policy, decided_by, binding_kind
                  ) VALUES (
                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                   ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+                   ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                   ?22
                  )",
                 params![
                     grant.id.as_str(),
@@ -146,6 +147,7 @@ impl Store {
                     grant.reason_code.as_str(),
                     grant.matched_policy,
                     grant.decided_by.map(|source| source.as_str()),
+                    grant.binding.as_str(),
                 ],
             )
             .map_err(classify_rusqlite)?;
@@ -162,7 +164,8 @@ impl Store {
                 "SELECT id, session_id, fingerprint, status, reason, created_at,
                         expires_at, decided_at, decision_source, scope,
                         exact_digest, integration, environment, database_name,
-                        agent_id, tool, reason_code, matched_policy, decided_by
+                        agent_id, tool, reason_code, matched_policy, decided_by,
+                        binding_kind
                  FROM approvals WHERE id = ?1",
             )
             .map_err(classify_rusqlite)?;
@@ -175,7 +178,8 @@ impl Store {
 
     /// List grants newest-first, flipping lazily-expired rows like the
     /// reference read path (explicit `now_ms`, no clock reads). Invalid
-    /// rows are skipped (never grants).
+    /// rows are skipped (never grants). Includes legacy rows, marked with
+    /// their binding kind, for history and introspection.
     pub fn list_grants(&self, now_ms: u64) -> Result<Vec<StoredGrant>, StoreError> {
         let conn = self.lock()?;
         let mut statement = conn
@@ -183,7 +187,9 @@ impl Store {
                 "SELECT id, session_id, fingerprint, status, reason, created_at,
                         expires_at, decided_at, decision_source, scope,
                         exact_digest, integration, environment, database_name,
-                        agent_id, tool, reason_code, matched_policy, decided_by
+                        agent_id, tool, reason_code, matched_policy, decided_by,
+                        binding_kind,
+                        binding_kind
                  FROM approvals ORDER BY created_at DESC",
             )
             .map_err(classify_rusqlite)?;
@@ -271,10 +277,12 @@ impl Store {
     }
 
     /// Find a live session-scoped grant for session, shape, and scope.
-    /// SQL prefilters on the indexed status/reuse/session/shape columns
-    /// (`reuse` lives in the frozen `scope` column); scope dimensions,
-    /// liveness, and row validity are enforced in Rust. Invalid rows are
-    /// skipped (never grants).
+    /// Only fully-bound (`exact_v1`) rows are candidates: legacy rows can
+    /// never authorize, no matter the session or shape (INV-027). SQL
+    /// prefilters on the indexed status/reuse/session/shape columns plus
+    /// the binding kind (`reuse` lives in the frozen `scope` column);
+    /// scope dimensions, liveness, and row validity are enforced in Rust.
+    /// Invalid rows are skipped (never grants).
     pub fn find_session_grant(
         &self,
         session_id: &str,
@@ -282,16 +290,19 @@ impl Store {
         scope: &qk_approval::ApprovalScope,
         now_ms: u64,
     ) -> Result<Option<StoredGrant>, StoreError> {
+        use qk_approval::ApprovalBinding;
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(
                 "SELECT id, session_id, fingerprint, status, reason, created_at,
                         expires_at, decided_at, decision_source, scope,
                         exact_digest, integration, environment, database_name,
-                        agent_id, tool, reason_code, matched_policy, decided_by
+                        agent_id, tool, reason_code, matched_policy, decided_by,
+                        binding_kind
                  FROM approvals
                  WHERE status = 'approved' AND scope = 'session'
                    AND session_id = ?1 AND fingerprint = ?2
+                   AND binding_kind = 'exact_v1'
                  ORDER BY created_at DESC",
             )
             .map_err(classify_rusqlite)?;
@@ -305,14 +316,51 @@ impl Store {
                 Err(StoreError::InvalidRow(_)) => continue,
                 Err(error) => return Err(error),
             };
+            if grant.binding != ApprovalBinding::ExactV1 {
+                continue;
+            }
             if now_ms >= grant.expires_at_ms {
                 continue;
             }
-            if grant.legacy_shape_only || grant.scope.matches(scope) {
+            if grant.scope.matches(scope) {
                 return Ok(Some(grant));
             }
         }
         Ok(None)
+    }
+
+    /// List legacy (incompletely bound) grants newest-first, for history
+    /// and migration introspection. These rows can never authorize:
+    /// authorization lookups exclude them structurally.
+    pub fn list_legacy_grants(&self) -> Result<Vec<StoredGrant>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT id, session_id, fingerprint, status, reason, created_at,
+                        expires_at, decided_at, decision_source, scope,
+                        exact_digest, integration, environment, database_name,
+                        agent_id, tool, reason_code, matched_policy, decided_by,
+                        binding_kind
+                 FROM approvals WHERE binding_kind = 'legacy_shape'
+                 ORDER BY created_at DESC",
+            )
+            .map_err(classify_rusqlite)?;
+        let rows = statement
+            .query_map([], GrantRow::read)
+            .map_err(classify_rusqlite)?;
+        let mut grants = Vec::new();
+        for row in rows {
+            let row = row.map_err(classify_rusqlite)?;
+            match row.validate() {
+                Ok(grant) => {
+                    debug_assert_eq!(grant.binding, qk_approval::ApprovalBinding::LegacyShape);
+                    grants.push(grant);
+                }
+                Err(StoreError::InvalidRow(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(grants)
     }
 
     /// Flip due waiting rows to expired. Returns the flipped count.
@@ -661,6 +709,7 @@ struct GrantRow {
     reason_code: Option<String>,
     matched_policy: Option<String>,
     decided_by: Option<String>,
+    binding_kind: Option<String>,
 }
 
 impl GrantRow {
@@ -684,13 +733,14 @@ impl GrantRow {
             reason_code: row.get(16)?,
             matched_policy: row.get(17)?,
             decided_by: row.get(18)?,
+            binding_kind: row.get(19).unwrap_or(None),
         })
     }
 
-    /// Validate into a typed grant. Legacy rows (missing exact digest or
-    /// scope dimensions) validate with `legacy_shape_only` set: they keep
-    /// frozen session+shape matching but can never satisfy strict scope
-    /// comparison or exact-token replay.
+    /// Validate into a typed grant. Rows whose binding kind is
+    /// `legacy_shape` — including every migrated row that lacks exact
+    /// identity or scope dimensions — validate as historical state: they
+    /// can never satisfy authorization lookups, only history listings.
     fn validate(self) -> Result<StoredGrant, StoreError> {
         if self.fingerprint.len() != 16 || !self.fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
         {
@@ -760,17 +810,37 @@ impl GrantRow {
                 StoreError::InvalidRow(format!("approval {}: unknown reason {code:?}", self.id))
             })?,
         };
-        let legacy_shape_only = exact.is_none()
-            || self.integration.is_none()
-            || self.environment.is_none()
-            || self.database_name.is_none()
-            || self.agent_id.is_none()
-            || self.tool.is_none();
+        // Explicit binding kind wins. Absent (pre-v3 reads) falls back to
+        // the nullability derivation, which mirrors the migration
+        // classifier: only fully complete rows qualify.
+        let binding = match self.binding_kind.as_deref() {
+            Some("exact_v1") => qk_approval::ApprovalBinding::ExactV1,
+            Some("legacy_shape") => qk_approval::ApprovalBinding::LegacyShape,
+            None => {
+                let complete = exact.is_some()
+                    && self.integration.is_some()
+                    && self.environment.is_some()
+                    && self.database_name.is_some()
+                    && self.agent_id.is_some()
+                    && self.tool.is_some();
+                if complete {
+                    qk_approval::ApprovalBinding::ExactV1
+                } else {
+                    qk_approval::ApprovalBinding::LegacyShape
+                }
+            }
+            Some(other) => {
+                return Err(StoreError::InvalidRow(format!(
+                    "approval {}: unknown binding kind {other:?}",
+                    self.id
+                )));
+            }
+        };
         Ok(StoredGrant {
             id: ApprovalId::new(self.id),
             shape: QueryShapeFingerprint::new(self.fingerprint),
             exact: exact.unwrap_or_else(ExactRequestDigest::unmatchable),
-            legacy_shape_only,
+            binding,
             scope: ApprovalScope {
                 session_id: self.session_id,
                 integration: self.integration.unwrap_or_default(),

@@ -27,7 +27,7 @@ use qk_sql::SqlDialect;
 use crate::id::ApprovalId;
 use crate::provider::{ApprovalProvider, ApprovalRequest, ProviderDecision, ProviderError};
 use crate::scope::{ApprovalScope, Scope};
-use crate::store::{ApprovalStore, GrantStatus, StoredGrant};
+use crate::store::{ApprovalBinding, ApprovalStore, GrantStatus, StoredGrant};
 
 /// Default approval lifetime in milliseconds (mirrors the reference
 /// 60-second default). Explicit per call; never read from the environment.
@@ -180,7 +180,7 @@ pub fn resolve(
                 id: response.id.clone(),
                 shape: shape.clone(),
                 exact,
-                legacy_shape_only: false,
+                binding: ApprovalBinding::ExactV1,
                 scope,
                 status: match response.decision {
                     ProviderDecision::Approved => GrantStatus::Approved,
@@ -277,11 +277,15 @@ fn retry_outcome(
     let Some(grant) = store.get(id) else {
         return Retry::Fresh;
     };
-    // Exact-request binding: any literal (or dialect, or scope) change
-    // alters the digest or scope, so the token cannot be reused for it.
-    // The reference mints a new approval row in this case; we proceed as
-    // a fresh request the same way.
-    if grant.exact != *exact || !grant.scope.matches(scope) {
+    // Exact-request binding: the grant must be fully bound, and any
+    // literal (or dialect, or scope) change alters the digest or scope, so
+    // the token cannot be reused for it. The reference mints a new
+    // approval row in this case; we proceed as a fresh request the same
+    // way.
+    if grant.binding != ApprovalBinding::ExactV1
+        || grant.exact != *exact
+        || !grant.scope.matches(scope)
+    {
         return Retry::Fresh;
     }
     if request.now_ms >= grant.expires_at_ms {

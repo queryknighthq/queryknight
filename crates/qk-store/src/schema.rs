@@ -4,10 +4,16 @@
 //!   no version tracking — the reference never sets `user_version`, so
 //!   legacy databases read as 0).
 //! - Version 2 adds QueryKnight-Rust columns and lookup indexes.
-//! - Fresh databases are created at version 2 in one transaction.
-//! - Legacy databases (version 0 *with* tables) migrate 0 -> 2 directly.
-//! - Version 0 *without* tables means a fresh file: create at version 2.
+//! - Version 3 adds the explicit `approvals.binding_kind` column
+//!   (`legacy_shape` vs `exact_v1`) and promotes complete rows.
+//! - Fresh databases are created at the current version in one transaction.
+//! - Legacy databases (version 0 *with* tables) migrate directly to
+//!   current; version 0 *without* tables means a fresh file.
 //! - Anything above [`SCHEMA_VERSION`] is refused (`SchemaMismatch`).
+//!
+//! `session_allows` rows are never converted into grants: without scope
+//! dimensions they cannot become active (INV-027). The table is preserved
+//! untouched for history.
 //!
 //! Every step is idempotent in effect: `CREATE TABLE IF NOT EXISTS`,
 //! column-exists checks before `ADD COLUMN`, `CREATE INDEX IF NOT
@@ -15,7 +21,7 @@
 //! never leave a half-applied schema behind the version stamp.
 
 /// Current schema version written by this crate.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Version 1 DDL: the TypeScript daemon schema, byte-for-byte in spirit
 /// (whitespace normalized). Includes the historically-added columns
@@ -85,6 +91,12 @@ CREATE TABLE IF NOT EXISTS session_allows (
   PRIMARY KEY (session_id, fingerprint)
 );
 ";
+
+/// Version 3 addition: explicit binding completeness. `legacy_shape`
+/// marks migrated rows that lack exact identity or scope dimensions
+/// (history only, never authorization-capable); `exact_v1` marks fully
+/// bound modern rows. Any other value is corrupt on read.
+const APPROVAL_V3_COLUMNS: &[(&str, &str)] = &[("binding_kind", "TEXT")];
 
 /// Version 2 additions. Each is `None`-able so legacy rows stay readable;
 /// absence carries authorization meaning (see `store.rs` reader).
@@ -188,8 +200,9 @@ pub(crate) fn migrate(conn: &mut rusqlite::Connection) -> Result<(), crate::Stor
             }
         }
     }
-    // Version 2 additions, same tolerant pattern.
-    let present = table_columns(&transaction, "approvals")
+    // Version 2 additions, same tolerant pattern. The set is tracked so
+    // version 3 can build on columns that may have just been created.
+    let mut present = table_columns(&transaction, "approvals")
         .map_err(|e| StoreError::Migration(e.to_string()))?;
     for (column, column_type) in APPROVAL_V2_COLUMNS {
         if !present.contains(*column) {
@@ -198,6 +211,7 @@ pub(crate) fn migrate(conn: &mut rusqlite::Connection) -> Result<(), crate::Stor
                     "ALTER TABLE approvals ADD COLUMN {column} {column_type}"
                 ))
                 .map_err(|e| StoreError::Migration(e.to_string()))?;
+            present.insert((*column).to_owned());
         }
     }
     for (_, ddl) in INDEXES {
@@ -205,46 +219,38 @@ pub(crate) fn migrate(conn: &mut rusqlite::Connection) -> Result<(), crate::Stor
             .execute_batch(ddl)
             .map_err(|e| StoreError::Migration(e.to_string()))?;
     }
-    migrate_orphan_session_grants(&transaction)?;
+    // Version 3: explicit binding completeness. New column defaults every
+    // existing row to `legacy_shape`; rows that are actually complete
+    // (exact digest plus all six scope dimensions) are promoted to
+    // `exact_v1` so fully-bound Rust rows never need reapproval.
+    // `session_allows` rows are deliberately NOT converted into grants:
+    // without scope dimensions they cannot become active (INV-027). The
+    // table itself is preserved untouched for history.
+    for (column, column_type) in APPROVAL_V3_COLUMNS {
+        if !present.contains(*column) {
+            transaction
+                .execute_batch(&format!(
+                    "ALTER TABLE approvals ADD COLUMN {column} {column_type} NOT NULL DEFAULT 'legacy_shape'"
+                ))
+                .map_err(|e| StoreError::Migration(e.to_string()))?;
+        }
+    }
+    transaction
+        .execute_batch(
+            "UPDATE approvals SET binding_kind = 'exact_v1'
+             WHERE exact_digest IS NOT NULL
+               AND integration IS NOT NULL
+               AND environment IS NOT NULL
+               AND database_name IS NOT NULL
+               AND agent_id IS NOT NULL
+               AND tool IS NOT NULL",
+        )
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
     transaction
         .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
         .map_err(|e| StoreError::Migration(e.to_string()))?;
     transaction
         .commit()
-        .map_err(|e| StoreError::Migration(e.to_string()))?;
-    Ok(())
-}
-
-/// Adopt orphaned legacy session grants: `session_allows` rows with no
-/// matching approved session approval row become synthetic approved
-/// session grants (frozen session-shape semantics preserved). Deterministic
-/// ids make the step idempotent; rows that already resolve are skipped.
-/// New columns stay NULL, so synthetics validate as `legacy_shape_only`
-/// (shape matching only, never exact-token replay). `expires_at` uses
-/// `i64::MAX`: the reference never expires these rows.
-fn migrate_orphan_session_grants(
-    transaction: &rusqlite::Transaction<'_>,
-) -> Result<(), crate::StoreError> {
-    use crate::StoreError;
-    transaction
-        .execute_batch(
-            "INSERT INTO approvals (
-               id, session_id, fingerprint, status, reason, risk,
-               operation_summary, created_at, expires_at, scope
-             )
-             SELECT 'qkam-' || session_id || '-' || fingerprint,
-                    session_id, fingerprint, 'approved',
-                    'migrated session grant', '', '', 0, 9223372036854775807, 'session'
-             FROM session_allows
-             WHERE length(fingerprint) = 16
-               AND NOT EXISTS (
-                 SELECT 1 FROM approvals AS existing
-                 WHERE existing.session_id = session_allows.session_id
-                   AND existing.fingerprint = session_allows.fingerprint
-                   AND existing.status = 'approved'
-                   AND existing.scope = 'session'
-               )",
-        )
         .map_err(|e| StoreError::Migration(e.to_string()))?;
     Ok(())
 }

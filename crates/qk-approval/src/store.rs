@@ -23,6 +23,30 @@ pub enum GrantStatus {
     Denied,
 }
 
+/// Binding completeness of a stored grant. Legacy and incomplete rows are
+/// historical state only: the type system separates them from fully-bound
+/// grants so no lookup path can accidentally treat one as the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalBinding {
+    /// Complete modern binding: exact digest plus all scope dimensions.
+    /// The only kind eligible for authorization.
+    ExactV1,
+    /// Migrated legacy state (or otherwise incomplete binding): visible
+    /// for history and introspection, never authorization-capable.
+    LegacyShape,
+}
+
+impl ApprovalBinding {
+    /// Frozen storage rendering.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ExactV1 => "exact_v1",
+            Self::LegacyShape => "legacy_shape",
+        }
+    }
+}
+
 /// One stored approval row.
 ///
 /// Every grant carries both identities: `exact` binds approval-id retries
@@ -38,10 +62,8 @@ pub struct StoredGrant {
     pub shape: QueryShapeFingerprint,
     /// Exact request identity (approval-token binding).
     pub exact: ExactRequestDigest,
-    /// True for pre-Rust rows lacking exact identity or scope dimensions.
-    /// Such rows keep frozen session+shape matching but never satisfy
-    /// strict scope comparison or exact-token replay.
-    pub legacy_shape_only: bool,
+    /// Binding completeness; only `ExactV1` can authorize.
+    pub binding: ApprovalBinding,
     /// Scope the grant binds to.
     pub scope: ApprovalScope,
     /// Current state.
@@ -173,11 +195,12 @@ impl ApprovalStore for InMemoryApprovalStore {
         now_ms: u64,
     ) -> Option<&StoredGrant> {
         self.grants.values().find(|grant| {
-            grant.status == GrantStatus::Approved
+            grant.binding == ApprovalBinding::ExactV1
+                && grant.status == GrantStatus::Approved
                 && grant.reuse == Scope::Session
                 && grant.shape == *shape
                 && grant.scope.session_id.as_deref() == Some(session_id)
-                && (grant.legacy_shape_only || grant.scope.matches(scope))
+                && grant.scope.matches(scope)
                 && Self::live(grant, now_ms)
         })
     }
@@ -185,7 +208,10 @@ impl ApprovalStore for InMemoryApprovalStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApprovalStore, DecideError, GrantStatus, InMemoryApprovalStore, StoredGrant};
+    use super::{
+        ApprovalBinding, ApprovalStore, DecideError, GrantStatus, InMemoryApprovalStore,
+        StoredGrant,
+    };
     use crate::id::ApprovalId;
     use crate::scope::{ApprovalScope, DecisionSource, Scope};
     use qk_core::{exact_request_digest, sql_fingerprint, ReasonCode};
@@ -215,7 +241,7 @@ mod tests {
             id: ApprovalId::new("qka-1".to_owned()),
             shape: sql_fingerprint("SELECT 1"),
             exact: exact_request_digest(SqlDialect::PostgreSql, "SELECT 1"),
-            legacy_shape_only: false,
+            binding: ApprovalBinding::ExactV1,
             scope: scope(),
             status: GrantStatus::Waiting,
             reuse: Scope::Once,

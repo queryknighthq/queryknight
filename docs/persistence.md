@@ -50,22 +50,63 @@ driven by actual lookups, nothing speculative):
 One transaction: v1 DDL (`IF NOT EXISTS`), tolerant column repair via
 `PRAGMA table_info` (mirrors the reference checks, and also backfills the
 historically added `schema_ddl`, `schema_diff`, `sql` columns), v2
-columns, indexes, orphan session-grant adoption, then the version stamp.
-A crash can never leave a half-applied schema behind the stamp, and
-re-running is a no-op. No `DROP TABLE`, no rebuilds, no data deletion.
+columns, indexes, v3 `binding_kind` column plus completeness promotion,
+then the version stamp. A crash can never leave a half-applied schema
+behind the stamp, and re-running is a no-op. No `DROP TABLE`, no rebuilds,
+no data deletion. Converges: fresh files, TS `user_version` 0 (with or
+without tables), and Rust v2 databases all end at version 3.
+
+## Legacy field matrix (what can and cannot be reconstructed)
+
+Per legacy row type, as the reference leaves it:
+
+| Field | Legacy `approvals` row | Legacy `session_allows` row |
+|---|---|---|
+| shape fingerprint | present (16-hex) | present (16-hex) |
+| exact request digest | **absent** — underivable from a 64-bit shape | **absent** |
+| session_id | present or NULL | present (PK part) |
+| integration | **absent** | **absent** |
+| environment | **absent** | **absent** |
+| database | **absent** | **absent** |
+| agent_id | **absent** | **absent** |
+| tool | **absent** | **absent** |
+| expiry | present (`expires_at`) | **absent** (upstream rows never expire) |
+| decision source | present or NULL | **absent** (a session approval existed) |
+
+Nothing is inferred: no defaults, no wildcards, no current-context
+fill-in. No legacy row is fully reconstructable, so **all** migrated
+grants require reapproval for active use. (The v2->v3 promotion of
+actually-complete rows exists only for databases already written by Rust
+versions, never for TypeScript rows.)
 
 Legacy approval migration:
 
-- Rows without `exact_digest` (or without any scope dimension) validate
-  with `legacy_shape_only`: they keep frozen session+shape matching but
-  can never satisfy strict scope comparison or exact-token replay (a
-  synthesized digest can never equal a real request digest).
-- Orphaned `session_allows` rows (no matching approved session approval)
-  are adopted as synthetic approved session grants with deterministic
-  `qkam-<session>-<fingerprint>` ids (idempotent by existence check,
-  unbounded expiry like the reference rows they mirror).
-- `session_id` is required for session matching; scope dimensions compare
-  exactly otherwise.
+- Rows are preserved verbatim and marked `binding_kind = 'legacy_shape'`
+  (the default for every pre-existing row; complete rows are promoted to
+  `exact_v1` by column-presence check).
+- Legacy rows validate for history (`get_grant`, `list_grants`,
+  `list_legacy_grants`) but can never satisfy authorization lookups:
+  `find_session_grant` filters `binding_kind = 'exact_v1'` in SQL and
+  re-checks in Rust; exact-token retry additionally requires digest
+  equality against a real request digest.
+- `session_allows` rows are never converted into grants (that would
+  require inventing the missing scope dimensions). The table is preserved
+  untouched for history; orphan rows authorize nothing.
+- `decide_grant` still records human decisions on legacy waiting rows
+  (mechanics work), but deciding does not upgrade binding: the row stays
+  `legacy_shape` and authorizes nothing until a new fully-bound approval
+  exists.
+
+## Intentional divergence from the TypeScript runtime
+
+Old QueryKnight: session + shape could authorize (session-allow rows, and
+approval retry on fingerprint match).
+
+Rust QueryKnight after migration: legacy session + shape grants remain
+visible as history but require reapproval, because the old database lacks
+the identity dimensions of the new security model. This is a deliberate
+fail-closed hardening (INV-027), not exact persistence parity: migration
+is non-destructive, but ambiguous authorization is disabled.
 
 ## Shape vs exact identity persistence
 

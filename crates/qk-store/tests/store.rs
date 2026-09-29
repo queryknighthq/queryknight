@@ -44,7 +44,7 @@ fn grant(id: &str) -> StoredGrant {
             SqlDialect::PostgreSql,
             "DELETE FROM customers WHERE id = 42",
         ),
-        legacy_shape_only: false,
+        binding: qk_approval::ApprovalBinding::ExactV1,
         scope: scope(),
         status: GrantStatus::Waiting,
         reuse: Scope::Once,
@@ -93,7 +93,7 @@ fn event(id: &str, session_id: &str, started_at_ms: u64) -> SessionEvent {
 /// Legacy TypeScript database as the reference leaves it: modern TS
 /// schema (with historically added columns), version stamp untouched (0),
 /// and no v2 columns. Built with raw SQL, exactly like `bun:sqlite` would.
-fn legacy_ts_db(path: &PathBuf, partial: bool) {
+fn legacy_ts_db(path: &std::path::Path, partial: bool) {
     let conn = rusqlite::Connection::open(path).expect("legacy open");
     let schema_ddl = if partial { "" } else { ",\n  schema_ddl TEXT" };
     conn.execute_batch(&format!(
@@ -223,12 +223,23 @@ fn migrate_legacy_ts_schema() {
     // Legacy waiting row reads with the legacy flag (no exact, no dims).
     let waiting = store.get_grant("qka_legacy1").expect("get").expect("row");
     assert_eq!(waiting.status, GrantStatus::Waiting);
-    assert!(waiting.legacy_shape_only);
+    assert_eq!(waiting.binding, qk_approval::ApprovalBinding::LegacyShape);
     assert_eq!(waiting.matched_policy, None);
-    // Legacy session row keeps frozen shape semantics.
+    // Legacy session row reads as historical state, not an active grant.
     let session = store.get_grant("qka_legacy2").expect("get").expect("row");
     assert_eq!(session.status, GrantStatus::Approved);
     assert_eq!(session.reuse, Scope::Session);
+    assert_eq!(session.binding, qk_approval::ApprovalBinding::LegacyShape);
+    // ... and therefore authorizes nothing, even with a fully matching
+    // request shape: reapproval is required (INV-027).
+    let shape = qk_core::QueryShapeFingerprint::new("0d2e6c16b5960f15".to_owned());
+    assert!(
+        store
+            .find_session_grant("session-1", &shape, &scope(), NOW)
+            .expect("lookup")
+            .is_none(),
+        "legacy session row must not authorize"
+    );
     // Expired legacy row reads (liveness gates it out of matching).
     let expired = store.get_grant("qka_legacy3").expect("get").expect("row");
     assert_eq!(expired.status, GrantStatus::Waiting);
@@ -243,12 +254,21 @@ fn migrate_legacy_ts_schema() {
         .expect("events");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].id, "qke_legacy");
-    // Orphan session grant was adopted as a synthetic approved session row
-    // carrying the legacy fingerprint verbatim.
+    // No synthetic grants are minted: the session_allows table is
+    // preserved untouched for history.
     let grants = store.list_grants(NOW).expect("list");
-    let adopted = grants.iter().find(|g| g.id.as_str().starts_with("qkam-"));
-    assert!(adopted.is_some(), "orphan must be adopted");
-    assert_eq!(adopted.expect("grant").shape.as_str(), "aaaaaaaaaaaaaaaa");
+    assert!(
+        grants.iter().all(|g| !g.id.as_str().starts_with("qkam-")),
+        "no synthetic grants may exist"
+    );
+    let legacy = store.list_legacy_grants().expect("legacy list");
+    assert!(legacy.len() >= 3, "legacy rows stay visible as history");
+    assert!(
+        legacy
+            .iter()
+            .all(|g| g.binding == qk_approval::ApprovalBinding::LegacyShape),
+        "history rows are all marked legacy"
+    );
 }
 
 fn legacy_scope() -> qk_approval::ApprovalScope {
@@ -263,32 +283,206 @@ fn legacy_scope() -> qk_approval::ApprovalScope {
 }
 
 #[test]
-fn orphan_session_grant_adopted() {
+fn orphan_session_grant_quarantined() {
     let path = temp_path("orphan");
     legacy_ts_db(&path, false);
     let store = Store::open(&path).expect("open");
-    // The orphan (session s-orphan, stored shape aaaa...) resolves by
-    // shape even with empty scope dimensions: legacy rows skip dim
-    // comparison.
+    // The orphan (session s-orphan, stored shape aaaa...) is preserved in
+    // `session_allows` but authorizes nothing: no synthetic grant exists,
+    // and the authorization lookup excludes it structurally.
     let shape = qk_core::QueryShapeFingerprint::new("aaaaaaaaaaaaaaaa".to_owned());
-    let found = store
-        .find_session_grant("s-orphan", &shape, &legacy_scope(), NOW)
-        .expect("lookup");
-    assert!(found.is_some(), "orphan must be adopted as session grant");
-    let found = found.expect("grant");
-    assert_eq!(found.status, GrantStatus::Approved);
-    assert!(found.legacy_shape_only);
-    // Idempotent: reopening does not duplicate the synthetic row.
-    drop(store);
-    let store = Store::open(&path).expect("reopen");
+    assert!(
+        store
+            .find_session_grant("s-orphan", &shape, &legacy_scope(), NOW)
+            .expect("lookup")
+            .is_none(),
+        "orphan must not authorize"
+    );
     let grants = store.list_grants(NOW).expect("list");
+    assert!(
+        grants.iter().all(|g| !g.id.as_str().starts_with("qkam-")),
+        "no synthetic grants may exist"
+    );
+    let allows: i64 = rusqlite::Connection::open(&path)
+        .expect("raw")
+        .query_row(
+            "SELECT COUNT(*) FROM session_allows WHERE session_id = 's-orphan'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(allows, 1, "orphan row preserved for history");
+    // Reopening changes nothing (idempotent, nothing to duplicate).
+    drop(store);
+    let reopened = Store::open(&path).expect("reopen");
+    assert!(reopened
+        .find_session_grant("s-orphan", &shape, &legacy_scope(), NOW)
+        .expect("lookup")
+        .is_none());
+}
+
+/// A version-2 Rust database: TS schema plus v2 columns, stamped version
+/// 2, holding one complete modern grant. Simulates upgrading a deployed
+/// v2 database (which never shipped publicly, but the path must hold).
+fn v2_db(path: &std::path::Path) {
+    legacy_ts_db(path, false);
+    let conn = rusqlite::Connection::open(path).expect("raw open");
+    conn.execute_batch(
+        "ALTER TABLE approvals ADD COLUMN exact_digest BLOB;
+         ALTER TABLE approvals ADD COLUMN integration TEXT;
+         ALTER TABLE approvals ADD COLUMN environment TEXT;
+         ALTER TABLE approvals ADD COLUMN database_name TEXT;
+         ALTER TABLE approvals ADD COLUMN agent_id TEXT;
+         ALTER TABLE approvals ADD COLUMN tool TEXT;
+         ALTER TABLE approvals ADD COLUMN reason_code TEXT;
+         ALTER TABLE approvals ADD COLUMN matched_policy TEXT;
+         ALTER TABLE approvals ADD COLUMN decided_by TEXT;
+         PRAGMA user_version = 2;",
+    )
+    .expect("v2 columns");
+    let digest = qk_core::exact_request_digest(
+        qk_sql::SqlDialect::PostgreSql,
+        "DELETE FROM customers WHERE id = 42",
+    );
+    conn.execute(
+        "INSERT INTO approvals (id, session_id, fingerprint, status, reason, risk,
+           operation_summary, created_at, expires_at, decided_at, decision_source, scope,
+           exact_digest, integration, environment, database_name, agent_id, tool,
+           reason_code, matched_policy)
+         VALUES ('qka_modern', 'session-1', '0d2e6c16b5960f15', 'approved',
+           'matched approval rule', 'high', 'delete customers', 1000, 9999999999999,
+           2000, 'cli', 'session', ?1, 'mcp', 'production', 'main', 'agent-1', 'db_query',
+           'REQUIRE_APPROVAL', 'production.main.approval_required[0]')",
+        rusqlite::params![&digest.as_bytes()[..]],
+    )
+    .expect("modern row");
+}
+
+#[test]
+fn v2_complete_row_promoted_not_reapproved() {
+    // A fully-bound v2 row converges to exact_v1 and keeps authorizing:
+    // only genuinely incomplete rows require reapproval.
+    let path = temp_path("v2upgrade");
+    v2_db(&path);
+    let store = Store::open(&path).expect("open");
     assert_eq!(
-        grants
-            .iter()
-            .filter(|g| g.id.as_str().starts_with("qkam-"))
-            .count(),
+        store.schema_version().expect("version"),
+        qk_store::SCHEMA_VERSION
+    );
+    let grant = store.get_grant("qka_modern").expect("get").expect("row");
+    assert_eq!(grant.binding, qk_approval::ApprovalBinding::ExactV1);
+    let shape = qk_core::QueryShapeFingerprint::new("0d2e6c16b5960f15".to_owned());
+    let found = store
+        .find_session_grant("session-1", &shape, &scope(), NOW)
+        .expect("lookup");
+    assert!(found.is_some(), "complete migrated row must authorize");
+}
+
+#[test]
+fn unknown_binding_kind_is_invalid_row() {
+    let path = temp_path("badkind");
+    legacy_ts_db(&path, false);
+    let store = Store::open(&path).expect("open");
+    rusqlite::Connection::open(&path)
+        .expect("raw")
+        .execute(
+            "UPDATE approvals SET binding_kind = 'future_kind' WHERE id = 'qka_legacy1'",
+            [],
+        )
+        .expect("corrupt kind");
+    assert!(matches!(
+        store.get_grant("qka_legacy1"),
+        Err(StoreError::InvalidRow(_))
+    ));
+}
+
+#[test]
+fn decide_legacy_row_then_still_quarantined() {
+    // Reapproval mechanics work on legacy rows (decide records the human
+    // decision), but the row keeps its legacy binding: it authorizes
+    // nothing until a NEW fully-bound approval exists.
+    let path = temp_path("legacydecide");
+    legacy_ts_db(&path, false);
+    let store = Store::open(&path).expect("open");
+    store
+        .decide_grant(
+            "qka_legacy1",
+            GrantStatus::Approved,
+            Scope::Once,
+            qk_approval::DecisionSource::Cli,
+            NOW,
+        )
+        .expect("decide records");
+    let back = store.get_grant("qka_legacy1").expect("get").expect("row");
+    assert_eq!(back.status, GrantStatus::Approved);
+    assert_eq!(
+        back.binding,
+        qk_approval::ApprovalBinding::LegacyShape,
+        "deciding must not upgrade binding"
+    );
+}
+
+#[test]
+fn canonical_upgrade_fixture() {
+    // Realistic TypeScript database: approvals in every state, session
+    // grants (covered and orphaned), history, sessions, connections.
+    // After migration: history intact, legacy rows visible but inert, and
+    // new Rust approvals work normally end to end.
+    let path = temp_path("upgrade");
+    legacy_ts_db(&path, false);
+    {
+        let conn = rusqlite::Connection::open(&path).expect("raw");
+        conn.execute(
+            "INSERT INTO connections (id, name, engine, environment, source, database, host_label)
+             VALUES ('qkc_test', 'test', 'postgres', 'production', 'manual', 'main', 'localhost')",
+            [],
+        )
+        .expect("connection");
+    }
+    let store = Store::open(&path).expect("migrate");
+    // History preserved.
+    assert!(store.get_session("qks_legacy").expect("get").is_some());
+    assert_eq!(
+        store
+            .list_session_events("qks_legacy", 100)
+            .expect("events")
+            .len(),
         1
     );
+    assert!(store.get_connection("qkc_test").expect("get").is_some());
+    // Legacy rows visible as history...
+    let legacy = store.list_legacy_grants().expect("legacy list");
+    assert!(
+        legacy.len() >= 3,
+        "legacy rows preserved, got {}",
+        legacy.len()
+    );
+    // ...but none authorize anything.
+    let shape = qk_core::QueryShapeFingerprint::new("0d2e6c16b5960f15".to_owned());
+    assert!(
+        store
+            .find_session_grant("session-1", &shape, &scope(), NOW)
+            .expect("lookup")
+            .is_none(),
+        "no legacy row may authorize"
+    );
+    // New Rust approvals work normally: insert, decide session, resolve.
+    let mut new = grant("qka-new");
+    new.scope.session_id = Some("session-1".to_owned());
+    store.insert_grant(&new, NOW).expect("insert");
+    store
+        .decide_grant(
+            "qka-new",
+            GrantStatus::Approved,
+            Scope::Session,
+            qk_approval::DecisionSource::Cli,
+            NOW,
+        )
+        .expect("decide");
+    let found = store
+        .find_session_grant("session-1", &new.shape, &scope(), NOW)
+        .expect("lookup");
+    assert_eq!(found.expect("grant").id.as_str(), "qka-new");
 }
 
 #[test]
@@ -363,7 +557,7 @@ fn grant_round_trip_all_fields() {
     store.insert_grant(&full, NOW).expect("insert");
     let back = store.get_grant("qka-full").expect("get").expect("row");
     assert_eq!(back, full);
-    assert!(!back.legacy_shape_only);
+    assert_eq!(back.binding, qk_approval::ApprovalBinding::ExactV1);
 }
 
 #[test]

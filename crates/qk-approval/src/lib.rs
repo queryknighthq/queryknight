@@ -36,4 +36,6 @@ pub use resolve::{
     resolve, ResolutionOutcome, ResolveRequest, ResolvedEvaluation, DEFAULT_APPROVAL_TTL_MS,
 };
 pub use scope::{ApprovalScope, DecisionSource, Scope};
-pub use store::{ApprovalStore, DecideError, GrantStatus, InMemoryApprovalStore, StoredGrant};
+pub use store::{
+    ApprovalBinding, ApprovalStore, DecideError, GrantStatus, InMemoryApprovalStore, StoredGrant,
+};
