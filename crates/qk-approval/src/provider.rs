@@ -2,9 +2,10 @@
 //! design — the providers needed here are in-process; daemon HTTP transport
 //! adapts at its own layer later without touching this trait.
 
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use qk_core::ReasonCode;
 
@@ -78,8 +79,9 @@ impl Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 /// Human-decision source consulted after `RequireApproval`. Synchronous:
-/// in-process providers only.
-pub trait ApprovalProvider {
+/// in-process providers only. `Send + Sync` so daemons can share providers
+/// across requests like stores.
+pub trait ApprovalProvider: Send + Sync {
     /// Ask for a decision. Called at most once per resolution, and never
     /// for evaluations that already allowed or denied.
     fn request(&self, request: &ApprovalRequest) -> Result<ProviderResponse, ProviderError>;
@@ -96,7 +98,7 @@ pub trait ApprovalIdGenerator {
 /// single-process use; the daemon port supplies a random generator.
 pub struct CountingIdGenerator {
     prefix: String,
-    next: Cell<usize>,
+    next: AtomicUsize,
 }
 
 impl CountingIdGenerator {
@@ -104,15 +106,14 @@ impl CountingIdGenerator {
     pub fn new(prefix: &str) -> Self {
         Self {
             prefix: prefix.to_owned(),
-            next: Cell::new(1),
+            next: AtomicUsize::new(1),
         }
     }
 }
 
 impl ApprovalIdGenerator for CountingIdGenerator {
     fn generate(&self) -> String {
-        let n = self.next.get();
-        self.next.set(n + 1);
+        let n = self.next.fetch_add(1, Ordering::SeqCst);
         format!("{}-{n}", self.prefix)
     }
 }
@@ -164,42 +165,53 @@ impl ApprovalProvider for ErrorProvider {
 /// verdicts come from a queue, ids from the generator. Records requests
 /// for assertions (e.g. proving non-approval results never contact it).
 pub struct TestProvider {
-    queue: std::cell::RefCell<VecDeque<ProviderDecision>>,
+    queue: Mutex<VecDeque<ProviderDecision>>,
     ids: CountingIdGenerator,
-    seen: std::cell::RefCell<Vec<ApprovalRequest>>,
-    calls: Cell<usize>,
+    seen: Mutex<Vec<ApprovalRequest>>,
+    calls: AtomicUsize,
 }
 
 impl TestProvider {
     /// Provider replaying `queue` in order; exhausted queue yields Waiting.
-    pub fn new(queue: Vec<ProviderDecision>) -> Self {
+    /// Ids are `{prefix}-{n}`; use distinct prefixes when several
+    /// providers share one store, mirroring random production ids.
+    pub fn with_prefix(prefix: &str, queue: Vec<ProviderDecision>) -> Self {
         Self {
-            queue: std::cell::RefCell::new(queue.into()),
-            ids: CountingIdGenerator::new("test"),
-            seen: std::cell::RefCell::new(Vec::new()),
-            calls: Cell::new(0),
+            queue: Mutex::new(queue.into()),
+            ids: CountingIdGenerator::new(prefix),
+            seen: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
         }
+    }
+
+    /// Provider replaying `queue` in order; exhausted queue yields Waiting.
+    pub fn new(queue: Vec<ProviderDecision>) -> Self {
+        Self::with_prefix("test", queue)
     }
 
     /// How many times `request` ran.
     #[must_use]
     pub fn calls(&self) -> usize {
-        self.calls.get()
+        self.calls.load(Ordering::SeqCst)
     }
 
     /// Requests received, in order.
     pub fn seen(&self) -> Vec<ApprovalRequest> {
-        self.seen.borrow().clone()
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
 impl ApprovalProvider for TestProvider {
     fn request(&self, request: &ApprovalRequest) -> Result<ProviderResponse, ProviderError> {
-        self.calls.set(self.calls.get() + 1);
-        self.seen.borrow_mut().push(request.clone());
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(request.clone());
         let decision = self
             .queue
-            .borrow_mut()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .pop_front()
             .unwrap_or(ProviderDecision::Waiting);
         Ok(ProviderResponse {

@@ -20,14 +20,14 @@
 
 use qk_core::{
     exact_request_digest, sql_fingerprint, Decision, EvaluationResult, ExactRequestDigest,
-    ExecutionContext, ReasonCode,
+    ExecutionContext, QueryShapeFingerprint, ReasonCode,
 };
 use qk_sql::SqlDialect;
 
 use crate::id::ApprovalId;
 use crate::provider::{ApprovalProvider, ApprovalRequest, ProviderDecision, ProviderError};
 use crate::scope::{ApprovalScope, Scope};
-use crate::store::{ApprovalBinding, ApprovalStore, GrantStatus, StoredGrant};
+use crate::store::{ApprovalBinding, ApprovalStore, ApprovalStoreError, GrantStatus, StoredGrant};
 
 /// Default approval lifetime in milliseconds (mirrors the reference
 /// 60-second default). Explicit per call; never read from the environment.
@@ -99,10 +99,11 @@ pub struct ResolvedEvaluation {
 
 /// Resolve an evaluation into a final result. Synchronous and side-effect
 /// free except for explicit `store` writes (grant rows); deterministic
-/// given its inputs.
+/// given its inputs. One implementation serves every `ApprovalStore`
+/// backend; store failures fail closed (never `Allow`).
 pub fn resolve(
     request: &ResolveRequest<'_>,
-    store: &mut dyn ApprovalStore,
+    store: &dyn ApprovalStore,
     provider: Option<&dyn ApprovalProvider>,
 ) -> ResolvedEvaluation {
     let evaluation = request.evaluation;
@@ -130,11 +131,14 @@ pub fn resolve(
     // Literal changes alter the digest, so the same token cannot authorize
     // them. Unknown, mismatched, or waiting ids fall through (waiting stays
     // pending on the same id; anything else proceeds as a fresh request).
+    // Store failures here fail closed; unknown or corrupt ids behave as
+    // fresh (provider re-ask, never a grant).
     if let Some(id) = request.approval_id {
         match retry_outcome(request, store, id, &exact, &scope) {
             Retry::Settled(resolved) => return resolved,
             Retry::Pending(resolved) => return resolved,
             Retry::Fresh => {}
+            Retry::StoreFailed(resolved) => return resolved,
         }
     }
 
@@ -142,13 +146,18 @@ pub fn resolve(
     // scope authorizes without contacting the provider. Shape matching is
     // explicitly broader than token matching (literal variants share a
     // session grant by frozen design); scope dimensions still bind fully.
+    // Store failures fail closed.
     if let Some(session_id) = &request.context.session_id {
-        // Clone the id out first: `store` is borrowed mutably below.
-        let session_grant = store
-            .find_session_grant(session_id, &shape, &scope, request.now_ms)
-            .map(|grant| grant.id.clone());
-        if let Some(id) = session_grant {
-            return granted(request, &id);
+        match store.find_session_grant(session_id, &shape, &scope, request.now_ms) {
+            Ok(Some(grant)) => {
+                if let Some(resolved) = verify_session_grant(request, &grant, &scope, &shape) {
+                    return resolved;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return store_failure(request, "session lookup failed");
+            }
         }
     }
 
@@ -195,7 +204,12 @@ pub fn resolve(
                 decided_at_ms: None,
                 decided_by: None,
             };
-            store.insert(stored);
+            // A verdict the store cannot durably record must not become an
+            // executable or pending result: without durable state, retries
+            // and audits cannot observe it. Fail closed instead.
+            if store.insert_grant(stored).is_err() {
+                return store_failure(request, "grant persistence failed");
+            }
             match response.decision {
                 ProviderDecision::Approved => ResolvedEvaluation {
                     decision: Decision::Allow,
@@ -264,6 +278,20 @@ enum Retry {
     Settled(ResolvedEvaluation),
     Pending(ResolvedEvaluation),
     Fresh,
+    StoreFailed(ResolvedEvaluation),
+}
+
+/// Fail-closed mapping for store failures during resolution. The machine
+/// value stays `APPROVAL_ERROR`; the human message carries bounded detail.
+fn store_failure(request: &ResolveRequest<'_>, detail: &str) -> ResolvedEvaluation {
+    ResolvedEvaluation {
+        decision: Decision::Deny,
+        reason_code: ReasonCode::ApprovalError,
+        message: format!("approval store failed closed: {detail}"),
+        matched_policy: request.evaluation.matched_policy.clone(),
+        approval_id: None,
+        outcome: ResolutionOutcome::ProviderError,
+    }
 }
 
 fn retry_outcome(
@@ -274,8 +302,14 @@ fn retry_outcome(
     scope: &ApprovalScope,
 ) -> Retry {
     let evaluation = request.evaluation;
-    let Some(grant) = store.get(id) else {
-        return Retry::Fresh;
+    let grant = match store.get_grant(&ApprovalId::new(id.to_owned())) {
+        Ok(Some(grant)) => grant,
+        // Unknown ids behave as fresh (provider re-ask, never a grant).
+        // Corrupt rows behave as unknown: they can never match, and
+        // blocking new approvals on one bad row would be a wider denial.
+        Ok(None) => return Retry::Fresh,
+        Err(ApprovalStoreError::CorruptState(_)) => return Retry::Fresh,
+        Err(_) => return Retry::StoreFailed(store_failure(request, "grant lookup failed")),
     };
     // Exact-request binding: the grant must be fully bound, and any
     // literal (or dialect, or scope) change alters the digest or scope, so
@@ -319,6 +353,28 @@ fn retry_outcome(
             outcome: ResolutionOutcome::ProviderWaiting,
         }),
     }
+}
+
+/// Re-verify a store-returned session candidate before authorizing: the
+/// store narrows, but authorization semantics stay here. Defense in depth
+/// against a persistence implementation that filters loosely.
+fn verify_session_grant(
+    request: &ResolveRequest<'_>,
+    grant: &StoredGrant,
+    scope: &ApprovalScope,
+    shape: &QueryShapeFingerprint,
+) -> Option<ResolvedEvaluation> {
+    if grant.binding != ApprovalBinding::ExactV1
+        || grant.status != GrantStatus::Approved
+        || grant.reuse != Scope::Session
+        || grant.shape != *shape
+        || grant.scope.session_id.as_deref() != request.context.session_id.as_deref()
+        || !grant.scope.matches(scope)
+        || request.now_ms >= grant.expires_at_ms
+    {
+        return None;
+    }
+    Some(granted(request, &grant.id))
 }
 
 fn granted(request: &ResolveRequest<'_>, id: &ApprovalId) -> ResolvedEvaluation {

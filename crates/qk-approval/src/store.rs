@@ -85,67 +85,93 @@ pub struct StoredGrant {
     pub decided_by: Option<DecisionSource>,
 }
 
-/// Failure to record a human decision.
+/// Approval storage failure. Backend-neutral: SQLite maps lock
+/// contention, constraint violations, corrupt rows, and engine errors onto
+/// these; resolution maps every variant fail-closed (never `Allow`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DecideError {
-    /// No grant with that id.
-    UnknownApproval,
-    /// Grant is not waiting (already decided).
-    NotWaiting,
-    /// Grant already expired (boundary: `now_ms >= expires_at_ms`).
-    Expired,
+pub enum ApprovalStoreError {
+    /// Backend temporarily unavailable (lock contention, busy exhaustion).
+    Unavailable(String),
+    /// State conflict: duplicate id on insert, or a decision that lost a
+    /// race against an already-decided grant.
+    Conflict(String),
+    /// Unknown approval id.
+    NotFound(String),
+    /// Grant exists but is not in a usable state (already decided, or
+    /// expired at the given timestamp).
+    InvalidState(String),
+    /// Persisted row failed validation. Never an active grant.
+    CorruptState(String),
+    /// Any other backend failure (open, migration, engine errors).
+    Internal(String),
 }
 
-impl Display for DecideError {
+impl Display for ApprovalStoreError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownApproval => write!(f, "approval not found"),
-            Self::NotWaiting => write!(f, "approval is not waiting"),
-            Self::Expired => write!(f, "approval expired"),
+            Self::Unavailable(detail) => write!(f, "approval store unavailable: {detail}"),
+            Self::Conflict(detail) => write!(f, "approval store conflict: {detail}"),
+            Self::NotFound(detail) => write!(f, "approval not found: {detail}"),
+            Self::InvalidState(detail) => write!(f, "approval invalid state: {detail}"),
+            Self::CorruptState(detail) => write!(f, "approval corrupt state: {detail}"),
+            Self::Internal(detail) => write!(f, "approval store error: {detail}"),
         }
     }
 }
 
-impl std::error::Error for DecideError {}
+impl std::error::Error for ApprovalStoreError {}
 
-/// Approval storage abstraction. The daemon port implements this over
-/// SQLite; this crate ships the in-memory implementation only.
-pub trait ApprovalStore {
-    /// Persist a grant (new requests and provider verdicts).
-    fn insert(&mut self, grant: StoredGrant);
-    /// Fetch by id (no expiry applied; matching applies it).
-    fn get(&self, id: &str) -> Option<&StoredGrant>;
-    /// Record a human decision on a live waiting grant.
-    fn decide(
-        &mut self,
-        id: &str,
+/// Approval storage abstraction over owned values. All operations are
+/// explicitly fallible and shareable: `Send + Sync` so the future daemon
+/// can hold one store behind `Arc` across requests. Reads return owned
+/// grants (no borrowed rows escape a backend lock); matching semantics
+/// stay in the resolver, never in the store.
+pub trait ApprovalStore: Send + Sync {
+    /// Persist a grant (new requests and provider verdicts). Duplicate ids
+    /// are a `Conflict`, never an overwrite.
+    fn insert_grant(&self, grant: StoredGrant) -> Result<(), ApprovalStoreError>;
+    /// Fetch by id. `None` means absent; expiry is applied by matching,
+    /// not here.
+    fn get_grant(&self, id: &ApprovalId) -> Result<Option<StoredGrant>, ApprovalStoreError>;
+    /// Record a human decision on a live waiting grant. Exactly one
+    /// concurrent decider wins; losers observe `Conflict` (already
+    /// decided) or `InvalidState` (expired).
+    fn decide_grant(
+        &self,
+        id: &ApprovalId,
         status: GrantStatus,
         reuse: Scope,
         source: DecisionSource,
         now_ms: u64,
-    ) -> Result<(), DecideError>;
-    /// Find a live session-scoped approval matching session, query shape,
-    /// and full scope. Expired grants never match.
+    ) -> Result<(), ApprovalStoreError>;
+    /// Candidate session-scoped approvals for a session and shape. The
+    /// store narrows (status, reuse, session, shape); the resolver still
+    /// verifies binding, scope, and liveness before authorizing anything.
     fn find_session_grant(
         &self,
         session_id: &str,
         shape: &QueryShapeFingerprint,
         scope: &ApprovalScope,
         now_ms: u64,
-    ) -> Option<&StoredGrant>;
+    ) -> Result<Option<StoredGrant>, ApprovalStoreError>;
 }
 
-/// Explicitly owned in-memory store. Single-threaded clarity: `&mut` for
-/// writes, `&` for reads, no locks, no globals.
+/// Explicitly owned in-memory store. A short mutex guards the map so the
+/// store is `Send + Sync` like every backend must be; critical sections
+/// are single hash operations.
 #[derive(Debug, Default)]
 pub struct InMemoryApprovalStore {
-    grants: HashMap<String, StoredGrant>,
+    grants: std::sync::Mutex<HashMap<String, StoredGrant>>,
 }
 
 impl InMemoryApprovalStore {
     /// Empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn poisoned() -> ApprovalStoreError {
+        ApprovalStoreError::Internal("approval store lock poisoned".to_owned())
     }
 
     /// Live (unexpired) waiting/approved/denied state for matching.
@@ -155,30 +181,48 @@ impl InMemoryApprovalStore {
 }
 
 impl ApprovalStore for InMemoryApprovalStore {
-    fn insert(&mut self, grant: StoredGrant) {
-        self.grants.insert(grant.id.as_str().to_owned(), grant);
+    fn insert_grant(&self, grant: StoredGrant) -> Result<(), ApprovalStoreError> {
+        let mut grants = self.grants.lock().map_err(|_| Self::poisoned())?;
+        if grants.contains_key(grant.id.as_str()) {
+            return Err(ApprovalStoreError::Conflict(format!(
+                "approval {} exists",
+                grant.id
+            )));
+        }
+        grants.insert(grant.id.as_str().to_owned(), grant);
+        Ok(())
     }
 
-    fn get(&self, id: &str) -> Option<&StoredGrant> {
-        self.grants.get(id)
+    fn get_grant(&self, id: &ApprovalId) -> Result<Option<StoredGrant>, ApprovalStoreError> {
+        Ok(self
+            .grants
+            .lock()
+            .map_err(|_| Self::poisoned())?
+            .get(id.as_str())
+            .cloned())
     }
 
-    fn decide(
-        &mut self,
-        id: &str,
+    fn decide_grant(
+        &self,
+        id: &ApprovalId,
         status: GrantStatus,
         reuse: Scope,
         source: DecisionSource,
         now_ms: u64,
-    ) -> Result<(), DecideError> {
-        let Some(grant) = self.grants.get_mut(id) else {
-            return Err(DecideError::UnknownApproval);
+    ) -> Result<(), ApprovalStoreError> {
+        let mut grants = self.grants.lock().map_err(|_| Self::poisoned())?;
+        let Some(grant) = grants.get_mut(id.as_str()) else {
+            return Err(ApprovalStoreError::NotFound(format!("approval {id}")));
         };
         if !Self::live(grant, now_ms) {
-            return Err(DecideError::Expired);
+            return Err(ApprovalStoreError::InvalidState(format!(
+                "approval {id} expired"
+            )));
         }
         if grant.status != GrantStatus::Waiting {
-            return Err(DecideError::NotWaiting);
+            return Err(ApprovalStoreError::Conflict(format!(
+                "approval {id} already decided"
+            )));
         }
         grant.status = status;
         grant.reuse = reuse;
@@ -193,23 +237,29 @@ impl ApprovalStore for InMemoryApprovalStore {
         shape: &QueryShapeFingerprint,
         scope: &ApprovalScope,
         now_ms: u64,
-    ) -> Option<&StoredGrant> {
-        self.grants.values().find(|grant| {
-            grant.binding == ApprovalBinding::ExactV1
-                && grant.status == GrantStatus::Approved
-                && grant.reuse == Scope::Session
-                && grant.shape == *shape
-                && grant.scope.session_id.as_deref() == Some(session_id)
-                && grant.scope.matches(scope)
-                && Self::live(grant, now_ms)
-        })
+    ) -> Result<Option<StoredGrant>, ApprovalStoreError> {
+        Ok(self
+            .grants
+            .lock()
+            .map_err(|_| Self::poisoned())?
+            .values()
+            .find(|grant| {
+                grant.binding == ApprovalBinding::ExactV1
+                    && grant.status == GrantStatus::Approved
+                    && grant.reuse == Scope::Session
+                    && grant.shape == *shape
+                    && grant.scope.session_id.as_deref() == Some(session_id)
+                    && grant.scope.matches(scope)
+                    && Self::live(grant, now_ms)
+            })
+            .cloned())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalBinding, ApprovalStore, DecideError, GrantStatus, InMemoryApprovalStore,
+        ApprovalBinding, ApprovalStore, ApprovalStoreError, GrantStatus, InMemoryApprovalStore,
         StoredGrant,
     };
     use crate::id::ApprovalId;
@@ -254,81 +304,95 @@ mod tests {
         }
     }
 
+    fn id(text: &str) -> ApprovalId {
+        ApprovalId::new(text.to_owned())
+    }
+
     #[test]
     fn decide_lifecycle_and_boundaries() {
-        let mut store = InMemoryApprovalStore::new();
+        let store = InMemoryApprovalStore::new();
         assert_eq!(
-            store.decide(
-                "missing",
+            store.decide_grant(
+                &id("missing"),
                 GrantStatus::Approved,
                 Scope::Once,
                 DecisionSource::Cli,
                 0
             ),
-            Err(DecideError::UnknownApproval)
+            Err(ApprovalStoreError::NotFound("approval missing".to_owned()))
         );
-        store.insert(grant());
+        store.insert_grant(grant()).expect("insert");
+        // Duplicate insert conflicts, never overwrites.
+        assert!(matches!(
+            store.insert_grant(grant()),
+            Err(ApprovalStoreError::Conflict(_))
+        ));
         // Expiry boundary: now == expires_at is expired (reference parity).
-        assert_eq!(
-            store.decide(
-                "qka-1",
+        assert!(matches!(
+            store.decide_grant(
+                &id("qka-1"),
                 GrantStatus::Approved,
                 Scope::Session,
                 DecisionSource::Cli,
                 1_000_000
             ),
-            Err(DecideError::Expired)
-        );
+            Err(ApprovalStoreError::InvalidState(_))
+        ));
         store
-            .decide(
-                "qka-1",
+            .decide_grant(
+                &id("qka-1"),
                 GrantStatus::Approved,
                 Scope::Session,
                 DecisionSource::Cli,
                 999_999,
             )
             .expect("decide");
-        let stored = store.get("qka-1").expect("stored");
+        let stored = store.get_grant(&id("qka-1")).expect("get").expect("stored");
         assert_eq!(stored.status, GrantStatus::Approved);
         assert_eq!(stored.reuse, Scope::Session);
         assert_eq!(stored.decided_by, Some(DecisionSource::Cli));
-        // Decided grants reject further decisions.
-        assert_eq!(
-            store.decide(
-                "qka-1",
+        // Decided grants reject further decisions as conflicts.
+        assert!(matches!(
+            store.decide_grant(
+                &id("qka-1"),
                 GrantStatus::Denied,
                 Scope::Once,
                 DecisionSource::Ui,
                 999_999
             ),
-            Err(DecideError::NotWaiting)
-        );
+            Err(ApprovalStoreError::Conflict(_))
+        ));
     }
 
     #[test]
     fn session_grant_matching() {
-        let mut store = InMemoryApprovalStore::new();
+        let store = InMemoryApprovalStore::new();
         let mut approved = grant();
         approved.status = GrantStatus::Approved;
         approved.reuse = Scope::Session;
-        store.insert(approved);
+        store.insert_grant(approved).expect("insert");
         assert!(store
             .find_session_grant("s1", &shape(), &scope(), 999_999)
+            .expect("lookup")
             .is_some());
         // Wrong session, wrong fingerprint, expired, or Once reuse: no match.
         assert!(store
             .find_session_grant("s2", &shape(), &scope(), 999_999)
+            .expect("lookup")
             .is_none());
         assert!(store
             .find_session_grant("s1", &other_shape(), &scope(), 999_999)
+            .expect("lookup")
             .is_none());
         assert!(store
             .find_session_grant("s1", &shape(), &scope(), 1_000_000)
+            .expect("lookup")
             .is_none());
         let mut other_scope = scope();
         other_scope.database = "other".to_owned();
         assert!(store
             .find_session_grant("s1", &shape(), &other_scope, 999_999)
+            .expect("lookup")
             .is_none());
     }
 }

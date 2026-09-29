@@ -60,7 +60,7 @@ fn resolve_approval(
         ErrorProvider, InMemoryApprovalStore, ProviderDecision, TestProvider, UnavailableProvider,
         DEFAULT_APPROVAL_TTL_MS,
     };
-    let mut store = InMemoryApprovalStore::new();
+    let store = InMemoryApprovalStore::new();
     let approved = TestProvider::new(vec![ProviderDecision::Approved]);
     let denied = TestProvider::new(vec![ProviderDecision::Denied]);
     let waiting = TestProvider::new(vec![ProviderDecision::Waiting]);
@@ -85,7 +85,7 @@ fn resolve_approval(
             ttl_ms: DEFAULT_APPROVAL_TTL_MS,
             now_ms: 1_000,
         },
-        &mut store,
+        &store,
         provider,
     );
     (

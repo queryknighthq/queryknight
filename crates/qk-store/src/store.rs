@@ -652,6 +652,76 @@ impl Store {
     }
 }
 
+/// Map store failures onto the approval persistence abstraction. Lock
+/// contention is transient (`Unavailable`); conflicts stay conflicts;
+/// corrupt rows can never authorize (`CorruptState`); everything else is
+/// `Internal`. Callers fail closed on every variant.
+fn map_approval_error(error: StoreError) -> qk_approval::ApprovalStoreError {
+    use qk_approval::ApprovalStoreError as Out;
+    match error {
+        StoreError::Busy(detail) => Out::Unavailable(detail),
+        StoreError::Conflict(detail) => Out::Conflict(detail),
+        StoreError::NotFound(detail) => Out::NotFound(detail),
+        StoreError::NotWaiting(detail) => Out::Conflict(detail),
+        StoreError::Expired(detail) => Out::InvalidState(detail),
+        StoreError::InvalidRow(detail) => Out::CorruptState(detail),
+        StoreError::Open(detail)
+        | StoreError::Migration(detail)
+        | StoreError::SchemaMismatch(detail)
+        | StoreError::Database(detail) => Out::Internal(detail),
+    }
+}
+
+impl qk_approval::ApprovalStore for Store {
+    fn insert_grant(&self, grant: StoredGrant) -> Result<(), qk_approval::ApprovalStoreError> {
+        // Creation timestamps need a clock (the reference uses Date.now at
+        // creation); matching and expiry stay on explicit timestamps.
+        let now_ms = system_now_ms().map_err(|_| {
+            qk_approval::ApprovalStoreError::Internal("system clock before epoch".to_owned())
+        })?;
+        self.insert_grant(&grant, now_ms)
+            .map_err(map_approval_error)
+    }
+
+    fn get_grant(
+        &self,
+        id: &ApprovalId,
+    ) -> Result<Option<StoredGrant>, qk_approval::ApprovalStoreError> {
+        self.get_grant(id.as_str()).map_err(map_approval_error)
+    }
+
+    fn decide_grant(
+        &self,
+        id: &ApprovalId,
+        status: GrantStatus,
+        reuse: Scope,
+        source: DecisionSource,
+        now_ms: u64,
+    ) -> Result<(), qk_approval::ApprovalStoreError> {
+        self.decide_grant(id.as_str(), status, reuse, source, now_ms)
+            .map_err(map_approval_error)
+    }
+
+    fn find_session_grant(
+        &self,
+        session_id: &str,
+        shape: &QueryShapeFingerprint,
+        scope: &ApprovalScope,
+        now_ms: u64,
+    ) -> Result<Option<StoredGrant>, qk_approval::ApprovalStoreError> {
+        self.find_session_grant(session_id, shape, scope, now_ms)
+            .map_err(map_approval_error)
+    }
+}
+
+fn system_now_ms() -> Result<u64, ()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .map_err(|_| ())
+}
+
 fn trim_debug(error: rusqlite::Error) -> String {
     let message = error.to_string();
     if message.len() <= 300 {

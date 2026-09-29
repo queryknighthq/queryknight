@@ -10,3 +10,5 @@ qk-core = { path = "../qk-core" }
 serde_json = "1"
 qk-sql = { path = "../qk-sql" }
 qk-approval = { path = "../qk-approval" }
+qk-store = { path = "../qk-store" }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }

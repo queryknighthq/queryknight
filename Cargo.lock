@@ -439,6 +439,8 @@ dependencies = [
  "qk-approval",
  "qk-core",
  "qk-sql",
+ "qk-store",
+ "rusqlite",
  "serde_json",
 ]
 

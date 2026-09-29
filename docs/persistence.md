@@ -146,6 +146,24 @@ so exactly one concurrent decider wins and losers observe
 assumptions. Connection inserts use `INSERT OR IGNORE` (deterministic
 under races, unlike the reference SELECT-then-INSERT).
 
+## ApprovalStore trait (qk-approval)
+
+One fallible owned-value abstraction serves both backends:
+`insert_grant` / `get_grant` / `find_session_grant` / `decide_grant`,
+all returning `Result<_, ApprovalStoreError>` (`Unavailable`, `Conflict`,
+`NotFound`, `InvalidState`, `CorruptState`, `Internal`) over owned
+`StoredGrant` values — no borrowed rows, no infallible writes. Both
+`InMemoryApprovalStore` and `qk_store::Store` implement it; `resolve()`
+calls it identically either way, re-verifying binding, status, scope,
+and liveness on every returned candidate (defense in depth: backends
+narrow, qk-approval authorizes). Store failures during resolution map to
+deny-side codes (`APPROVAL_ERROR`, or `APPROVAL_UNAVAILABLE` when no
+provider could be consulted); a provider verdict that cannot be durably
+recorded fails closed instead of executing. The trait requires
+`Send + Sync` (both implementations hold it via short mutex sections)
+so the future daemon can share one store across requests; no Tokio or
+async runtime is involved at this layer.
+
 ## State transitions
 
 `waiting -> approved`, `waiting -> denied` (via `decide_grant` with an

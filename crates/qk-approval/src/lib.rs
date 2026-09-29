@@ -37,5 +37,6 @@ pub use resolve::{
 };
 pub use scope::{ApprovalScope, DecisionSource, Scope};
 pub use store::{
-    ApprovalBinding, ApprovalStore, DecideError, GrantStatus, InMemoryApprovalStore, StoredGrant,
+    ApprovalBinding, ApprovalStore, ApprovalStoreError, GrantStatus, InMemoryApprovalStore,
+    StoredGrant,
 };
