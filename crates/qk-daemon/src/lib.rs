@@ -18,6 +18,7 @@ pub mod routes;
 pub mod runtime;
 pub mod server;
 pub mod state;
+pub mod ui;
 
 pub use auth::{generate_token, AuthToken};
 pub use config::{DaemonConfig, DEFAULT_BIND, DEFAULT_BODY_LIMIT_BYTES, DEFAULT_PORT};

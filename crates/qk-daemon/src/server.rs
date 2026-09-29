@@ -64,6 +64,16 @@ async fn gatekeeper(
     if path == "/status" || path == "/health" || path == "/ready" {
         return with_cors(next.run(request).await, origin_ref);
     }
+    // Browser surface: GET/HEAD of non-API paths (SPA shell, static
+    // assets) need no token — the reference skips auth for GET
+    // non-API paths the same way. (HEAD is included even though the
+    // reference only exempts GET: HEAD is defined as bodyless GET and
+    // browsers/CDNs rely on it; documented in browser-ui.md.)
+    if (request.method() == axum::http::Method::GET || request.method() == axum::http::Method::HEAD)
+        && !crate::ui::is_api_path(&path)
+    {
+        return with_cors(next.run(request).await, origin_ref);
+    }
     if let Some(response) = check_auth(&request, &token) {
         return with_cors(response, origin_ref);
     }
@@ -118,13 +128,11 @@ async fn map_method_not_allowed(response: Response) -> Response {
     response
 }
 
-/// Unknown paths: JSON 404 (the reference serves its SPA bundle here when
-/// one exists; without static serving the contract is a plain 404).
-async fn fallback_404() -> impl IntoResponse {
-    (
-        StatusCode::NOT_FOUND,
-        axum::Json(serde_json::json!({"error": "not found"})),
-    )
+/// Unknown paths: the embedded-Vue fallback in [`crate::ui`] (SPA shell
+/// for browser-owned routes, frozen JSON 404 for API-shaped unknowns).
+/// Kept as a named function so the routing table reads declaratively.
+async fn fallback_404(method: axum::http::Method, uri: axum::http::Uri) -> impl IntoResponse {
+    crate::ui::fallback(method, uri).await
 }
 
 /// Build the router. Pure construction: no sockets, no tasks.

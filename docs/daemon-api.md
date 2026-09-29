@@ -45,6 +45,25 @@ deferred to the runtime-lifecycle commit (tracked in
 - The token never appears in logs, `Debug`, or `Display` output
   (redaction wrapper; pinned by test).
 
+## Browser/static surface
+
+The embedded Vue SPA shell and assets (full contract:
+`docs/browser-ui.md`). Delivery rules affecting API clients:
+
+- `GET`/`HEAD` of non-API paths need no token (SPA shell, static
+  assets); every API-shaped path still requires it. (`HEAD` is
+  included though the reference only exempts `GET`: HEAD is bodyless
+  GET and browsers/CDNs rely on it.)
+- Precedence: exact API routes > embedded files > SPA fallback for
+  browser-owned `GET`/`HEAD` > frozen JSON 404 for API-shaped
+  unknowns (`/approvals/...`, `/sessions/...`, `/activity`,
+  `/events`, `/allows`, `/connections`) > plain 404 for `/assets/*`
+  misses and non-GET/HEAD misses.
+- `index.html` and any `?token=` response: `Cache-Control: no-store`.
+  Hashed `/assets/*`: `public, max-age=31536000, immutable`.
+- HTML carries restrictive CSP, `Referrer-Policy: no-referrer`,
+  `X-Frame-Options: DENY`, `nosniff`; assets carry `nosniff`.
+
 ## Endpoints
 
 | Method + path | Auth | Body / params | Success | Notes |

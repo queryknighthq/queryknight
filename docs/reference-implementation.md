@@ -499,6 +499,72 @@ Source: `packages/daemon/src/index.ts`, `packages/cli/src/index.ts`
     `localStorage qk_token`, then Bearer; `HistoryClient` reads
     `session.token` per request. (UI serving itself is deferred in Rust.)
 
+## Static UI serving audit (browser-surface phase, verified against source and built dist 2026-09-29)
+
+Source: `apps/ui/src/{App.vue (434 lines), main.ts, logo.svg}`,
+`apps/ui/{package.json, vite.config.ts, dist/}`,
+`packages/daemon/src/{index.ts, app.ts}` (`staticFile`, `isApiPath`,
+`uiDistDir`).
+
+1. Frontend source: `apps/ui/src/` (`App.vue` tab SPA, `main.ts`
+   mounts `#app`, `logo.svg` inlined as data URI, no vue-router).
+2. Build: `vite build` (vite 8 + @vitejs/plugin-vue 6 + vue 3; the
+   `build` script does NOT typecheck).
+3. Output: `apps/ui/dist/{index.html, assets/index-<8base62>.js,
+   assets/index-<8base62>.css}` (80K total; verified byte-identical
+   rebuild offline to a temp outDir).
+4. TS serves disk files per request: `staticFile()` + `new
+   Response(Bun.file(file))` in the `index.ts` fetch fallback.
+5. Disk reads, never embedded (`existsSync` on every miss).
+6. `GET /` -> `dist/index.html`.
+7. Fallback: any GET whose API response is 404 serves the exact disk
+   file if present, else `dist/index.html` (200) — INCLUDING missing
+   `/assets/*` paths and API-shaped unknown paths.
+8. Excluded from fallback: non-GET methods (API 404 returned as-is)
+   and any API response != 404.
+9. API shape list (`isApiPath`): `/activity`, `/sessions`,
+   `/sessions/*`, `/events`, `/allows`, `/connections`, `/approvals`,
+   `/approvals/*`. (Auth-skip list: `GET` + non-API skips auth; also
+   `/status /health /ready` always skip.)
+10. Unknown API route: Hono 404 -> GET falls into static/index.html
+    (e.g. `GET /approvals/x/y` -> 200 index.html when dist exists).
+    The Rust port deliberately diverges here (frozen 1631702 JSON 404
+    for API-shaped unknowns).
+11. Bootstrap: `new URLSearchParams(location.search).get('token')`.
+12-14. Storage: `localStorage` key `qk_token`, raw token value; no
+    sessionStorage/cookie/memory-only mode.
+15-17. Removal: `history.replaceState({}, '', location.pathname)` in
+    the same `token()` call that stores it, before the first fetch;
+    no redirect/navigation.
+18. Precedence: `?token=` unconditionally OVERWRITES any stored value
+    (no comparison, no validation).
+19-20. Invalid `?token=wrong`: stored blindly; every API call then
+    401s and the page shows the `401 unauthorized` text. No logout or
+    clear-token control exists.
+21. Transport after bootstrap: `authorization: Bearer <token>` header
+    on every `fetch` (plus `content-type: application/json`); the
+    query transport is never reused by the UI.
+22. Same-origin relative paths (`/activity`, `/sessions`, ...): no
+    port/host assumptions, no CORS needed in production.
+23-25. No CSP, no Referrer-Policy, no X-Frame-Options/frame-ancestors
+    anywhere (server or bundle). Rust adds these as hardening.
+26. No Cache-Control/ETag logic in TS (Bun.file defaults only). Rust
+    sets `no-store` (index/bootstrap) vs `immutable` (hashed assets).
+27. Hashed names: `index-<8 chars base62>.js/.css`.
+28. `index.html` cached like any other file in TS (no special rule).
+29. No `.map` files in dist (vite default `sourcemap: false`).
+30. Dev: `vite dev` standalone; the daemon never proxies to it.
+31. Deep links: no router — every path renders the same SPA (default
+    tab `approvals`, 2s poll); session selection is JS state, not URL.
+32. Malformed/nonexistent asset: TS serves index.html 200 (Rust
+    diverges to 404 for recognizable asset paths).
+33. No favicon/manifest/link icons (`/favicon.ico` -> index.html).
+34. The token never enters logs: the bundle has zero `console.*`
+    calls and no error reporting.
+35. Browser contract relied upon: same-origin relative fetch, Bearer
+    `qk_token` from localStorage, `?token=` one-shot bootstrap with
+    immediate `replaceState` cleanup.
+
 ## External compatibility surfaces (freeze list)
 
 1. `evaluate(ctx, sql, opts)` signature + Evaluation JSON shape + all reason codes.

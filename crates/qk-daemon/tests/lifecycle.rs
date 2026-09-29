@@ -259,6 +259,35 @@ async fn restart_reuses_token_and_keeps_history() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_surface_works_on_ephemeral_port() {
+    // Same-origin relativity: the SPA shell and API share whatever
+    // port the daemon bound; no frozen 47821 leaks anywhere.
+    use qk_daemon::runtime::probe::probe_get;
+    let home = temp_home("browser-port");
+    let daemon = runtime(home.clone());
+    let (handle, shutdown_tx, addr) = spawn_daemon(daemon).await;
+    let target = ProbeTarget::new("127.0.0.1", addr.port()).expect("loopback");
+    let (code, body) = probe_get(&target, "/", None, std::time::Duration::from_secs(2))
+        .await
+        .expect("shell");
+    assert_eq!(code, 200);
+    assert!(body.starts_with(b"<!doctype html>"));
+    // API on the same odd port still enforces auth.
+    let (code, _) = probe_get(
+        &target,
+        "/approvals",
+        None,
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .expect("api");
+    assert_eq!(code, 401);
+    let _ = shutdown_tx.send(());
+    handle.await.expect("join").expect("stop");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_start_stop_is_stable() {
     // Flake detector: five full cycles on one home.
     let home = temp_home("repeat");

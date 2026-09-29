@@ -222,10 +222,18 @@ async fn host_and_origin_gates() {
 #[tokio::test]
 async fn unknown_route_and_method() {
     let (app, _) = test_app();
-    // Unknown path: JSON 404 (static UI serving is deferred).
-    let (status, body, _) = call(app.clone(), request("GET", "/nope", None)).await;
+    // Unknown API-shaped path: frozen JSON 404 (never the SPA shell).
+    let (status, body, _) = call(app.clone(), request("GET", "/approvals/nope/deeper", None)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(json(&body)["error"], "not found");
+    // Unknown non-API path serves the SPA shell (browser routes).
+    let (status, body, headers) = call(app.clone(), request("GET", "/nope", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.starts_with(b"<!doctype html>"));
+    assert_eq!(
+        headers.get("content-security-policy").expect("csp").to_str().expect("csp"),
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    );
     // Wrong method on a known path: 404 like the reference router.
     let (status, _, _) = call(app.clone(), request("DELETE", "/status", None)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
