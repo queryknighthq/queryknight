@@ -11,6 +11,7 @@ path = "src/main.rs"
 qk-core = { path = "../qk-core" }
 qk-sql = { path = "../qk-sql" }
 qk-daemon = { path = "../qk-daemon" }
+qk-mcp = { path = "../qk-mcp" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -19,3 +20,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time",
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }

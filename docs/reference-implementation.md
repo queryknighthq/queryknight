@@ -634,6 +634,68 @@ Source: `packages/adapters/{mysql,postgres,sqlite}/src/index.ts`,
 - No implicit transactions anywhere; per-request adapter use means
   no cross-request transaction affinity.
 
+## MCP contract audit (mcp phase, verified against source 2026-09-30)
+
+Source: `packages/mcp/src/{index.ts, tools.ts, format.ts, engine.ts}`,
+`@modelcontextprotocol/server` (stdio), `packages/cli/src/index.ts`
+(`mcp` command).
+
+- Exactly 8 tools: `db_tables`, `db_describe`, `db_schema`,
+  `db_query`, `db_explain`, `db_sample`, `approvals_list`,
+  `approvals_decide`. No aliases.
+- Server identity: name `queryknight`, version `QUERYKNIGHT_VERSION`
+  (`0.1.0-beta.0`), frozen `mcpInstructions(connectionKey)` text
+  (bound-connection preamble + tool summary + approval-retry
+  instructions + no-fallback warning).
+- Schemas (zod; unknown keys stripped, not rejected):
+  `db_tables {schema?, includeViews?, limit? int 1-200}`,
+  `db_describe {table, schema?}`, `db_schema {schema?, limit? int
+  1-200}`, `db_query {sql string 1-1_000_000, params? array max
+  1000, maxRows? int 1-200, cursor?, approvalId?}`,
+  `db_explain {sql, params?}`, `db_sample {table, schema?, limit?
+  int 1-200}`, `approvals_list {}`, `approvals_decide {id, status:
+  approved|denied}`. Annotations: `destructiveHint: true` only on
+  `db_query`/`approvals_decide`, else read-only.
+- Output: `{content: [{type: 'text', text}]}` single text block
+  always. `formatQuery`: optional `Query matched ~N rows (planner
+  estimate).`, `Showing N rows.`, markdown table (`NULL` -> ``),
+  blank, `Returned to agent: N bytes`, `Estimated tokens returned:
+  ~N`, optional avoided/cursor/`Rows affected:` lines.
+- `Blocked:` prefix (exact capital + colon) for denials, pending,
+  and param overflow; pending template byte-exact
+  (`Blocked: waiting for approval <id>.` / ask-user line /
+  `approvals_decide("<id>", "approved")   # or "denied"` / `Then
+  retry db_query with the same SQL and approvalId="<id>".`).
+  Denied/pending are TEXT RESULTS, not protocol errors; DB/daemon
+  failures throw (protocol errors).
+- Retry is an explicit `approvalId` tool argument; cursor paging
+  reuses stored SQL (policy-file path re-evaluates it).
+- One bound connection per server (`createAdapter(url)` at
+  startup; `connectionKeyFromUrl` password-stripped key);
+  `db_query` uses `databaseKeyFor(connectionKey)`
+  (`QUERYKNIGHT_DATABASE` ?? key), `environmentFromEnv()`,
+  hardcoded `integration: 'mcp'`, `tool: 'db_query'`.
+- `dbTables` default limit 50, views filtered unless
+  `includeViews`; `dbSchema` tables-only default 50 with `…
+  truncated. Narrow schema or raise limit.`; `dbSample` default 20,
+  clamp 200, cursor disabled; `parseTableRef` splits on FIRST dot
+  (`schema.table`), explicit `schema` wins.
+- `dbExplain`/`runSample` evaluate NO policy (direct adapter calls);
+  metadata tools take identifiers only.
+- History: `track()` records EVERY tool call (`sessionId`,
+  `connectionKey`, `source: 'mcp'`, SQL text, durationMs,
+  rows/bytes/tokens or decision/errorCode) via `POST /events`
+  (best-effort catch); `dbQuery` success records full counters.
+  Daemon down at startup -> `sessionId` undefined -> history
+  undefined -> tools run history-less; approvals tools return
+  `daemon unavailable; start queryknight`.
+- `queryknight mcp` requires `MYSQL_URL`/`DATABASE_URL` else
+  `set MYSQL_URL` stderr exit 1; `adapter.connect()` at startup;
+  SIGTERM/SIGINT -> disconnect; `serveStdio` (stdout protocol-only,
+  no other stdout writes in mcp sources).
+- `withTimeout`: `QUERYKNIGHT_DB_TIMEOUT_MS ?? 30000`, race with
+  `may still be running server-side` text, AbortSignal support.
+
 ## External compatibility surfaces (freeze list)
 
 1. `evaluate(ctx, sql, opts)` signature + Evaluation JSON shape + all reason codes.

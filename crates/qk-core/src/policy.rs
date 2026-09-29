@@ -169,6 +169,44 @@ pub struct PolicyTestCase {
     pub reason: Option<String>,
 }
 
+/// Built-in demo policy text (production `main` with read allows,
+/// destructive denies, write approvals, sensitive columns, and
+/// unbounded-mutation/row guards). Used when no policy file is
+/// configured; real deployments pass an explicit file.
+pub const DEMO_POLICY: &str = "version: 1
+defaults:
+  decision: deny
+environments:
+  production:
+    databases:
+      main:
+        allow:
+          - operations: [select, show, describe, explain]
+        deny:
+          - operations: [drop, truncate, grant, revoke]
+        approval_required:
+          - operations: [insert, update, delete, create, alter]
+        sensitive:
+          columns:
+            - users.password_hash
+            - users.mfa_secret
+            - payments.card_token
+            - customers.ssn
+            - \"*.api_key\"
+            - \"*.secret\"
+            - \"*.access_token\"
+        mutations:
+          deny_without_where: [update, delete]
+        row_safety:
+          max_limit: 1000
+";
+
+/// Parse the built-in demo policy (infallible in practice; errors only
+/// if the embedded text ever stops validating).
+pub fn demo_policy() -> Result<PolicyFile> {
+    parse_policy(DEMO_POLICY)
+}
+
 /// Validated policy v1 file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyFile {

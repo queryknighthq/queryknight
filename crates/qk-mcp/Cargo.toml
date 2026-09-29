@@ -1,0 +1,27 @@
+[package]
+name = "qk-mcp"
+version = "0.1.0-beta.0"
+edition = "2021"
+
+[dependencies]
+qk-core = { path = "../qk-core" }
+qk-sql = { path = "../qk-sql" }
+qk-approval = { path = "../qk-approval" }
+qk-db = { path = "../qk-db" }
+qk-daemon = { path = "../qk-daemon" }
+rmcp = { version = "3", features = ["transport-io"] }
+base64 = "0.22"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util", "process"] }
+assert_cmd = "2"
+predicates = "3"
+serde_json = "1"
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+qk-daemon = { path = "../qk-daemon" }
+qk-core = { path = "../qk-core" }
+qk-db = { path = "../qk-db" }

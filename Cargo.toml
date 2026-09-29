@@ -8,5 +8,5 @@ members = [
     "crates/qk-cli",
     "crates/qk-db",
     "crates/qk-store",
-    "crates/qk-daemon", "crates/qk-db",
+    "crates/qk-daemon", "crates/qk-db", "crates/qk-mcp",
 ]

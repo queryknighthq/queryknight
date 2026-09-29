@@ -26,7 +26,7 @@ pub use glob::{check_glob, glob_match};
 /// the evaluation [`Decision`].
 pub use policy::Decision as PolicyDecision;
 pub use policy::{
-    parse_policy, parse_test_cases, DatabasePolicy, Defaults, EnvironmentPolicy, MutationsPolicy,
-    ParseFallback, PolicyFile, PolicyRule, PolicyTestCase, RowSafety, SensitiveAction,
-    SensitivePolicy,
+    demo_policy, parse_policy, parse_test_cases, DatabasePolicy, Defaults, EnvironmentPolicy,
+    MutationsPolicy, ParseFallback, PolicyFile, PolicyRule, PolicyTestCase, RowSafety,
+    SensitiveAction, SensitivePolicy, DEMO_POLICY,
 };

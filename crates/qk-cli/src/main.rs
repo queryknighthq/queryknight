@@ -16,6 +16,7 @@
 
 mod daemon_cmd;
 mod inspect;
+mod mcp_cmd;
 mod policy;
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
@@ -112,6 +113,15 @@ enum TopCommand {
         /// Probe port (default: pid file's port, else `QUERYKNIGHT_PORT`).
         #[arg(long)]
         port: Option<u16>,
+    },
+    /// Start the MCP stdio server for the bound database connection.
+    Mcp {
+        /// Policy file (`QUERYKNIGHT_POLICY_FILE`, else built-in demo).
+        #[arg(long)]
+        policy: Option<std::path::PathBuf>,
+        /// State directory (`QUERYKNIGHT_HOME`, default ~/.queryknight).
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
     },
 }
 
@@ -212,6 +222,7 @@ fn run(cli: Cli) -> i32 {
         }) => daemon_cmd::start(home, port, foreground),
         Some(TopCommand::Stop { home, port }) => daemon_cmd::stop(home, port),
         Some(TopCommand::Status { home, port }) => daemon_cmd::status(home, port),
+        Some(TopCommand::Mcp { policy, home }) => mcp_cmd::run(policy, home),
     }
 }
 

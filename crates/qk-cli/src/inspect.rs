@@ -6,42 +6,13 @@ use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use qk_core::{
-    evaluate, parse_policy, Decision, EvaluateOptions, EvaluationRequest, ExecutionContext,
-    PolicyFile,
+    demo_policy as core_demo_policy, evaluate, parse_policy, Decision, EvaluateOptions,
+    EvaluationRequest, ExecutionContext, PolicyFile,
 };
 
-/// Demo policy used when `--policy` is absent. Mirrors the reference demo
-/// posture (production `main` with read allows, destructive denies, write
-/// approvals, sensitive columns, unbounded-mutation and row guards) so the
-/// CLI is useful without a policy file. Real deployments pass `--policy`.
-const DEMO_POLICY: &str = "version: 1
-defaults:
-  decision: deny
-environments:
-  production:
-    databases:
-      main:
-        allow:
-          - operations: [select, show, describe, explain]
-        deny:
-          - operations: [drop, truncate, grant, revoke]
-        approval_required:
-          - operations: [insert, update, delete, create, alter]
-        sensitive:
-          columns:
-            - users.password_hash
-            - users.mfa_secret
-            - payments.card_token
-            - customers.ssn
-            - \"*.api_key\"
-            - \"*.secret\"
-            - \"*.access_token\"
-        mutations:
-          deny_without_where: [update, delete]
-        row_safety:
-          max_limit: 1000
-";
-
+/// Demo policy used when `--policy` is absent (see
+/// [`qk_core::DEMO_POLICY`]): useful without a policy file; real
+/// deployments pass `--policy`.
 /// Parsed inspect arguments (adapted from CLI syntax into core APIs).
 pub struct InspectArgs {
     /// SQL dialect name.
@@ -65,7 +36,7 @@ pub struct InspectArgs {
 }
 
 fn demo_policy() -> Result<PolicyFile, String> {
-    parse_policy(DEMO_POLICY).map_err(|e| format!("internal demo policy invalid: {e}"))
+    core_demo_policy().map_err(|e| format!("internal demo policy invalid: {e}"))
 }
 
 fn load_policy(path: &PathBuf) -> Result<PolicyFile, i32> {

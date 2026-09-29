@@ -109,3 +109,9 @@ INV-035: Database execution may occur only after the complete current request ha
 
 INV-036: The database dialect and security context used for evaluation are derived from trusted connection/configuration state, not from untrusted request metadata.
   `DbConfig` variants (URL-scheme selected with the frozen mysql-default rule) determine `SqlDialect`; the policy `ExecutionContext` (integration/environment/database/tool/session) is built by the trusted caller from configuration. Agents supply only SQL text, params, paging, and an optional approval id. Corpus: dialect-derivation tests (backquote SQL executes under mysql config, blocks with zero calls under postgres) + adapter-factory mapping tests.
+
+INV-037: MCP is an untrusted protocol adapter. Tool arguments may select only explicitly exposed resources and may never override trusted database dialect, integration identity, policy context, or approval binding.
+  The server assigns `integration: "mcp"`; environment/database/session derive from the bound connection configuration; the dialect derives from the stored connection variant (there is no `dialect` argument); unknown fields are ignored, never honored. Arguments carry only SQL text, params, paging, approval ids, and table identifiers into the existing `qk-db` choke point. Corpus: qk-mcp schema snapshots, trusted-derivation tests, unknown-field tests, and call-count proofs.
+
+INV-038: MCP stdout is reserved exclusively for protocol traffic; diagnostics or secrets must never contaminate the stdio transport.
+  No banners, `println!`, tracing-to-stdout, or panic text on stdout; stderr carries diagnostics without tokens, passwords, or raw SQL by default. Pinned by a real-process stdio test asserting every stdout line is valid JSON-RPC. Corpus: qk-cli stdio integration tests.
