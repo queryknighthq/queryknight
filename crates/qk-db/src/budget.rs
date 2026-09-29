@@ -11,8 +11,8 @@ pub const MAX_ROWS: usize = 50;
 pub const MAX_BYTES: usize = 64 * 1024;
 /// Frozen token-estimate cap (heuristic units).
 pub const MAX_TOKENS: usize = 8000;
-/// Frozen parameter count cap (`MAX_QUERY_PARAMS`).
-pub const MAX_PARAMS: usize = 1000;
+/// Frozen parameter count cap, shared with exact identity validation.
+pub const MAX_PARAMS: usize = qk_core::MAX_EXECUTION_PARAMS;
 
 /// Budget triple (rows, bytes, token estimates).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

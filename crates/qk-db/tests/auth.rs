@@ -92,13 +92,7 @@ fn approval<'a>(
 }
 
 fn auth_request(sql: &str) -> AuthorizationRequest {
-    AuthorizationRequest {
-        sql: sql.to_owned(),
-        params: Vec::new(),
-        approval_id: None,
-        max_rows: None,
-        cursor: None,
-    }
+    AuthorizationRequest::new(sql, Vec::new())
 }
 
 /// Recording fake: counts execute/explain/ping contacts and logs SQL.
@@ -430,14 +424,24 @@ async fn parameterized_request_permits_exact_v2() {
     let config = sqlite_config();
     let trusted = auth();
     let policy = policy();
-    let mut request = auth_request("SELECT a FROM t WHERE id = ?");
-    request.params = vec![serde_json::json!(7)];
+    let request = AuthorizationRequest::new(
+        "SELECT a FROM t WHERE id = ?",
+        vec![qk_core::ExecutionParam::Int(7)],
+    );
     let permit = permit(authorize(
         &store, None, &config, &trusted, &policy, &request,
     ));
-    // Any params → Exact V2, and the digest differs from the literal
-    // form's V1 digest.
-    assert!(matches!(permit.exact(), qk_core::ExactDigest::V2(_)));
+    assert_eq!(
+        permit.exact(),
+        &qk_core::ExactDigest::V2(
+            qk_core::exact_request_digest_v2(
+                qk_sql::SqlDialect::Sqlite,
+                "SELECT a FROM t WHERE id = ?",
+                &[qk_core::ExecutionParam::Int(7)],
+            )
+            .expect("bounded"),
+        )
+    );
 }
 
 #[tokio::test]
@@ -549,11 +553,14 @@ fn session_grant_issues_a_new_permit_for_a_literal_variant() {
     store
         .insert_grant(grant(
             parameterized,
-            ApprovalBinding::ExactV2(qk_core::exact_request_digest_v2(
-                qk_sql::SqlDialect::Sqlite,
-                parameterized,
-                &[qk_core::DigestParam::Int(1)],
-            )),
+            ApprovalBinding::ExactV2(
+                qk_core::exact_request_digest_v2(
+                    qk_sql::SqlDialect::Sqlite,
+                    parameterized,
+                    &[qk_core::ExecutionParam::Int(1)],
+                )
+                .expect("bounded"),
+            ),
             Scope::Session,
         ))
         .expect("grant stored");

@@ -353,3 +353,63 @@ error state interacts with permit issuance. `integration` will be
 `proxy_pg` / `proxy_mysql` (trusted listener config, never wire
 input). Observation wraps one client attempt (blocked / pending /
 executed / DB failure) exactly once, outside `qk-db`.
+
+## Shared exact parameter identity
+
+The current direct/MCP path starts with `ExecuteRequest.params:
+Vec<serde_json::Value>` in `qk-db::service`. `ExecutionService` retains
+those original JSON values for adapter binding and converts a separate
+copy through `qk-db::auth::execution_identity_params` into
+`qk_core::ExecutionParam`. The protocol-neutral `AuthorizationRequest` and
+`qk-approval::ResolveRequest` carry only these identity values. `DigestParam`
+was a public qk-core type; it is retained as a source-compatible alias to
+`ExecutionParam`, whose richer `Wire` variant is protocol-neutral.
+`authorize_guarded` validates their shared count/byte bounds; Exact V1/V2
+selection occurs in `qk-db::auth::permit_for` for direct allow and
+`qk-approval::resolve` for approval outcomes. Both use the same bounded
+`qk_core::exact_request_digest_v2` encoder, which returns a typed limit error
+or hashes them. An `ExecutionPermit` exposes
+only the digest/version and trusted facts; qk-db's private execution values
+are not exposed through permit accessors.
+
+The mapping preserves prior JSON behavior: null, bool, signed/unsigned
+integer, float bits, UTF-8 text, and byte values retain their existing
+logical tags and Exact V2 frames. JSON numbers are never routed through
+`f64` when they fit integer types. Compound JSON values retain the previous
+canonical JSON-text identity fallback and remain subject to qk-db driver's
+existing bind validation. Zero parameters still select Exact V1; one or more
+select Exact V2.
+
+`ExecutionParam` is shared approval/security identity, not a driver or ORM
+value type. Its logical variants preserve existing persisted Exact V2
+digests. Its protocol-neutral `Wire { representation, type_hint, bytes }`
+variant distinguishes text and binary representations, arbitrary non-UTF-8
+bytes, and optional stable type metadata. Wire values use a new reserved V2
+parameter tag; their metadata and payload are independently length-framed.
+Exact identity is representation-sensitive request identity, not semantic
+database-value equivalence. The single encoder streams fields into SHA-256;
+it does not serialize values to Debug/JSON text or assemble one large
+canonical buffer.
+
+The shared boundary accepts at most 1000 parameters and 1 MiB aggregate
+parameter payload bytes. The count is the existing frozen query-parameter
+cap, now sourced from `qk-core`; the 1 MiB aggregate bound matches the SQL
+analysis input budget while allowing realistic large binary values and
+bounding proxy-controlled hashing/memory. Exceeding either bound fails closed
+with a typed identity error before permit issuance. `ExecutionParam` Debug
+redacts all values; it has no Display/Serde representation. Approval storage
+continues to persist only binding kind and 32-byte digest; no schema change.
+
+Future wire mapping (not implemented here):
+
+```text
+PostgreSQL Parse → retain SQL + optional generic type hints per statement
+Bind → validate each value → ordered ExecutionParam::Wire(Text|Binary,
+       type_hint, exact bytes), with NULL represented distinctly
+Execute → authorize_guarded(SQL, ExecutionParams) → consume permit →
+          forward original executable message on the bound backend session
+```
+
+PostgreSQL ingress must use this shared Exact V2 encoder and must not add a
+proxy-local digest. MySQL `COM_STMT_EXECUTE` will use the same
+`ExecutionParam` identity model; this task adds no MySQL protocol behavior.

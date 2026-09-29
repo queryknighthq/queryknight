@@ -9,8 +9,8 @@
 
 use qk_approval::{ApprovalId, ApprovalScope, ResolveRequest};
 use qk_core::{
-    evaluate, Decision, DigestParam, EvaluateOptions, EvaluationRequest, ExactDigest,
-    ExecutionContext, PolicyFile, QueryShapeFingerprint, ReasonCode,
+    evaluate, Decision, EvaluateOptions, EvaluationRequest, ExactDigest, ExecutionContext,
+    PolicyFile, QueryShapeFingerprint, ReasonCode,
 };
 use qk_sql::SqlDialect;
 
@@ -44,16 +44,116 @@ pub struct GuardedAuthorizationCall<'a, 'b> {
 /// authorization identity.
 #[derive(Debug, Clone)]
 pub struct AuthorizationRequest {
-    /// Untrusted SQL text (or empty when paging via `cursor`).
+    /// SQL under authorization.
     pub sql: String,
-    /// Bound parameters as JSON scalars (never interpolated).
-    pub params: Vec<serde_json::Value>,
+    /// Protocol-neutral ordered execution identity parameters.
+    pub params: Vec<qk_core::ExecutionParam>,
+    /// Original JSON driver values retained only for qk-db execution.
+    pub(crate) driver_params: Vec<serde_json::Value>,
     /// Retry with a previously issued approval id.
     pub approval_id: Option<String>,
-    /// Requested row cap (clamped into the budget at execution).
+    /// Requested row cap.
     pub max_rows: Option<usize>,
-    /// Continuation cursor from a previous truncated SELECT.
+    /// Continuation cursor.
     pub cursor: Option<String>,
+}
+impl AuthorizationRequest {
+    /// Build an authorization-only request from protocol-neutral values.
+    /// The caller retains its original executable message for forwarding.
+    pub fn new(sql: impl Into<String>, params: Vec<qk_core::ExecutionParam>) -> Self {
+        Self {
+            sql: sql.into(),
+            params,
+            driver_params: Vec::new(),
+            approval_id: None,
+            max_rows: None,
+            cursor: None,
+        }
+    }
+
+    pub(crate) fn from_json(
+        sql: String,
+        params: Vec<serde_json::Value>,
+        approval_id: Option<String>,
+        max_rows: Option<usize>,
+        cursor: Option<String>,
+    ) -> Result<Self, DbError> {
+        validate_json_param_size(&params)?;
+        Ok(Self {
+            params: execution_identity_params(&params),
+            sql,
+            driver_params: params,
+            approval_id,
+            max_rows,
+            cursor,
+        })
+    }
+}
+
+fn validate_json_param_size(params: &[serde_json::Value]) -> Result<(), DbError> {
+    use qk_core::{MAX_EXECUTION_PARAMS, MAX_EXECUTION_PARAM_BYTES};
+    if params.len() > MAX_EXECUTION_PARAMS {
+        return Err(DbError::new(
+            DbErrorKind::Query,
+            format!("too many query parameters (max {MAX_PARAMS})"),
+        ));
+    }
+    let mut total = 0usize;
+    for param in params {
+        let size = match param {
+            serde_json::Value::String(value) => value.len(),
+            serde_json::Value::Null | serde_json::Value::Bool(_) => 0,
+            serde_json::Value::Number(value)
+                if value.as_i64().is_some()
+                    || value.as_u64().is_some()
+                    || value.as_f64().is_some() =>
+            {
+                8
+            }
+            value => {
+                let remaining = MAX_EXECUTION_PARAM_BYTES.saturating_sub(total);
+                let mut writer = LimitedCounter {
+                    written: 0,
+                    limit: remaining,
+                };
+                if serde_json::to_writer(&mut writer, value).is_err() {
+                    return Err(parameter_bytes_error());
+                }
+                writer.written
+            }
+        };
+        total = total.saturating_add(size);
+        if total > MAX_EXECUTION_PARAM_BYTES {
+            return Err(parameter_bytes_error());
+        }
+    }
+    Ok(())
+}
+
+fn parameter_bytes_error() -> DbError {
+    DbError::new(
+        DbErrorKind::Query,
+        "query parameter identity exceeds the 1 MiB limit",
+    )
+}
+
+struct LimitedCounter {
+    written: usize,
+    limit: usize,
+}
+
+impl std::io::Write for LimitedCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.written.saturating_add(bytes.len()) > self.limit {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        self.written += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Whether authorization may resolve approvals (contact providers).
@@ -156,15 +256,21 @@ pub fn authorize_guarded(
 ) -> AuthorizationOutcome {
     // Cursor paging reuses stored SQL; the resolved text is what gets
     // evaluated (never trust the cursor blindly).
-    let (sql, params, offset) = match resolve_cursor(cursors, request, call.connection_key) {
-        Ok(resolved) => resolved,
-        Err(error) => return AuthorizationOutcome::Failed(error),
-    };
-    if params.len() > MAX_PARAMS {
-        return AuthorizationOutcome::Failed(DbError::new(
-            DbErrorKind::Query,
-            format!("too many query parameters (max {MAX_PARAMS})"),
-        ));
+    let (sql, driver_params, identity_params, offset) =
+        match resolve_cursor(cursors, request, call.connection_key) {
+            Ok(resolved) => resolved,
+            Err(error) => return AuthorizationOutcome::Failed(error),
+        };
+    if let Err(error) = qk_core::validate_execution_params(&identity_params) {
+        let message = match error {
+            qk_core::ExecutionIdentityError::TooManyParameters => {
+                format!("too many query parameters (max {MAX_PARAMS})")
+            }
+            qk_core::ExecutionIdentityError::ParametersTooLarge => {
+                "query parameter identity exceeds the 1 MiB limit".to_owned()
+            }
+        };
+        return AuthorizationOutcome::Failed(DbError::new(DbErrorKind::Query, message));
     }
     let context = call.auth.execution_context();
     let evaluation = evaluate(
@@ -196,14 +302,15 @@ pub fn authorize_guarded(
             call,
             &evaluation,
             &sql,
-            &params,
+            &identity_params,
             request.approval_id.as_deref(),
         ) {
             Resolve::Executable(resolved) => {
                 return permit_for(
                     call,
                     &sql,
-                    &params,
+                    &identity_params,
+                    &driver_params,
                     offset,
                     request,
                     resolved.approval_id,
@@ -218,7 +325,8 @@ pub fn authorize_guarded(
     permit_for(
         call,
         &sql,
-        &params,
+        &identity_params,
+        &driver_params,
         offset,
         request,
         None,
@@ -232,62 +340,69 @@ pub fn authorize_guarded(
 fn permit_for(
     call: &GuardedAuthorizationCall<'_, '_>,
     sql: &str,
-    params: &[serde_json::Value],
+    identity_params: &[qk_core::ExecutionParam],
+    driver_params: &[serde_json::Value],
     offset: u64,
     request: &AuthorizationRequest,
     approval_id: Option<qk_approval::ApprovalId>,
     reason_code: ReasonCode,
     matched_policy: Option<String>,
 ) -> AuthorizationOutcome {
+    let exact = if identity_params.is_empty() {
+        qk_core::ExactDigest::V1(qk_core::exact_request_digest(call.config.dialect(), sql))
+    } else {
+        match qk_core::exact_request_digest_v2(call.config.dialect(), sql, identity_params) {
+            Ok(digest) => qk_core::ExactDigest::V2(digest),
+            Err(_) => {
+                return AuthorizationOutcome::Failed(DbError::new(
+                    DbErrorKind::Query,
+                    "query parameter identity exceeds supported limits",
+                ))
+            }
+        }
+    };
     AuthorizationOutcome::Permitted(Box::new(ExecutionPermit {
         dialect: call.config.dialect(),
         shape: qk_core::sql_fingerprint(sql),
-        exact: exact_for(call.config.dialect(), sql, params),
+        exact,
         scope: scope_of(&call.auth.execution_context()),
         reason_code,
         matched_policy,
         approval_id,
         sql: sql.to_owned(),
-        params: params.to_vec(),
+        params: driver_params.to_vec(),
         offset,
         max_rows: request.max_rows,
         connection_key: call.connection_key.to_owned(),
     }))
 }
 
-/// Exact identity for a request (V1 when param-less, V2 otherwise).
-fn exact_for(dialect: SqlDialect, sql: &str, params: &[serde_json::Value]) -> qk_core::ExactDigest {
-    let digest: Vec<DigestParam> = params.iter().map(param_to_digest).collect();
-    if digest.is_empty() {
-        qk_core::ExactDigest::V1(qk_core::exact_request_digest(dialect, sql))
-    } else {
-        qk_core::ExactDigest::V2(qk_core::exact_request_digest_v2(dialect, sql, &digest))
-    }
+/// Convert existing qk-db JSON parameters into shared identity values.
+/// The original JSON values remain the driver-binding source.
+pub(crate) fn execution_identity_params(
+    params: &[serde_json::Value],
+) -> Vec<qk_core::ExecutionParam> {
+    params.iter().map(param_to_digest).collect()
 }
 
-/// Canonical digest parameter from a JSON scalar: the same typed
-/// value the driver will bind (integers keep integer precision —
-/// never routed through f64 for identity).
-pub(crate) fn param_to_digest(value: &serde_json::Value) -> DigestParam {
+fn param_to_digest(value: &serde_json::Value) -> qk_core::ExecutionParam {
+    use qk_core::ExecutionParam as P;
     match value {
-        serde_json::Value::Null => DigestParam::Null,
-        serde_json::Value::Bool(value) => DigestParam::Bool(*value),
+        serde_json::Value::Null => P::Null,
+        serde_json::Value::Bool(value) => P::Bool(*value),
         serde_json::Value::Number(value) => {
             if let Some(int) = value.as_i64() {
-                DigestParam::Int(int)
+                P::Int(int)
             } else if let Some(uint) = value.as_u64() {
-                DigestParam::UInt(uint)
+                P::UInt(uint)
             } else if let Some(float) = value.as_f64() {
-                DigestParam::FloatBits(float.to_bits())
+                P::FloatBits(float.to_bits())
             } else {
-                DigestParam::Text(value.to_string())
+                P::Text(value.to_string())
             }
         }
-        serde_json::Value::String(text) => DigestParam::Text(text.clone()),
-        // Compound values cannot bind as params (rejected later by
-        // driver conversion); digest them by canonical JSON text so
-        // they still perturb identity deterministically.
-        other => DigestParam::Text(other.to_string()),
+        serde_json::Value::String(text) => P::Text(text.clone()),
+        other => P::Text(other.to_string()),
     }
 }
 
@@ -302,20 +417,34 @@ fn scope_of(context: &ExecutionContext) -> ApprovalScope {
     }
 }
 
-/// Resolve cursor-or-direct input into (sql, params, offset), mirroring
-/// the frozen `input.cursor && !sql` branch.
+/// Resolve cursor-or-direct input into SQL, driver values, identity values,
+/// and offset, mirroring the frozen `input.cursor && !sql` branch.
 fn resolve_cursor(
     cursors: &CursorStore,
     request: &AuthorizationRequest,
     connection_key: &str,
-) -> Result<(String, Vec<serde_json::Value>, u64), DbError> {
+) -> Result<
+    (
+        String,
+        Vec<serde_json::Value>,
+        Vec<qk_core::ExecutionParam>,
+        u64,
+    ),
+    DbError,
+> {
     if let Some(cursor_id) = request.cursor.as_deref() {
         if request.sql.trim().is_empty() {
             let stored = cursors.read(cursor_id, connection_key)?;
-            return Ok((stored.sql, stored.params, stored.offset));
+            let identities = execution_identity_params(&stored.params);
+            return Ok((stored.sql, stored.params, identities, stored.offset));
         }
     }
-    Ok((request.sql.clone(), request.params.clone(), 0))
+    Ok((
+        request.sql.clone(),
+        request.driver_params.clone(),
+        request.params.clone(),
+        0,
+    ))
 }
 
 /// Internal resolution verdict: executable (with facts) or a final
@@ -329,11 +458,9 @@ fn resolve_approval(
     call: &GuardedAuthorizationCall<'_, '_>,
     evaluation: &qk_core::EvaluationResult,
     sql: &str,
-    params: &[serde_json::Value],
+    params: &[qk_core::ExecutionParam],
     approval_id: Option<&str>,
 ) -> Resolve {
-    // Fail closed rather than panic if approval wiring is missing: a
-    // caller bug must never become an implicit Allow.
     let Some(setup) = call.approval else {
         return Resolve::Outcome(Box::new(AuthorizationOutcome::Failed(DbError::new(
             DbErrorKind::Query,
@@ -341,14 +468,13 @@ fn resolve_approval(
         ))));
     };
     let context = call.auth.execution_context();
-    let digest: Vec<DigestParam> = params.iter().map(param_to_digest).collect();
     let resolved = qk_approval::resolve(
         &ResolveRequest {
             evaluation,
             context: &context,
             dialect: call.config.dialect(),
             sql,
-            params: &digest,
+            params,
             approval_id,
             ttl_ms: setup.ttl_ms,
             now_ms: setup.now_ms,
@@ -387,5 +513,40 @@ fn resolve_approval(
         | ResolutionOutcome::ProviderUnavailable
         | ResolutionOutcome::ProviderError
         | ResolutionOutcome::NotRequired => Resolve::Outcome(Box::new(blocked())),
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{execution_identity_params, validate_json_param_size};
+    use qk_core::{exact_request_digest_v2, ExecutionParam, MAX_EXECUTION_PARAM_BYTES};
+
+    #[test]
+    fn json_parameter_identity_preserves_old_logical_v2_bytes() {
+        let params = execution_identity_params(&[serde_json::json!(42)]);
+        assert_eq!(params, [ExecutionParam::Int(42)]);
+        assert_eq!(
+            exact_request_digest_v2(
+                qk_sql::SqlDialect::PostgreSql,
+                "DELETE FROM customers WHERE id = ?",
+                &params,
+            )
+            .expect("bounded"),
+            qk_core::ExactRequestDigestV2::from_bytes([
+                0xd6, 0x4c, 0xe1, 0xe2, 0x4d, 0x23, 0xea, 0xce, 0x00, 0x75, 0x08, 0xbe, 0x10, 0x9f,
+                0x22, 0xb3, 0x99, 0x72, 0xd9, 0x06, 0xeb, 0x6e, 0xe9, 0x80, 0xfc, 0x36, 0xfa, 0xc0,
+                0x51, 0x7e, 0x27, 0x9b,
+            ])
+        );
+    }
+
+    #[test]
+    fn json_input_budget_rejects_before_identity_copy() {
+        let secret = "x".repeat(MAX_EXECUTION_PARAM_BYTES + 1);
+        let error = validate_json_param_size(&[serde_json::Value::String(secret)]).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "query parameter identity exceeds the 1 MiB limit"
+        );
     }
 }

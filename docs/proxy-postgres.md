@@ -39,9 +39,28 @@ Rust intentionally hardens unsafe/missing reference behavior: exact permit for e
 ### Specific semantic decisions
 
 - PostgreSQL Parse performs syntax analysis and parse analysis, may resolve names/types and access catalogs; planning/execution generally occurs later. It is not SQL execution, but Parse/Describe can disclose metadata and should not be treated as execution permit-bearing operations. Rust documents this deliberate metadata exposure and never allows Parse to authorize an Execute.
-- Bind captures the actual parameter values and format codes; the proxy stores secret bytes in bounded typed state and never formats them. Text is represented as `DigestParam::Text`; binary as `DigestParam::Bytes`; NULL as `DigestParam::Null`. Parameter format and declared OID must also be framed into identity to avoid unsafe collapse; this needs a small shared `DigestParam` extension if format/type tags cannot be encoded as additional ordered framed values without ambiguity.
+- Bind captures actual parameter values and format codes; future proxy state must keep secret bytes bounded and unformatted. It will map text/binary values to shared `ExecutionParam::Wire` with optional generic `type_hint`; NULL remains `ExecutionParam::Null` (never inferred from empty bytes). This identity type and the canonical Exact V2 encoder are now available in qk-core; no protocol-specific digest extension is needed.
 - Simple Query authorizes the entire decoded SQL request, including all statements; no partial forwarding. The forwarded frame is the original Q frame whose C-string SQL is the exact bytes analyzed. Empty Q is synthesized per PostgreSQL (`I`/empty response) and does not invoke authorization.
 - No persistent permit cache. Every Execute attempt, including a portal resumed after PortalSuspended, authorizes again.
 - Startup user/database/options cannot redirect backend target or change trusted role/search path/options. Configured backend host/database identity is the security context. Frontend authentication remains relayed only where compatible with the trusted backend startup identity.
 - Backend TLS: TS reference does not implement it. Rust must reject a TLS-required configuration unless clean maintained TLS transport is available; never silently downgrade.
 - COPY FROM STDIN, FunctionCall, replication, GSSENC, unvalidated CancelRequest are rejected rather than passed through.
+
+## Future shared-identity boundary
+
+A future PostgreSQL adapter must:
+
+```text
+Parse: retain statement SQL and optional generic parameter type hints
+Bind: validate each value and format; create ordered ExecutionParam::Wire
+      { Text|Binary, type_hint, exact bytes }; represent NULL distinctly
+Execute: resolve current portal SQL + values → authorize_guarded
+         → shared Exact V2 → consume ExecutionPermit → forward original
+         Execute on the same backend session
+```
+
+Wire text and binary bytes are hashed exactly as represented, without UTF-8,
+base64, or hex conversion. The shared encoder owns representation/type framing;
+the future proxy MUST NOT implement another digest. MySQL
+`COM_STMT_EXECUTE` will use the same protocol-neutral identity type. No proxy
+protocol code is included in this prerequisite.

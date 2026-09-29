@@ -121,31 +121,46 @@ pub fn exact_request_digest(dialect: SqlDialect, sql: &str) -> ExactRequestDiges
 /// comparable without checking the version first.
 const DIGEST_DOMAIN_V2: &[u8] = b"queryknight:approval-request:v2\x00";
 
-/// Canonical bound-parameter value for exact identity. Mirrors the
-/// typed value passed to the driver (never a `Debug` rendering, never
-/// JSON object text): order matters, types are tagged, and every
-/// value is length-framed so concatenations cannot blur.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DigestParam {
+/// Protocol-neutral exact identity for one executable parameter. Values
+/// are secret-bearing; Debug reports only kind and byte length.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ExecutionParam {
     /// SQL NULL.
     Null,
     /// Boolean.
     Bool(bool),
-    /// Signed integer (driver `i64`; exact bits preserved).
+    /// Signed integer (exact bits).
     Int(i64),
-    /// Unsigned integer (driver `u64`; exact bits preserved).
+    /// Unsigned integer (exact bits).
     UInt(u64),
-    /// Binary float by exact bit pattern (`1.0` and `1.00` share
-    /// bits and therefore identity — the driver sees one value).
+    /// Floating point value represented by its exact bits.
     FloatBits(u64),
-    /// Text (UTF-8 bytes verbatim).
+    /// Logical UTF-8 text value.
     Text(String),
-    /// Raw bytes verbatim.
+    /// Logical raw bytes.
     Bytes(Vec<u8>),
+    /// Protocol text or binary value, preserving representation and
+    /// optional stable interpretation metadata.
+    Wire {
+        /// Text or binary wire representation.
+        representation: ParamRepresentation,
+        /// Protocol-neutral type metadata when supplied by the ingress.
+        type_hint: Option<u32>,
+        /// Exact wire payload bytes (not UTF-8 decoded).
+        bytes: Vec<u8>,
+    },
 }
 
-impl DigestParam {
-    /// Type tag byte for framed encoding.
+/// Wire value representation used in Exact V2 identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamRepresentation {
+    /// Text-encoded wire value.
+    Text,
+    /// Binary wire value.
+    Binary,
+}
+
+impl ExecutionParam {
     fn tag(&self) -> u8 {
         match self {
             Self::Null => 0x00,
@@ -156,21 +171,82 @@ impl DigestParam {
             Self::FloatBits(_) => 0x05,
             Self::Text(_) => 0x06,
             Self::Bytes(_) => 0x07,
+            Self::Wire { .. } => 0x08,
         }
     }
 
-    /// Canonical value bytes (fixed width for numbers, verbatim for
-    /// text/bytes, empty for null/bool which the tag already covers).
-    fn bytes(&self) -> Vec<u8> {
+    fn logical_bytes(&self) -> &[u8] {
         match self {
-            Self::Null | Self::Bool(_) => Vec::new(),
-            Self::Int(value) => value.to_be_bytes().to_vec(),
-            Self::UInt(value) => value.to_be_bytes().to_vec(),
-            Self::FloatBits(bits) => bits.to_be_bytes().to_vec(),
-            Self::Text(text) => text.as_bytes().to_vec(),
-            Self::Bytes(bytes) => bytes.clone(),
+            Self::Null | Self::Bool(_) => &[],
+            Self::Int(_) | Self::UInt(_) | Self::FloatBits(_) => &[],
+            Self::Text(text) => text.as_bytes(),
+            Self::Bytes(bytes) => bytes,
+            Self::Wire { .. } => &[],
         }
     }
+
+    fn payload_len(&self) -> usize {
+        match self {
+            Self::Null | Self::Bool(_) => 0,
+            Self::Int(_) | Self::UInt(_) | Self::FloatBits(_) => 8,
+            Self::Text(text) => text.len(),
+            Self::Bytes(bytes) | Self::Wire { bytes, .. } => bytes.len(),
+        }
+    }
+}
+
+impl fmt::Debug for ExecutionParam {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => f.write_str("ExecutionParam::Null"),
+            Self::Bool(_) => f.write_str("ExecutionParam::Bool(<redacted>)"),
+            Self::Int(_) => f.write_str("ExecutionParam::Int(<redacted: 8 bytes>)"),
+            Self::UInt(_) => f.write_str("ExecutionParam::UInt(<redacted: 8 bytes>)"),
+            Self::FloatBits(_) => f.write_str("ExecutionParam::FloatBits(<redacted: 8 bytes>)"),
+            Self::Text(value) => write!(f, "ExecutionParam::Text(<redacted: {} bytes>)", value.len()),
+            Self::Bytes(value) => write!(f, "ExecutionParam::Bytes(<redacted: {} bytes>)", value.len()),
+            Self::Wire { representation, type_hint, bytes } => write!(
+                f,
+                "ExecutionParam::Wire({representation:?}, type_hint: {type_hint:?}, <redacted: {} bytes>)",
+                bytes.len()
+            ),
+        }
+    }
+}
+
+/// Source-compatible name for the former logical digest parameter type.
+pub type DigestParam = ExecutionParam;
+
+/// Maximum aggregate parameter payload bytes accepted for exact identity.
+/// Equal to the frozen SQL analysis budget: 1 MiB.
+pub const MAX_EXECUTION_PARAM_BYTES: usize = 1024 * 1024;
+
+/// Maximum number of ordered execution parameters accepted by the identity
+/// boundary. Shared by all adapters.
+pub const MAX_EXECUTION_PARAMS: usize = 1000;
+
+/// Typed failure for unsafe or oversized exact-identity inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionIdentityError {
+    /// More than the shared 1000-parameter cap.
+    TooManyParameters,
+    /// Aggregate value bytes exceed [`MAX_EXECUTION_PARAM_BYTES`].
+    ParametersTooLarge,
+}
+
+/// Validate count and aggregate raw payload bytes before hashing.
+pub fn validate_execution_params(params: &[ExecutionParam]) -> Result<(), ExecutionIdentityError> {
+    if params.len() > MAX_EXECUTION_PARAMS {
+        return Err(ExecutionIdentityError::TooManyParameters);
+    }
+    let mut total = 0usize;
+    for param in params {
+        total = total.saturating_add(param.payload_len());
+        if total > MAX_EXECUTION_PARAM_BYTES {
+            return Err(ExecutionIdentityError::ParametersTooLarge);
+        }
+    }
+    Ok(())
 }
 
 /// Parameter-aware exact request identity: full SHA-256 over a
@@ -213,35 +289,60 @@ impl ExactRequestDigestV2 {
     }
 }
 
+fn push_len(hasher: &mut Sha256, len: usize) {
+    hasher.update(u32::try_from(len).unwrap_or(u32::MAX).to_be_bytes());
+}
+
 fn push_framed(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update(u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_be_bytes());
+    push_len(hasher, bytes.len());
     hasher.update(bytes);
 }
 
-/// Compute the parameter-aware exact digest. Empty `params` still
-/// produces a V2 digest (callers select V1 vs V2; see
-/// [`RequestIdentity`]).
-#[must_use]
+/// Compute the bounded parameter-aware exact digest. Logical values retain
+/// the original V2 bytes; wire values use a reserved tag and framed metadata.
 pub fn exact_request_digest_v2(
     dialect: SqlDialect,
     sql: &str,
-    params: &[DigestParam],
-) -> ExactRequestDigestV2 {
+    params: &[ExecutionParam],
+) -> Result<ExactRequestDigestV2, ExecutionIdentityError> {
+    validate_execution_params(params)?;
     let mut hasher = Sha256::new();
     hasher.update(DIGEST_DOMAIN_V2);
     push_framed(&mut hasher, dialect.to_string().as_bytes());
     push_framed(&mut hasher, sql.as_bytes());
-    hasher.update(
-        u32::try_from(params.len())
-            .unwrap_or(u32::MAX)
-            .to_be_bytes(),
-    );
+    push_len(&mut hasher, params.len());
     for param in params {
         hasher.update([param.tag()]);
-        push_framed(&mut hasher, &param.bytes());
+        match param {
+            ExecutionParam::Null | ExecutionParam::Bool(_) => push_len(&mut hasher, 0),
+            ExecutionParam::Int(value) => push_framed(&mut hasher, &value.to_be_bytes()),
+            ExecutionParam::UInt(value) | ExecutionParam::FloatBits(value) => {
+                push_framed(&mut hasher, &value.to_be_bytes())
+            }
+            ExecutionParam::Text(_) | ExecutionParam::Bytes(_) => {
+                push_framed(&mut hasher, param.logical_bytes())
+            }
+            ExecutionParam::Wire {
+                representation,
+                type_hint,
+                bytes,
+            } => {
+                let mut metadata = [0u8; 6];
+                metadata[0] = match representation {
+                    ParamRepresentation::Text => 0,
+                    ParamRepresentation::Binary => 1,
+                };
+                if let Some(type_hint) = type_hint {
+                    metadata[1] = 1;
+                    metadata[2..].copy_from_slice(&type_hint.to_be_bytes());
+                }
+                push_framed(&mut hasher, &metadata);
+                push_framed(&mut hasher, bytes);
+            }
+        }
     }
     let bytes: [u8; 32] = hasher.finalize().into();
-    ExactRequestDigestV2(bytes)
+    Ok(ExactRequestDigestV2(bytes))
 }
 
 /// Versioned exact execution identity. V1 binds dialect + SQL only
@@ -306,8 +407,9 @@ pub fn sql_fingerprint(sql: &str) -> QueryShapeFingerprint {
 #[cfg(test)]
 mod tests {
     use super::{
-        exact_request_digest, exact_request_digest_v2, normalize_sql, sql_fingerprint, DigestParam,
-        ExactDigest,
+        exact_request_digest, exact_request_digest_v2, normalize_sql, sql_fingerprint,
+        validate_execution_params, DigestParam, ExactDigest, ExecutionIdentityError,
+        ExecutionParam, ParamRepresentation, MAX_EXECUTION_PARAM_BYTES,
     };
     use qk_sql::SqlDialect;
 
@@ -329,7 +431,7 @@ mod tests {
         assert_eq!(ExactDigest::V1(v1).version(), "exact_v1");
         // V1 and V2 never collide by construction (distinct domains).
         let v2 = exact_request_digest_v2(SqlDialect::Sqlite, "DELETE FROM t WHERE id = 42", &[]);
-        assert_ne!(v1.as_bytes(), v2.as_bytes());
+        assert_ne!(v1.as_bytes(), v2.expect("bounded").as_bytes());
     }
 
     /// V2 parameter matrix (§21): order, type, and value sensitive;
@@ -409,8 +511,11 @@ mod tests {
             exact_request_digest_v2(d, sql, &many),
             exact_request_digest_v2(d, sql, &many)
         );
-        assert_eq!(ExactDigest::V2(base()).version(), "exact_v2");
-        assert_eq!(base().to_hex().len(), 64);
+        assert_eq!(
+            ExactDigest::V2(base().expect("bounded")).version(),
+            "exact_v2"
+        );
+        assert_eq!(base().expect("bounded").to_hex().len(), 64);
     }
 
     /// Vectors captured from the TypeScript oracle (2026-09-28).
@@ -523,5 +628,160 @@ mod tests {
             sel.to_hex(),
             "2d57fd23069370db8a3240bf60d22bcc57901de9ac0b6f87a353298dbad506e4"
         );
+    }
+    #[test]
+    fn execution_param_preserves_v2_compatibility_and_wire_distinctions() {
+        use ExecutionParam as P;
+        use ParamRepresentation::{Binary, Text};
+        let dialect = SqlDialect::PostgreSql;
+        let sql = "DELETE FROM customers WHERE id = ?";
+        let old_logical =
+            exact_request_digest_v2(dialect, sql, &[DigestParam::Int(42)]).expect("bounded vector");
+        assert_eq!(
+            old_logical.to_hex(),
+            "d64ce1e24d23eace007508be109f22b39972d906eb6ee980fc36fac0517e279b"
+        );
+        let text42 = P::Wire {
+            representation: Text,
+            type_hint: None,
+            bytes: b"42".to_vec(),
+        };
+        let text43 = P::Wire {
+            representation: Text,
+            type_hint: None,
+            bytes: b"43".to_vec(),
+        };
+        let binary42 = P::Wire {
+            representation: Binary,
+            type_hint: None,
+            bytes: b"42".to_vec(),
+        };
+        assert_ne!(
+            exact_request_digest_v2(dialect, sql, std::slice::from_ref(&text42)),
+            exact_request_digest_v2(dialect, sql, &[text43])
+        );
+        assert_ne!(
+            exact_request_digest_v2(dialect, sql, std::slice::from_ref(&text42)),
+            exact_request_digest_v2(dialect, sql, &[binary42])
+        );
+        assert_ne!(
+            exact_request_digest_v2(dialect, sql, std::slice::from_ref(&text42)),
+            exact_request_digest_v2(
+                dialect,
+                sql,
+                &[P::Wire {
+                    representation: Text,
+                    type_hint: Some(23),
+                    bytes: b"42".to_vec()
+                }]
+            )
+        );
+        assert_ne!(
+            exact_request_digest_v2(dialect, sql, &[P::Null]),
+            exact_request_digest_v2(
+                dialect,
+                sql,
+                &[P::Wire {
+                    representation: Text,
+                    type_hint: None,
+                    bytes: vec![]
+                }]
+            )
+        );
+        assert_ne!(
+            exact_request_digest_v2(
+                dialect,
+                sql,
+                &[P::Wire {
+                    representation: Binary,
+                    type_hint: None,
+                    bytes: vec![]
+                }]
+            ),
+            exact_request_digest_v2(dialect, sql, &[P::Bytes(vec![])])
+        );
+        let non_utf8 = P::Wire {
+            representation: Binary,
+            type_hint: Some(17),
+            bytes: vec![0, 0x80, 0xff],
+        };
+        assert_eq!(
+            exact_request_digest_v2(dialect, sql, std::slice::from_ref(&non_utf8)),
+            exact_request_digest_v2(dialect, sql, &[non_utf8])
+        );
+        assert_ne!(
+            exact_request_digest_v2(dialect, sql, &[P::Int(42), P::Text("x".to_owned())]),
+            exact_request_digest_v2(dialect, sql, &[P::Text("x".to_owned()), P::Int(42)])
+        );
+        assert_ne!(
+            exact_request_digest_v2(
+                dialect,
+                sql,
+                &[P::Text("ab".to_owned()), P::Text("c".to_owned())]
+            ),
+            exact_request_digest_v2(
+                dialect,
+                sql,
+                &[P::Text("a".to_owned()), P::Text("bc".to_owned())]
+            )
+        );
+        assert_ne!(
+            exact_request_digest_v2(dialect, sql, &[P::Text("abc".to_owned())]),
+            exact_request_digest_v2(
+                dialect,
+                sql,
+                &[P::Text("a".to_owned()), P::Text("bc".to_owned())]
+            )
+        );
+        assert_ne!(
+            exact_request_digest_v2(dialect, sql, &[P::Int(42)]),
+            exact_request_digest_v2(SqlDialect::MySql, sql, &[P::Int(42)])
+        );
+        let text_non_utf8 = P::Wire {
+            representation: Text,
+            type_hint: None,
+            bytes: vec![0, 0x80, 0xff],
+        };
+        assert_eq!(
+            exact_request_digest_v2(dialect, sql, std::slice::from_ref(&text_non_utf8)),
+            exact_request_digest_v2(dialect, sql, &[text_non_utf8])
+        );
+        assert_ne!(
+            exact_request_digest_v2(dialect, sql, &[P::Null]),
+            exact_request_digest_v2(dialect, sql, &[P::Text("NULL".to_owned())])
+        );
+        assert_ne!(
+            exact_request_digest_v2(dialect, sql, &[P::Int(42)]),
+            exact_request_digest_v2(SqlDialect::Sqlite, sql, &[P::Int(42)])
+        );
+    }
+
+    #[test]
+    fn execution_param_limits_and_debug_are_fail_closed_and_redacted() {
+        let valid = vec![ExecutionParam::Wire {
+            representation: ParamRepresentation::Binary,
+            type_hint: None,
+            bytes: vec![0x5a; MAX_EXECUTION_PARAM_BYTES],
+        }];
+        assert!(validate_execution_params(&valid).is_ok());
+        let too_large = vec![ExecutionParam::Bytes(vec![
+            0;
+            MAX_EXECUTION_PARAM_BYTES + 1
+        ])];
+        assert_eq!(
+            exact_request_digest_v2(SqlDialect::PostgreSql, "SELECT $1", &too_large),
+            Err(ExecutionIdentityError::ParametersTooLarge)
+        );
+        let too_many = vec![ExecutionParam::Null; super::MAX_EXECUTION_PARAMS + 1];
+        assert_eq!(
+            validate_execution_params(&too_many),
+            Err(ExecutionIdentityError::TooManyParameters)
+        );
+        let secret = ExecutionParam::Wire {
+            representation: ParamRepresentation::Text,
+            type_hint: Some(25),
+            bytes: b"PARAM_WIRE_SECRET_12345".to_vec(),
+        };
+        assert!(!format!("{secret:?}").contains("PARAM_WIRE_SECRET_12345"));
     }
 }

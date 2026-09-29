@@ -963,7 +963,8 @@ fn v2_param_change_rejects() {
     let (evaluation, context, _) = require_approval();
     let store = InMemoryApprovalStore::new();
     let params = [DigestParam::Int(42)];
-    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::PostgreSql, SQL, &params);
+    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::PostgreSql, SQL, &params)
+        .expect("bounded fixture");
     store
         .insert_grant(approved_grant(
             "qka-v2",
@@ -1017,7 +1018,8 @@ fn v2_dialect_change_rejects() {
     let (evaluation, context, _) = require_approval();
     let store = InMemoryApprovalStore::new();
     let params = [DigestParam::Int(42)];
-    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::PostgreSql, SQL, &params);
+    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::PostgreSql, SQL, &params)
+        .expect("bounded fixture");
     store
         .insert_grant(approved_grant(
             "qka-v2d",
@@ -1050,7 +1052,8 @@ fn session_v2_reuses_param_variants() {
     let (evaluation, context, _) = require_approval();
     let store = InMemoryApprovalStore::new();
     let params = [DigestParam::Int(42)];
-    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::PostgreSql, SQL, &params);
+    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::PostgreSql, SQL, &params)
+        .expect("bounded fixture");
     store
         .insert_grant(approved_grant(
             "qka-sess",
@@ -1108,11 +1111,14 @@ fn binding_helpers() {
     ));
     assert!(v1.is_fully_bound() && !v1.is_legacy());
     assert_eq!(v1.version(), "exact_v1");
-    let v2 = ApprovalBinding::ExactV2(qk_core::exact_request_digest_v2(
-        qk_sql::SqlDialect::Sqlite,
-        "SELECT 1",
-        &[DigestParam::Int(1)],
-    ));
+    let v2 = ApprovalBinding::ExactV2(
+        qk_core::exact_request_digest_v2(
+            qk_sql::SqlDialect::Sqlite,
+            "SELECT 1",
+            &[DigestParam::Int(1)],
+        )
+        .expect("bounded fixture"),
+    );
     assert!(v2.is_fully_bound() && !v2.is_legacy());
     assert_eq!(v2.version(), "exact_v2");
     assert!(!ApprovalBinding::LegacyShape.is_fully_bound());

@@ -1039,7 +1039,8 @@ fn v2_grant(
     params: &[qk_core::DigestParam],
     reuse: qk_approval::Scope,
 ) -> qk_approval::StoredGrant {
-    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::Sqlite, sql, params);
+    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::Sqlite, sql, params)
+        .expect("bounded fixture");
     qk_approval::StoredGrant {
         id: qk_approval::ApprovalId::new(id.to_owned()),
         shape: qk_core::sql_fingerprint(sql),

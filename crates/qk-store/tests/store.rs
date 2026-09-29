@@ -921,7 +921,8 @@ fn unicode_event_round_trip() {
 // ---------------------------------------------------------------------------
 
 fn v2_grant(id: &str, sql: &str, params: &[qk_core::DigestParam]) -> StoredGrant {
-    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::Sqlite, sql, params);
+    let digest = qk_core::exact_request_digest_v2(qk_sql::SqlDialect::Sqlite, sql, params)
+        .expect("bounded fixture");
     StoredGrant {
         id: ApprovalId::new(id.to_owned()),
         shape: qk_core::sql_fingerprint(sql),

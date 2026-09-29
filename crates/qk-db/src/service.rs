@@ -234,6 +234,16 @@ impl ExecutionService {
         request: &ExecuteRequest,
     ) -> ExecutionOutcome {
         use crate::auth::{authorize_guarded, AuthorizationRequest, ResolveMode};
+        let auth_request = match AuthorizationRequest::from_json(
+            request.sql.clone(),
+            request.params.clone(),
+            request.approval_id.clone(),
+            request.max_rows,
+            request.cursor.clone(),
+        ) {
+            Ok(request) => request,
+            Err(error) => return ExecutionOutcome::Failed(error),
+        };
         let outcome = authorize_guarded(
             &self.cursors,
             &crate::auth::GuardedAuthorizationCall {
@@ -243,13 +253,7 @@ impl ExecutionService {
                 approval: Some(call.approval),
                 policy: call.policy,
             },
-            &AuthorizationRequest {
-                sql: request.sql.clone(),
-                params: request.params.clone(),
-                approval_id: request.approval_id.clone(),
-                max_rows: request.max_rows,
-                cursor: request.cursor.clone(),
-            },
+            &auth_request,
             ResolveMode::ResolveApprovals,
         );
         match outcome {
@@ -298,6 +302,16 @@ impl ExecutionService {
         params: &[serde_json::Value],
     ) -> ExecutionOutcome {
         use crate::auth::{authorize_guarded, AuthorizationRequest, ResolveMode};
+        let auth_request = match AuthorizationRequest::from_json(
+            sql.to_owned(),
+            params.to_vec(),
+            None,
+            None,
+            None,
+        ) {
+            Ok(request) => request,
+            Err(error) => return ExecutionOutcome::Failed(error),
+        };
         let outcome = authorize_guarded(
             &self.cursors,
             &crate::auth::GuardedAuthorizationCall {
@@ -309,13 +323,7 @@ impl ExecutionService {
                 approval: None,
                 policy: call.policy,
             },
-            &AuthorizationRequest {
-                sql: sql.to_owned(),
-                params: params.to_vec(),
-                approval_id: None,
-                max_rows: None,
-                cursor: None,
-            },
+            &auth_request,
             ResolveMode::EvaluateOnly,
         );
         let permit = match outcome {

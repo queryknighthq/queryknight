@@ -19,8 +19,8 @@
 //! for non-approval evaluations.
 
 use qk_core::{
-    exact_request_digest, exact_request_digest_v2, sql_fingerprint, Decision, DigestParam,
-    EvaluationResult, ExactDigest, ExecutionContext, QueryShapeFingerprint, ReasonCode,
+    exact_request_digest, sql_fingerprint, Decision, EvaluationResult, ExactDigest,
+    ExecutionContext, ExecutionParam, QueryShapeFingerprint, ReasonCode,
 };
 use qk_sql::SqlDialect;
 
@@ -48,10 +48,9 @@ pub struct ResolveRequest<'a> {
     pub dialect: SqlDialect,
     /// Untrusted SQL under evaluation (hashed, never stored raw).
     pub sql: &'a str,
-    /// Ordered bound parameters for exact identity (empty slice means
-    /// no params → Exact V1; non-empty → Exact V2). qk-db constructs
-    /// these from the actual driver-bound values.
-    pub params: &'a [DigestParam],
+    /// Protocol-neutral ordered values for exact identity (empty slice
+    /// means no params → Exact V1; non-empty → Exact V2).
+    pub params: &'a [ExecutionParam],
     /// Retry token: a previously issued approval id, if any.
     pub approval_id: Option<&'a str>,
     /// Lifetime for newly stored grants.
@@ -133,11 +132,19 @@ pub fn resolve(
     let exact = if request.params.is_empty() {
         ExactDigest::V1(exact_request_digest(request.dialect, request.sql))
     } else {
-        ExactDigest::V2(exact_request_digest_v2(
-            request.dialect,
-            request.sql,
-            request.params,
-        ))
+        match qk_core::exact_request_digest_v2(request.dialect, request.sql, request.params) {
+            Ok(digest) => ExactDigest::V2(digest),
+            Err(_) => {
+                return ResolvedEvaluation {
+                    decision: Decision::Deny,
+                    reason_code: ReasonCode::ApprovalError,
+                    message: "execution parameter identity exceeds supported limits".to_owned(),
+                    matched_policy: None,
+                    approval_id: None,
+                    outcome: ResolutionOutcome::ProviderError,
+                }
+            }
+        }
     };
     let scope = scope_of(request.context);
 
