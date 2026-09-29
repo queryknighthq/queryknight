@@ -1531,6 +1531,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "qk-control-plane"
+version = "0.1.0-beta.0"
+dependencies = [
+ "qk-approval",
+ "qk-core",
+ "qk-daemon",
+ "qk-sql",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "qk-core"
 version = "0.1.0"
 dependencies = [
@@ -1587,6 +1600,7 @@ dependencies = [
  "predicates",
  "qk-approval",
  "qk-audit",
+ "qk-control-plane",
  "qk-core",
  "qk-daemon",
  "qk-db",

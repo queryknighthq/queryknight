@@ -72,24 +72,97 @@ approval id, table identifiers.
 - `approvals_list` without daemon: `daemon unavailable; start
   queryknight`. Decide result: `approval <id>: <status>`.
 
-## Approvals via daemon
+## Daemon control-plane client and approval provider
 
-`qk-mcp` never opens the state DB. A sync daemon provider maps
-`ApprovalRequest` → daemon `POST /approvals` (new row, always
-waiting — the `wait:false` flow) and retry ids → `GET
-/approvals/{id}` verdicts (approved only with matching shape
-fingerprint; exact binding still enforced locally by
-`qk-approval`). A pre-check of `GET /allows` reuses daemon session
-grants without minting duplicate rows (mirrors
-`hasSessionAllow`). Session history: `POST /sessions` at startup
-(source `mcp`), `POST /events` per tool call (best-effort; failures
-never change outcomes, never re-execute).
+### Audited pre-extraction implementation
 
-Daemon discovery reuses `qk-daemon` runtime paths/token semantics
-(`QUERYKNIGHT_HOME`, `session.token`, pid-file port); Bearer header
-transport; bounded timeouts; redacted errors. Daemon down →
-history-less execution still works; approval tools degrade to the
-frozen unavailable text (never authorization success).
+Before extraction, daemon HTTP logic lived in `qk-mcp/src/daemon.rs`;
+session/history payload assembly lived in `history.rs`; discovery and
+approval-provider construction lived in `server.rs`. Runtime files and port
+records are owned by `qk-daemon::runtime`; MCP did not parse pid-file
+contents itself. Approval decisions and storage remain in
+`qk-approval`/`qk-daemon`/`qk-store`.
+
+- Discovery called `RuntimeSource { home, port: None }` and centralized
+  `runtime::paths::resolve`; explicit `home` won, else `QUERYKNIGHT_HOME`,
+  else `~/.queryknight`. It read `session.token` through
+  `runtime::token::read_token_raw`, UTF-8 decoded and trimmed it; empty,
+  unreadable, or non-UTF8 token disabled the endpoint.
+- URL precedence was `QUERYKNIGHT_DAEMON_URL` over pid-file port over the
+  resolved `QUERYKNIGHT_PORT`/default. A configured invalid URL failed
+  discovery with no fallback. The private parser accepted only the literal
+  `http://` prefix and loopback host names; because it splits on the first
+  colon, the effective accepted hosts were `127.0.0.1` and `localhost`
+  (neither raw nor bracketed IPv6 parsed successfully). It then connected to
+  `127.0.0.1` regardless of hostname. Without an override, `daemon.pid` port
+  was preferred; pid read/parse errors fell back to the resolved port.
+- HTTP was hand-written over `std::net::TcpStream`; no client library.
+  Connect, read, and write timeouts were each set to 5 seconds. These are
+  per-blocking-operation socket timeouts, not a guaranteed total request
+  deadline (a slow stream could extend `read_to_end`). Requests used
+  `Host: 127.0.0.1`, `Connection: close`, JSON content headers, and
+  `Authorization: Bearer …`; the token was not put in URL/path/query.
+  Response reads used unbounded `read_to_end`; `Content-Length` was parsed
+  when present, defaulted to zero when absent, and body bytes were required
+  to contain at least that length. No chunked-transfer parser existed.
+  JSON was decoded with `serde_json::from_slice`; response bodies were not
+  copied into errors. `DaemonFailure` was a content-free unit type. The old
+  `DaemonEndpoint` derived `Debug` and exposed its token; the shared client
+  redacts it. The shared client also reads at most the centralized 4 KiB
+  runtime token bound and caps HTTP headers at 32 KiB and responses at 1 MiB.
+- Status handling varied by operation: JSON POST accepted any 2xx; list and
+  GET approval/session-allow required 200. Missing/malformed fields became
+  generic failure, `None`, or `false`; approval lookups/verification and
+  session checks failed closed as waiting/false. MCP mapped list/decide
+  failures to fixed protocol errors, never daemon body text.
+- Generic operations were `POST /sessions`, `POST /events`, `GET /approvals`,
+  `GET /approvals/:id`, `POST /approvals`, `POST /approvals/:id/verify`,
+  `POST /approvals/:id/decide`, and `GET /allows`. Session creation used
+  `{connectionKey, source:"mcp"}`. `/events` carried the existing full-SQL
+  history payload and was best effort. Approvals-list JSON was formatted by
+  MCP. Decide used `{status, source:"mcp"}`.
+- Exact retries first checked fetched status, shape fingerprint, and binding
+  kind, then used POST verify with digest/version/full scope; only an approved
+  row plus a successful verify could return Approved. Digest traveled in the
+  POST body only; raw SQL/parameters never crossed this HTTP boundary.
+  Exact V1/V2 versions were checked by the daemon against stored typed
+  bindings; ShapeV1 could not satisfy exact verification; LegacyShape was
+  explicitly quarantined. The daemon verify route checked approved status,
+  `now < expires_at`, binding version, all 32 digest bytes, and full scope.
+- Explicit Session reuse used `/allows` with session, fingerprint, and all
+  trusted scope dimensions. The daemon store returned only live,
+  fully-bound session grants. The provider supplied a local-only approval id
+  so qk-approval could mint a new request-specific permit. Once retry with a
+  changed exact digest returned Waiting (fresh approval required), not
+  Approved. Denied approvals returned Denied; expired/unknown/malformed/
+  invalid-token responses never became Approved.
+- Provider-specific functions mapped risk/operation summary and created exact
+  bound waiting approvals. These, exact verification sequencing, and binding
+  interpretation are reusable control-plane/approval responsibilities.
+  MCP-specific responsibilities are history SQL classification/payload,
+  startup source `"mcp"`, approval-list presentation, and user-facing fixed
+  protocol error text.
+
+### Shared extraction boundary
+
+`qk-control-plane` owns `ControlPlaneClient`, typed daemon approval DTOs,
+runtime-based discovery, authenticated loopback HTTP, and the single
+`DaemonApprovalProvider` implementation. `qk-mcp` consumes that client for
+approval tools, session bootstrap, and event recording; it retains only MCP
+history shaping/classification and formatting. The provider remains
+synchronous; a future async wire proxy must schedule it off Tokio core workers.
+The client reuses `qk-daemon::runtime::{paths, token, singleton}` for home,
+token, and pid/port discovery; `QUERYKNIGHT_DAEMON_URL` remains highest
+precedence and an invalid override never falls back. `ControlPlaneClient`
+exposes only typed session/event/approval operations
+(`create_session`, `record_event`, `list_approvals`, `approval`,
+`verify_approval`, `decide_approval`, `session_allows`, `create_approval`),
+not arbitrary method/path requests. It uses the existing 5-second
+connect/read/write socket timeouts (per blocking operation, not an absolute
+deadline) and newly caps headers at 32 KiB and responses at 1 MiB. Token-file
+decoding/trim and the 4 KiB bound come from the existing runtime token reader.
+Control-plane errors are typed and content-free; MCP maps list/decide failures
+to the same frozen fixed protocol messages.
 
 ## Intentional divergences from TS
 

@@ -7,7 +7,7 @@
 //! sends full SQL to daemon history); no credentials are ever
 //! recorded (connection keys are password-stripped upstream).
 
-use crate::daemon::DaemonEndpoint;
+use qk_control_plane::ControlPlaneClient;
 
 /// Frozen `classifySql` keyword map (history display metadata only —
 /// security analysis stays in `qk-sql`/`qk-core`).
@@ -33,7 +33,7 @@ pub fn classify_for_history(sql: &str) -> (&'static str, &'static str) {
 /// `None` (daemon down) disables recording; tools run unchanged.
 #[derive(Debug, Clone)]
 pub struct HistoryRecorder {
-    endpoint: DaemonEndpoint,
+    client: ControlPlaneClient,
     session_id: String,
     connection_key: String,
 }
@@ -41,10 +41,10 @@ pub struct HistoryRecorder {
 impl HistoryRecorder {
     /// Start a session (`POST /sessions`, source `mcp`) and bind the
     /// recorder. `None` when the daemon is unreachable.
-    pub fn start(endpoint: &DaemonEndpoint, connection_key: &str) -> Option<Self> {
-        let session_id = endpoint.start_session(connection_key)?;
+    pub fn start(client: &ControlPlaneClient, connection_key: &str) -> Option<Self> {
+        let session_id = client.create_session(connection_key, "mcp").ok()?;
         Some(Self {
-            endpoint: endpoint.clone(),
+            client: client.clone(),
             session_id,
             connection_key: connection_key.to_owned(),
         })
@@ -76,7 +76,7 @@ impl HistoryRecorder {
             "estimatedTokensAvoided": event.estimated_tokens_avoided,
             "errorCode": event.error_code,
         });
-        self.endpoint.record_event(&body);
+        let _ = self.client.record_event(&body);
     }
 }
 

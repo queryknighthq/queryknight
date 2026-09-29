@@ -15,13 +15,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use qk_approval::InMemoryApprovalStore;
+use qk_control_plane::{
+    ApprovalDecision as DaemonDecision, ApprovalStatus as DaemonApprovalStatus, ControlPlaneClient,
+    ControlPlaneError, DaemonApprovalProvider,
+};
 use qk_db::{
     ApprovalSetup, ExecuteRequest, ExecutionOutcome, ExecutionService, ExplainCall, GuardedCall,
     TrustedContext,
 };
 
 use crate::config::McpConnection;
-use crate::daemon::{DaemonApprovalProvider, DaemonEndpoint};
 use crate::error::{protocol_error, ErrorKind};
 use crate::format::{
     format_blocked, format_explain, format_pending_approval, format_query, format_schema_overview,
@@ -55,9 +58,8 @@ pub struct McpState {
     adapter: Arc<dyn qk_db::DatabaseAdapter>,
     connection: McpConnection,
     policy: qk_core::PolicyFile,
-    /// Daemon endpoint for history + approvals (`None` degrades to
-    /// history-less execution and frozen unavailable texts).
-    endpoint: Option<DaemonEndpoint>,
+    /// Shared daemon client for approval authority and history.
+    control_plane: Option<ControlPlaneClient>,
     history: Option<HistoryRecorder>,
     observer: qk_audit::Observer,
 }
@@ -73,16 +75,16 @@ impl McpState {
     ) -> Result<Self, McpError> {
         let connection = McpConnection::from_url(url)?;
         let adapter = ExecutionService::adapter_for(&connection.config);
-        let endpoint = DaemonEndpoint::discover(home);
-        let history = endpoint
+        let control_plane = ControlPlaneClient::discover(home).ok();
+        let history = control_plane
             .as_ref()
-            .and_then(|endpoint| HistoryRecorder::start(endpoint, &connection.connection_key));
+            .and_then(|client| HistoryRecorder::start(client, &connection.connection_key));
         Ok(Self {
             service: ExecutionService::new(),
             adapter,
             connection,
             policy,
-            endpoint,
+            control_plane,
             history,
             observer: qk_audit::Observer::new(vec![]),
         })
@@ -102,7 +104,7 @@ impl McpState {
             adapter,
             connection,
             policy,
-            endpoint: None,
+            control_plane: None,
             history,
             observer: qk_audit::Observer::new(vec![]),
         })
@@ -437,9 +439,9 @@ impl QueryKnightServer {
 
 impl QueryKnightServer {
     fn approval_provider(&self, approval_id: Option<String>) -> Option<DaemonApprovalProvider> {
-        let endpoint = self.state.endpoint.clone()?;
+        let client = self.state.control_plane.clone()?;
         Some(DaemonApprovalProvider::new(
-            endpoint,
+            client,
             self.state
                 .history
                 .as_ref()
@@ -800,17 +802,15 @@ impl QueryKnightServer {
 
     /// Handler entry (public for integration tests).
     pub async fn approvals_list_impl(&self) -> Result<String, McpError> {
-        let Some(endpoint) = self.state.endpoint.clone() else {
+        let Some(client) = self.state.control_plane.clone() else {
             return Ok("daemon unavailable; start queryknight".to_owned());
         };
-        let views = endpoint
-            .list_approvals()
-            .map_err(|_: crate::daemon::DaemonFailure| {
-                protocol_error(ErrorKind::Daemon("approvals listing failed".to_owned()))
-            })?;
-        let waiting: Vec<&serde_json::Value> = views
+        let views = client.list_approvals().map_err(|_: ControlPlaneError| {
+            protocol_error(ErrorKind::Daemon("approvals listing failed".to_owned()))
+        })?;
+        let waiting: Vec<_> = views
             .iter()
-            .filter(|view| view.get("status").and_then(|status| status.as_str()) == Some("waiting"))
+            .filter(|view| view.status == DaemonApprovalStatus::Waiting)
             .collect();
         if waiting.is_empty() {
             return Ok("No waiting approvals.".to_owned());
@@ -827,7 +827,7 @@ impl QueryKnightServer {
         &self,
         args: ApprovalsDecideArgs,
     ) -> Result<String, McpError> {
-        let Some(endpoint) = self.state.endpoint.clone() else {
+        let Some(client) = self.state.control_plane.clone() else {
             return Ok("daemon unavailable; start queryknight".to_owned());
         };
         if args.id.trim().is_empty() {
@@ -835,17 +835,16 @@ impl QueryKnightServer {
                 "id is required".to_owned(),
             )));
         }
-        let status = match args.status {
-            ApprovalStatus::Approved => "approved",
-            ApprovalStatus::Denied => "denied",
+        let decision = match args.status {
+            ApprovalStatus::Approved => DaemonDecision::Approved,
+            ApprovalStatus::Denied => DaemonDecision::Denied,
         };
-        let decided =
-            endpoint
-                .decide(&args.id, status)
-                .map_err(|_: crate::daemon::DaemonFailure| {
-                    protocol_error(ErrorKind::Daemon("approval decision failed".to_owned()))
-                })?;
-        Ok(format!("approval {}: {decided}", args.id))
+        let decided = client
+            .decide_approval(&args.id, decision, qk_approval::DecisionSource::Mcp, None)
+            .map_err(|_: ControlPlaneError| {
+                protocol_error(ErrorKind::Daemon("approval decision failed".to_owned()))
+            })?;
+        Ok(format!("approval {}: {}", args.id, decided.as_str()))
     }
 
     /// Best-effort history (synchronous loopback call; failures
@@ -858,18 +857,12 @@ impl QueryKnightServer {
 }
 
 /// Format one waiting approval (frozen `approvalsList` shape).
-fn format_approval(view: &serde_json::Value) -> String {
-    let text = |key: &str| view.get(key).and_then(|value| value.as_str()).unwrap_or("");
+fn format_approval(view: &qk_control_plane::ApprovalSummary) -> String {
     let mut lines = vec![
-        format!(
-            "{}  {}  {}",
-            text("id"),
-            text("risk"),
-            text("operationSummary")
-        ),
-        format!("  {}", text("reason")),
+        format!("{}  {}  {}", view.id, view.risk, view.operation_summary),
+        format!("  {}", view.reason),
     ];
-    if let Some(snaps) = view.get("schemaDdl").and_then(|value| value.as_array()) {
+    if let Some(snaps) = view.schema_ddl.as_ref().and_then(|value| value.as_array()) {
         for snap in snaps {
             let name = snap
                 .get("ref")

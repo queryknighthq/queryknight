@@ -413,3 +413,24 @@ Execute → authorize_guarded(SQL, ExecutionParams) → consume permit →
 PostgreSQL ingress must use this shared Exact V2 encoder and must not add a
 proxy-local digest. MySQL `COM_STMT_EXECUTE` will use the same
 `ExecutionParam` identity model; this task adds no MySQL protocol behavior.
+
+## Shared daemon approval path
+
+The daemon-backed provider and authenticated control-plane HTTP client live
+in `qk-control-plane`; MCP and future protocol adapters consume the same
+provider. Runtime discovery reuses `qk-daemon::runtime`. The provider maps a
+typed `ApprovalRequest` through the existing `qk-approval::ApprovalProvider`
+trait, then `authorize_guarded` returns a request-specific permit. Only
+cryptographic digest/version and trusted scope cross the daemon boundary;
+`ExecutionParam`, SQL values, and wire bytes stay process-local.
+
+```text
+ingress adapter → authorize_guarded → qk-approval resolve
+                                  → qk-control-plane::DaemonApprovalProvider
+                                  → qk-control-plane::ControlPlaneClient
+                                  → qk-daemon verify /allows /approvals
+```
+
+The provider performs bounded synchronous loopback I/O during authorization.
+Future async wire servers must schedule that work so it cannot block a Tokio
+core worker; the provider trait and authorization plane remain synchronous.

@@ -67,6 +67,13 @@ fn read_token_file(path: &std::path::Path) -> Result<Option<AuthToken>, RuntimeE
     Ok(Some(AuthToken::new(trimmed.to_owned())))
 }
 
+/// Read a persisted token without creating or rotating it. This is the
+/// client-side counterpart to [`load_or_create`]: absent/empty files return
+/// `None`, while malformed/oversized files remain typed startup failures.
+pub fn read_existing(paths: &RuntimePaths) -> Result<Option<AuthToken>, RuntimeError> {
+    read_token_file(&paths.token)
+}
+
 /// Raw token-file bytes for tests and diagnostics that must not parse.
 pub fn read_token_raw(path: &std::path::Path) -> Result<Vec<u8>, RuntimeError> {
     std::fs::read(path).map_err(|error| {

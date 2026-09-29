@@ -8,7 +8,7 @@ qk-core = { path = "../qk-core" }
 qk-sql = { path = "../qk-sql" }
 qk-approval = { path = "../qk-approval" }
 qk-db = { path = "../qk-db" }
-qk-daemon = { path = "../qk-daemon" }
+qk-control-plane = { path = "../qk-control-plane" }
 qk-audit = { path = "../qk-audit" }
 qk-metrics = { path = "../qk-metrics" }
 rmcp = { version = "3", features = ["transport-io"] }
