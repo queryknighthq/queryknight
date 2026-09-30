@@ -109,6 +109,14 @@ impl CapabilityState {
         self.server_advertised & self.proxy_supported & self.client_selected & CLIENT_MULTI_RESULTS
             != 0
     }
+
+    pub fn supports_prepared_multi_results(self) -> bool {
+        self.server_advertised
+            & self.proxy_supported
+            & self.client_selected
+            & CLIENT_PS_MULTI_RESULTS
+            != 0
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -569,14 +577,14 @@ fn checked_advance(payload: &[u8], offset: &mut usize, amount: usize) -> Result<
     Ok(())
 }
 
-fn read_u16(payload: &[u8], offset: usize) -> Result<u16, ProtocolError> {
+pub(crate) fn read_u16(payload: &[u8], offset: usize) -> Result<u16, ProtocolError> {
     let bytes = payload
         .get(offset..offset + 2)
         .ok_or(ProtocolError::Malformed)?;
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
-fn read_u32(payload: &[u8], offset: usize) -> Result<u32, ProtocolError> {
+pub(crate) fn read_u32(payload: &[u8], offset: usize) -> Result<u32, ProtocolError> {
     let bytes = payload
         .get(offset..offset + 4)
         .ok_or(ProtocolError::Malformed)?;
@@ -680,7 +688,8 @@ mod tests {
             | CLIENT_COMPRESS
             | CLIENT_MULTI_STATEMENTS
             | CLIENT_LOCAL_FILES
-            | CLIENT_DEPRECATE_EOF;
+            | CLIENT_DEPRECATE_EOF
+            | CLIENT_PS_MULTI_RESULTS;
         let filtered_greeting =
             filter_server_greeting(&greeting(b"caching_sha2_password", capabilities))
                 .expect("greeting");

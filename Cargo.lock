@@ -1635,6 +1635,8 @@ dependencies = [
  "qk-mcp",
  "qk-sql",
  "qk-store",
+ "sha1",
+ "sha2 0.10.9",
  "tokio",
 ]
 

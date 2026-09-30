@@ -1,8 +1,3 @@
-use std::future::Future;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use qk_approval::{ApprovalProvider, InMemoryApprovalStore};
 use qk_control_plane::DaemonApprovalProvider;
 use qk_db::{
@@ -10,6 +5,10 @@ use qk_db::{
     GuardedAuthorizationCall, ResolveMode, TrustedContext,
 };
 use qk_sql::Operation;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -27,6 +26,8 @@ use crate::protocol::{
     COM_STMT_EXECUTE, COM_STMT_FETCH, COM_STMT_PREPARE, COM_STMT_RESET, COM_STMT_SEND_LONG_DATA,
     MAX_COLUMNS, MAX_HANDSHAKE_PAYLOAD, MAX_LOGICAL_RESPONSE,
 };
+#[path = "proxy_prepared.rs"]
+mod prepared_proxy;
 
 /// Maximum simultaneous frontend/backend sessions.
 pub const MAX_CLIENTS: usize = 128;
@@ -276,7 +277,7 @@ async fn create_proxy_session(config: &ProxyConfig) -> Option<String> {
         .filter(|session_id| !session_id.is_empty())
 }
 
-struct BackendState {
+pub(super) struct BackendState {
     status_flags: u16,
     capabilities: CapabilityState,
 }
@@ -288,6 +289,7 @@ async fn command_loop(
     session_id: Option<&str>,
     backend_state: &mut BackendState,
 ) {
+    let mut prepared = prepared_proxy::PreparedState::default();
     loop {
         let command = match read_command(frontend).await {
             Ok(command) => command,
@@ -328,9 +330,78 @@ async fn command_loop(
                     continue;
                 }
                 if write_message(backend, 0, &message.payload).await.is_err()
-                    || relay_response(frontend, backend, 1, backend_state)
+                    || relay_response(frontend, backend, 1, backend_state, false)
                         .await
                         .is_err()
+                {
+                    return;
+                }
+            }
+            COM_STMT_PREPARE => {
+                if prepared_proxy::handle_prepare(
+                    frontend,
+                    backend,
+                    &message,
+                    &mut prepared,
+                    backend_state,
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
+            COM_STMT_EXECUTE => {
+                if prepared_proxy::handle_execute(
+                    frontend,
+                    backend,
+                    &message,
+                    config.clone(),
+                    session_id,
+                    &mut prepared,
+                    backend_state,
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
+            COM_STMT_SEND_LONG_DATA => {
+                if prepared_proxy::buffer_long_data(&message, &mut prepared).is_err() {
+                    return;
+                }
+            }
+            COM_STMT_RESET => {
+                if prepared_proxy::handle_reset(
+                    frontend,
+                    backend,
+                    &message,
+                    &mut prepared,
+                    backend_state,
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
+            COM_STMT_CLOSE => {
+                if prepared_proxy::handle_close(backend, &message, &mut prepared)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            COM_STMT_FETCH => {
+                if write_policy_error(
+                    frontend,
+                    message.next_sequence(),
+                    "QueryKnight does not support MySQL prepared-statement cursors",
+                )
+                .await
+                .is_err()
                 {
                     return;
                 }
@@ -365,10 +436,11 @@ async fn command_loop(
                         continue;
                     }
                 };
-                let outcome = match authorize_query(
+                let outcome = match authorize_request(
                     config.clone(),
                     session_id.map(str::to_owned),
                     sql.to_owned(),
+                    Vec::new(),
                 )
                 .await
                 {
@@ -450,9 +522,15 @@ async fn command_loop(
                 {
                     return;
                 }
-                if relay_response(frontend, backend, message.next_sequence(), backend_state)
-                    .await
-                    .is_err()
+                if relay_response(
+                    frontend,
+                    backend,
+                    message.next_sequence(),
+                    backend_state,
+                    false,
+                )
+                .await
+                .is_err()
                 {
                     return;
                 }
@@ -476,10 +554,11 @@ async fn command_loop(
     }
 }
 
-async fn authorize_query(
+async fn authorize_request(
     config: Arc<ProxyConfig>,
     session_id: Option<String>,
     sql: String,
+    params: Vec<qk_core::ExecutionParam>,
 ) -> Option<AuthorizationOutcome> {
     tokio::task::spawn_blocking(move || {
         let store = InMemoryApprovalStore::new();
@@ -513,7 +592,7 @@ async fn authorize_query(
             tool: "proxy_query".to_owned(),
             session_id,
         };
-        let mut request = AuthorizationRequest::new(sql, Vec::new());
+        let mut request = AuthorizationRequest::new(sql, params);
         request.require_supported_analysis = true;
         request.reject_operations.push(Operation::Unsupported);
         authorize_guarded(
@@ -602,8 +681,14 @@ async fn relay_response(
     backend: &mut TcpStream,
     first_sequence: u8,
     state: &mut BackendState,
+    prepared_results: bool,
 ) -> Result<(), ProtocolError> {
     let mut expected_sequence = first_sequence;
+    let supports_more_results = if prepared_results {
+        state.capabilities.supports_prepared_multi_results()
+    } else {
+        state.capabilities.supports_multi_results()
+    };
     loop {
         let first = read_response_packet(backend, expected_sequence).await?;
         expected_sequence = first.next_sequence();
@@ -619,7 +704,7 @@ async fn relay_response(
         if is_ok(payload) {
             state.status_flags = server_status_from_ok(payload)?;
             if response_has_more_results(state.status_flags) {
-                if !state.capabilities.supports_multi_results() {
+                if !supports_more_results {
                     return Err(ProtocolError::Unsupported);
                 }
                 continue;
@@ -662,7 +747,7 @@ async fn relay_response(
                 state.status_flags = server_status_from_eof(&row.payload)?;
                 write_message(frontend, row.sequence, &row.payload).await?;
                 if response_has_more_results(state.status_flags) {
-                    if !state.capabilities.supports_multi_results() {
+                    if !supports_more_results {
                         return Err(ProtocolError::Unsupported);
                     }
                     break;

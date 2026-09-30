@@ -18,3 +18,5 @@ qk-store = { path = "../qk-store" }
 qk-mcp = { path = "../qk-mcp" }
 mysql_async = "0.37"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util"] }
+sha2 = "0.10"
+sha1 = "0.10"

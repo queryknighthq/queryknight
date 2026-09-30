@@ -9,8 +9,11 @@ use qk_db::DbConfig;
 use qk_proxy_mysql::{ProxyConfig, ProxyServer};
 use tokio::sync::oneshot;
 
+#[path = "common/live_mysql_wire.rs"]
+mod live_mysql_wire;
 const LIVE_URL_DEFAULT: &str = "mysql://root:root@127.0.0.1:3306/qk";
 const TABLE: &str = "qk_proxy_mysql_live";
+const PREPARED_TABLE: &str = "qk_proxy_mysql_live_prepared";
 
 const LIVE_POLICY: &str = r#"
 version: 1
@@ -99,6 +102,7 @@ async fn connect_proxy(proxy: &RunningProxy, backend_url: &str) -> Conn {
 async fn mysql_84_live_proxy_contract() {
     let backend_url =
         std::env::var("MYSQL_PROXY_TEST_URL").unwrap_or_else(|_| LIVE_URL_DEFAULT.to_owned());
+    let backend_opts = Opts::from_url(&backend_url).expect("backend MySQL options");
     let mut direct = connect(&backend_url).await;
     let version: Option<String> = direct
         .query_first("SELECT VERSION()")
@@ -116,11 +120,21 @@ async fn mysql_84_live_proxy_contract() {
         .await
         .expect("drop prior fixture");
     direct
+        .query_drop(format!("DROP TABLE IF EXISTS {PREPARED_TABLE}"))
+        .await
+        .expect("drop prior prepared fixture");
+    direct
         .query_drop(format!(
             "CREATE TABLE {TABLE} (id INT PRIMARY KEY, value VARCHAR(64) NOT NULL)"
         ))
         .await
         .expect("create fixture");
+    direct
+        .query_drop(format!(
+            "CREATE TABLE {PREPARED_TABLE} (id INT PRIMARY KEY, value VARCHAR(64) NOT NULL)"
+        ))
+        .await
+        .expect("create prepared fixture");
     direct
         .exec_drop(
             format!("INSERT INTO {TABLE} (id, value) VALUES (?, ?), (?, ?), (?, ?), (?, ?)"),
@@ -128,12 +142,36 @@ async fn mysql_84_live_proxy_contract() {
         )
         .await
         .expect("insert fixture");
+    direct
+        .exec_drop(
+            format!(
+                "INSERT INTO {PREPARED_TABLE} (id, value) VALUES (?, ?), (?, ?), (?, ?), (?, ?)"
+            ),
+            (
+                7,
+                "prepared-once",
+                8,
+                "prepared-session",
+                9,
+                "prepared-session-2",
+                10,
+                "other-session",
+            ),
+        )
+        .await
+        .expect("insert prepared fixture");
 
     let daemon = TestControlPlane::start().await;
     let proxy = RunningProxy::start(&backend_url, daemon.client.clone()).await;
     let mut client = connect_proxy(&proxy, &backend_url).await;
     let one: Option<u64> = client.query_first("SELECT 1").await.expect("SELECT 1");
     assert_eq!(one, Some(1));
+    let prepared_select = client.prep("SELECT ?").await.expect("prepare SELECT");
+    let selected: Option<u64> = client
+        .exec_first(&prepared_select, (42u64,))
+        .await
+        .expect("binary prepared SELECT");
+    assert_eq!(selected, Some(42));
 
     client
         .query_drop(format!(
@@ -163,6 +201,22 @@ async fn mysql_84_live_proxy_contract() {
         .expect("start transaction");
     assert!(client
         .query_drop(format!("UPDATE {TABLE} SET value = 'blocked' WHERE id = 1"))
+        .await
+        .is_err());
+    let prepared_update = client
+        .prep(format!("UPDATE {TABLE} SET value = ? WHERE id = ?"))
+        .await
+        .expect("prepare bounded UPDATE");
+    assert!(client
+        .exec_drop(&prepared_update, ("blocked".to_owned(), 1u64))
+        .await
+        .is_err());
+    let unbounded_update = client
+        .prep(format!("UPDATE {TABLE} SET value = ?"))
+        .await
+        .expect("prepare unbounded UPDATE");
+    assert!(client
+        .exec_drop(&unbounded_update, ("blocked".to_owned(),))
         .await
         .is_err());
     let in_transaction: Option<String> = client
@@ -196,6 +250,36 @@ async fn mysql_84_live_proxy_contract() {
         .await
         .expect("independent rollback verification");
     assert_eq!(rolled_back, None);
+    let prepared_insert = client
+        .prep(format!("INSERT INTO {TABLE} (id, value) VALUES (?, ?)"))
+        .await
+        .expect("prepare transactional INSERT");
+    client
+        .query_drop("START TRANSACTION")
+        .await
+        .expect("start prepared rollback transaction");
+    client
+        .exec_drop(&prepared_insert, (6u64, "prepared-rolled-back"))
+        .await
+        .expect("prepared insert in transaction");
+    client
+        .query_drop("ROLLBACK")
+        .await
+        .expect("rollback prepared row");
+    let prepared_rolled_back: Option<String> = direct
+        .query_first(format!("SELECT value FROM {TABLE} WHERE id = 6"))
+        .await
+        .expect("direct prepared rollback check");
+    assert_eq!(prepared_rolled_back, None);
+    client
+        .exec_drop(&prepared_insert, (6u64, "prepared-committed"))
+        .await
+        .expect("same prepared statement after rollback");
+    let prepared_committed: Option<String> = direct
+        .query_first(format!("SELECT value FROM {TABLE} WHERE id = 6"))
+        .await
+        .expect("direct prepared commit check");
+    assert_eq!(prepared_committed.as_deref(), Some("prepared-committed"));
 
     client
         .query_drop("SET autocommit = 0")
@@ -234,8 +318,18 @@ async fn mysql_84_live_proxy_contract() {
         .await
         .is_err());
     assert!(
-        client.prep("SELECT ?").await.is_err(),
-        "prepared protocol remains unsupported"
+        client
+            .prep(format!("SELECT missing_qk_live_column FROM {TABLE}"))
+            .await
+            .is_err(),
+        "prepared syntax errors are relayed"
+    );
+    assert!(
+        client
+            .prep(format!("SELECT 1; DROP TABLE {TABLE}"))
+            .await
+            .is_err(),
+        "multi-statement PREPARE remains unsupported"
     );
 
     // Once: exact SQL retry succeeds, changed literal cannot consume the grant.
@@ -298,6 +392,93 @@ async fn mysql_84_live_proxy_contract() {
         .await
         .is_err());
 
+    // Prepared Once binds the SQL placeholder, type, and value into ExactV2.
+    let mut prepared_client = connect_proxy(&proxy, &backend_url).await;
+    let prepared_sql = format!("DELETE FROM {PREPARED_TABLE} WHERE id = ?");
+    let prepared_fingerprint = qk_core::sql_fingerprint(&prepared_sql).as_str().to_owned();
+    let prepared_delete = prepared_client
+        .prep(&prepared_sql)
+        .await
+        .expect("prepare parameterized DELETE");
+    assert!(prepared_client
+        .exec_drop(&prepared_delete, (7u64,))
+        .await
+        .is_err());
+    let direct_before: Option<String> = direct
+        .query_first(format!("SELECT value FROM {PREPARED_TABLE} WHERE id = 7"))
+        .await
+        .expect("blocked prepared row remains");
+    assert_eq!(direct_before.as_deref(), Some("prepared-once"));
+    let prepared_once = daemon
+        .client
+        .list_approvals()
+        .expect("prepared Once pending")
+        .into_iter()
+        .find(|approval| {
+            approval.status == qk_control_plane::ApprovalStatus::Waiting
+                && approval.fingerprint == prepared_fingerprint
+        })
+        .expect("approval for prepared placeholder SQL");
+    daemon
+        .client
+        .decide_approval(
+            &prepared_once.id,
+            ApprovalDecision::Approved,
+            qk_approval::DecisionSource::Ui,
+            Some(qk_approval::Scope::Once),
+        )
+        .expect("approve prepared Once");
+    prepared_client
+        .exec_drop(&prepared_delete, (7u64,))
+        .await
+        .expect("exact prepared Once retry");
+    let once_deleted: Option<String> = direct
+        .query_first(format!("SELECT value FROM {PREPARED_TABLE} WHERE id = 7"))
+        .await
+        .expect("verify prepared Once side effect");
+    assert_eq!(once_deleted, None);
+
+    assert!(prepared_client
+        .exec_drop(&prepared_delete, (8u64,))
+        .await
+        .is_err());
+    let changed_pending = daemon
+        .client
+        .list_approvals()
+        .expect("changed prepared parameter pending")
+        .into_iter()
+        .find(|approval| {
+            approval.status == qk_control_plane::ApprovalStatus::Waiting
+                && approval.fingerprint == prepared_fingerprint
+        })
+        .expect("Once did not authorize changed prepared value");
+    daemon
+        .client
+        .decide_approval(
+            &changed_pending.id,
+            ApprovalDecision::Approved,
+            qk_approval::DecisionSource::Ui,
+            Some(qk_approval::Scope::Session),
+        )
+        .expect("approve prepared Session scope");
+    prepared_client
+        .exec_drop(&prepared_delete, (8u64,))
+        .await
+        .expect("prepared Session retry");
+    prepared_client
+        .exec_drop(&prepared_delete, (9u64,))
+        .await
+        .expect("prepared Session grants a fresh request-specific permit");
+    for id in [8, 9] {
+        let remaining: Option<String> = direct
+            .query_first(format!(
+                "SELECT value FROM {PREPARED_TABLE} WHERE id = {id}"
+            ))
+            .await
+            .expect("verify prepared Session side effect");
+        assert_eq!(remaining, None);
+    }
+
     // A second live frontend receives an isolated backend session and approval scope.
     let mut other = connect_proxy(&proxy, &backend_url).await;
     let other_value: Option<Option<u64>> = other
@@ -309,6 +490,16 @@ async fn mysql_84_live_proxy_contract() {
         .query_drop(format!("DELETE FROM {TABLE} WHERE id = 4"))
         .await
         .is_err());
+    let other_prepared = other
+        .prep(&prepared_sql)
+        .await
+        .expect("prepare in isolated frontend");
+    assert!(other.exec_drop(&other_prepared, (10u64,)).await.is_err());
+    let other_row: Option<String> = direct
+        .query_first(format!("SELECT value FROM {PREPARED_TABLE} WHERE id = 10"))
+        .await
+        .expect("other frontend's prepared block has no side effect");
+    assert_eq!(other_row.as_deref(), Some("other-session"));
 
     // LegacyShape rows are visible to the daemon but never produce a permit.
     let legacy_sql = format!("DELETE FROM {TABLE} WHERE id = 4");
@@ -370,17 +561,46 @@ async fn mysql_84_live_proxy_contract() {
         )
         .expect("insert legacy grant");
     assert!(legacy_client.query_drop(&legacy_sql).await.is_err());
+    let legacy_prepared = legacy_client
+        .prep(format!("DELETE FROM {TABLE} WHERE id = ?"))
+        .await
+        .expect("prepare LegacyShape SQL");
+    assert!(legacy_client
+        .exec_drop(&legacy_prepared, (4u64,))
+        .await
+        .is_err());
     let remaining: Option<String> = direct
         .query_first(format!("SELECT value FROM {TABLE} WHERE id = 4"))
         .await
         .expect("legacy row remains");
     assert_eq!(remaining.as_deref(), Some("legacy"));
 
+    let mut raw = live_mysql_wire::RawMysqlClient::connect(&proxy, &backend_opts).await;
+    let raw_statement = raw.prepare("SELECT ?").await;
+    let secret = b"MYSQL_PREPARED_SECRET_8675309";
+    raw.send_long_data(raw_statement, 0, &secret[..11]).await;
+    raw.send_long_data(raw_statement, 0, &secret[11..]).await;
+    assert_eq!(
+        raw.execute_long_string(raw_statement).await,
+        secret,
+        "MySQL 8.4 receives the ordered accumulated long-data value"
+    );
+    let store = qk_store::Store::open(&daemon.home.join("queryknight.db")).expect("history store");
+    let history = store.list_events(100).expect("query history");
+    assert!(history
+        .iter()
+        .any(|event| event.sql.as_deref() == Some("SELECT ?")));
+    assert!(!format!("{history:?}").contains("MYSQL_PREPARED_SECRET_8675309"));
+    drop(raw);
     legacy_client
         .disconnect()
         .await
         .expect("disconnect legacy test client");
     other.disconnect().await.expect("disconnect second client");
+    prepared_client
+        .disconnect()
+        .await
+        .expect("disconnect prepared frontend");
     client.disconnect().await.expect("disconnect proxy client");
     proxy.stop().await;
     daemon.stop().await;
@@ -388,6 +608,10 @@ async fn mysql_84_live_proxy_contract() {
         .query_drop(format!("DROP TABLE {TABLE}"))
         .await
         .expect("cleanup fixture");
+    direct
+        .query_drop(format!("DROP TABLE {PREPARED_TABLE}"))
+        .await
+        .expect("cleanup prepared fixture");
     direct.disconnect().await.expect("disconnect direct client");
 }
 

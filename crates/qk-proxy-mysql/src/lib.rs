@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 mod config;
+mod prepared;
 mod protocol;
 mod proxy;
 
