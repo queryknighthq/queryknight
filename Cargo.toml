@@ -15,4 +15,5 @@ members = [
     "crates/qk-control-plane",
     "crates/qk-proxy-postgres",
     "crates/qk-proxy-mysql",
+    "crates/qk-openshell",
 ]

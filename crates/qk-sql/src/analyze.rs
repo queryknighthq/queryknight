@@ -9,11 +9,13 @@
 //! `docs/sqlparser-differences.md`).
 
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     AssignmentTarget, CopySource, Delete, Expr, FunctionArg, FunctionArgExpr, GrantObjects, Ident,
     LimitClause, MergeAction, MergeUpdateKind, ObjectName, Query, Select, SelectItem, Set, SetExpr,
     Statement, TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind, Value,
+    ValueWithSpan, Visit, Visitor,
 };
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
@@ -77,6 +79,59 @@ pub fn analyze_with_options(
             })
         })
     })
+}
+
+/// Detect whether parsed SQL contains a bind placeholder, using the same
+/// dialect parser and recursion guard as query analysis.
+///
+/// This lets protocol adapters refuse an unbound parameterized request without
+/// scanning SQL text or maintaining a second lexer.
+pub fn has_parameter_markers(
+    sql: &str,
+    dialect: SqlDialect,
+    options: AnalyzeOptions,
+) -> Result<bool, SqlAnalysisError> {
+    let bytes = sql.len();
+    if bytes > options.max_bytes {
+        return Err(SqlAnalysisError::InputTooLarge {
+            bytes,
+            max_bytes: options.max_bytes,
+        });
+    }
+    stacker::grow(GROWTH_BYTES, || {
+        std::panic::catch_unwind(|| {
+            let statements = parse_bounded(dialect, sql)?;
+            let mut visitor = ParameterMarkerVisitor { found: false };
+            for statement in &statements {
+                if statement.visit(&mut visitor).is_break() {
+                    break;
+                }
+            }
+            Ok(visitor.found)
+        })
+        .unwrap_or_else(|_| {
+            Err(SqlAnalysisError::AnalysisError {
+                message: "analysis panicked on input; failing closed".to_owned(),
+            })
+        })
+    })
+}
+
+struct ParameterMarkerVisitor {
+    found: bool,
+}
+
+impl Visitor for ParameterMarkerVisitor {
+    type Break = ();
+
+    fn pre_visit_value(&mut self, value: &ValueWithSpan) -> ControlFlow<Self::Break> {
+        if matches!(value.value, Value::Placeholder(_)) {
+            self.found = true;
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
 }
 
 /// Inner pipeline: parse, walk, assemble. Runs inside the grown segment.
