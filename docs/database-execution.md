@@ -400,31 +400,36 @@ with a typed identity error before permit issuance. `ExecutionParam` Debug
 redacts all values; it has no Display/Serde representation. Approval storage
 continues to persist only binding kind and 32-byte digest; no schema change.
 
-## PostgreSQL Simple Query identity boundary
+## PostgreSQL Simple and Extended Query identity boundaries
 
-The implemented PostgreSQL adapter accepts only Simple Query `Q` messages.
-Each complete SQL C string is authorized with no bind parameters and therefore
-uses the shared SQL-only exact identity; a permit authorizes every statement
-in that one request and is consumed before the original frame is forwarded on
-its authenticated backend session. Extended Query Parse/Bind/Execute is
-rejected, so PostgreSQL wire text/binary parameter mapping is not yet an
-executable surface. MySQL `COM_STMT_EXECUTE` behavior is unchanged.
+Simple Query `Q` authorizes the complete SQL with no bind parameters and
+therefore uses shared SQL-only Exact V1. The original frame is consumed and
+forwarded only after its request-specific permit is minted.
 
-The protocol-neutral `ExecutionParam::Wire` and Exact V2 encoder remain the
-shared boundary for any future parameterized ingress: text and binary bytes
-are hashed exactly as represented, with an optional type hint and NULL
-represented distinctly. Ingress adapters must not add a proxy-local digest.
+Extended Query Parse and Bind are forwarded as protocol setup and never create
+approval requests or permits. Bind values become ordered shared
+`ExecutionParam::Wire` values: text/binary format, exact bytes, and any
+nonzero OID declared at Parse are retained; NULL remains `ExecutionParam::Null`.
+Execute resolves the portal's statement-version snapshot and current values,
+calls `authorize_guarded`, and uses the canonical Exact V2 encoder before
+consuming a fresh permit and forwarding the original Execute. Type inference
+reported later by PostgreSQL is not fabricated into a hint. Bind result
+formats and Execute `max_rows` are protocol/result-flow state, not approval
+identity. COPY, SQL SET, and FunctionCall remain blocked.
+
+The protocol-neutral Exact V2 encoder is shared across ingress adapters;
+text and binary bytes are hashed exactly as represented, and no proxy-local
+digest is permitted. MySQL behavior is unchanged.
 
 ## Shared daemon approval path
 
 The daemon-backed provider and authenticated control-plane HTTP client live
-in `qk-control-plane`; MCP and the PostgreSQL Simple Query proxy consume the
-same provider. Runtime discovery reuses `qk-daemon::runtime`. The provider
-maps a typed `ApprovalRequest` through the existing
-`qk-approval::ApprovalProvider` trait, then `authorize_guarded` returns a
-request-specific permit. Only cryptographic digest/version and trusted scope
-cross the daemon boundary; `ExecutionParam`, SQL values, and wire bytes stay
-process-local.
+in `qk-control-plane`; MCP and the PostgreSQL proxy consume the same provider.
+Runtime discovery reuses `qk-daemon::runtime`. The provider maps a typed
+`ApprovalRequest` through the existing `qk-approval::ApprovalProvider`
+trait, then `authorize_guarded` returns a request-specific permit. Only
+cryptographic digest/version and trusted scope cross the daemon boundary;
+`ExecutionParam`, SQL values, and wire bytes stay process-local.
 
 ```text
 ingress adapter → authorize_guarded → qk-approval resolve

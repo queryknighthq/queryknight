@@ -29,6 +29,8 @@ pub const MAX_CLIENTS: usize = 128;
 /// and has no qk-db per-operation timeout or reconnect/replay behavior.
 pub const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+const BACKEND_FLUSH_FRAME: [u8; 5] = [b'H', 0, 0, 0, 4];
+
 /// Proxy startup/accept failure. No backend URL, credentials, SQL, or token is
 /// included in its display surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +130,155 @@ struct BackendSession {
     client_encoding: Option<String>,
 }
 
+/// Bound per-frontend prepared statement/portal capacity.
+const MAX_STATEMENTS_PER_CLIENT: usize = 1024;
+const MAX_PORTALS_PER_CLIENT: usize = 1024;
+const MAX_CLIENT_EXTENDED_STATE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug)]
+struct PreparedStatement {
+    sql: String,
+    parameter_type_hints: Vec<Option<u32>>,
+    version: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortalState {
+    Bound,
+    Suspended,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug)]
+struct Portal {
+    statement: Arc<PreparedStatement>,
+    execution_params: Vec<ExecutionParam>,
+    parameter_formats: Vec<qk_core::ParamRepresentation>,
+    result_formats: Vec<i16>,
+    backend_state: PortalState,
+}
+
+/// Prepared protocol state is private to one frontend/backend session.
+#[derive(Default)]
+struct ExtendedState {
+    statements: std::collections::HashMap<String, Arc<PreparedStatement>>,
+    portals: std::collections::HashMap<String, Portal>,
+    next_statement_version: u64,
+    retained_bytes: usize,
+    error_until_sync: bool,
+}
+
+impl ExtendedState {
+    fn begin_unnamed_parse(&mut self) {
+        if let Some(statement) = self.statements.remove("") {
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(statement_state_bytes(&statement));
+        }
+    }
+
+    fn begin_unnamed_bind(&mut self) {
+        self.remove_portal("");
+    }
+
+    fn clear_unnamed_for_simple_query(&mut self) {
+        self.begin_unnamed_parse();
+        self.begin_unnamed_bind();
+    }
+
+    fn insert_statement(&mut self, name: String, statement: Arc<PreparedStatement>) {
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(statement_state_bytes(&statement));
+        self.statements.insert(name, statement);
+    }
+
+    fn remove_statement(&mut self, name: &str) {
+        if let Some(statement) = self.statements.remove(name) {
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(statement_state_bytes(&statement));
+            let mut removed_bytes = 0usize;
+            self.portals.retain(|_, portal| {
+                let keep = !Arc::ptr_eq(&portal.statement, &statement);
+                if !keep {
+                    removed_bytes = removed_bytes.saturating_add(portal_state_bytes(portal));
+                }
+                keep
+            });
+            self.retained_bytes = self.retained_bytes.saturating_sub(removed_bytes);
+        }
+    }
+
+    fn insert_portal(&mut self, name: String, portal: Portal) {
+        self.remove_portal(&name);
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(portal_state_bytes(&portal));
+        self.portals.insert(name, portal);
+    }
+
+    fn remove_portal(&mut self, name: &str) {
+        if let Some(portal) = self.portals.remove(name) {
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(portal_state_bytes(&portal));
+        }
+    }
+
+    fn complete_sync(&mut self, transaction_status: u8) {
+        self.error_until_sync = false;
+        if transaction_status == b'I' {
+            let portal_bytes = self
+                .portals
+                .values()
+                .map(portal_state_bytes)
+                .fold(0usize, usize::saturating_add);
+            self.retained_bytes = self.retained_bytes.saturating_sub(portal_bytes);
+            self.portals.clear();
+        }
+    }
+}
+
+fn statement_state_bytes(statement: &PreparedStatement) -> usize {
+    statement
+        .sql
+        .len()
+        .saturating_add(statement.parameter_type_hints.len() * std::mem::size_of::<Option<u32>>())
+}
+
+fn execution_param_bytes(parameter: &ExecutionParam) -> usize {
+    match parameter {
+        ExecutionParam::Null => 0,
+        ExecutionParam::Bool(_) => std::mem::size_of::<bool>(),
+        ExecutionParam::Int(_) | ExecutionParam::UInt(_) | ExecutionParam::FloatBits(_) => 8,
+        ExecutionParam::Text(value) => value.len(),
+        ExecutionParam::Bytes(value) => value.len(),
+        ExecutionParam::Wire { bytes, .. } => bytes.len(),
+    }
+}
+
+fn portal_state_bytes(portal: &Portal) -> usize {
+    let parameter_bytes = portal
+        .execution_params
+        .iter()
+        .map(execution_param_bytes)
+        .fold(0usize, usize::saturating_add);
+    portal
+        .statement
+        .sql
+        .len()
+        .saturating_add(parameter_bytes)
+        .saturating_add(
+            portal.statement.parameter_type_hints.len() * std::mem::size_of::<Option<u32>>(),
+        )
+        .saturating_add(
+            portal.parameter_formats.len() * std::mem::size_of::<qk_core::ParamRepresentation>(),
+        )
+        .saturating_add(portal.result_formats.len() * std::mem::size_of::<i16>())
+}
+
 async fn handle_client(
     stream: TcpStream,
     config: Arc<ProxyConfig>,
@@ -220,6 +371,7 @@ async fn handle_client(
     }
     let session_id = create_proxy_session(&config, &mut shutdown).await;
     let mut pending_frontend = None;
+    let mut extended = ExtendedState::default();
     loop {
         if *shutdown.borrow() {
             return;
@@ -246,8 +398,44 @@ async fn handle_client(
                 }
             }
         };
+        if frame.kind == b'X' {
+            let _ = backend.writer.write_all(&frame.raw).await;
+            return;
+        }
+        if extended.error_until_sync {
+            if frame.kind != b'S' {
+                continue;
+            }
+            if protocol::validate_empty_message(frame.payload()).is_err() {
+                let _ = write_error(
+                    &mut frontend_write,
+                    "FATAL",
+                    "08P01",
+                    "invalid PostgreSQL Sync message",
+                )
+                .await;
+                return;
+            }
+            if backend.writer.write_all(&frame.raw).await.is_err()
+                || relay_extended_ready(
+                    &mut backend,
+                    &mut frontend,
+                    &mut frontend_write,
+                    &mut pending_frontend,
+                    &mut shutdown,
+                    &extended,
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            extended.complete_sync(backend.transaction_status);
+            continue;
+        }
         match frame.kind {
             b'Q' => {
+                extended.clear_unnamed_for_simple_query();
                 let sql = match simple_query_sql(frame.payload()) {
                     Ok(sql) => sql,
                     Err(_) => {
@@ -430,28 +618,19 @@ async fn handle_client(
                     }
                 }
             }
-            b'X' => {
-                let _ = backend.writer.write_all(&frame.raw).await;
-                return;
-            }
             b'P' | b'B' | b'D' | b'E' | b'C' | b'H' => {
-                if send_error_only(
-                    &mut frontend_write,
-                    "ERROR",
-                    "0A000",
-                    "PostgreSQL extended query protocol is not supported by this proxy",
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-                if drain_until_sync(
-                    &mut frontend,
-                    &mut frontend_write,
-                    &mut backend,
-                    &mut pending_frontend,
-                    &mut shutdown,
+                if process_extended_frame(
+                    frame,
+                    &mut extended,
+                    config.clone(),
+                    session_id.clone(),
+                    ExtendedIo {
+                        frontend: &mut frontend,
+                        client: &mut frontend_write,
+                        backend: &mut backend,
+                        pending_frontend: &mut pending_frontend,
+                        shutdown: &mut shutdown,
+                    },
                 )
                 .await
                 .is_err()
@@ -460,20 +639,33 @@ async fn handle_client(
                 }
             }
             b'S' => {
-                if send_error_only(
+                if protocol::validate_empty_message(frame.payload()).is_err() {
+                    let _ = write_error(
+                        &mut frontend_write,
+                        "FATAL",
+                        "08P01",
+                        "invalid PostgreSQL Sync message",
+                    )
+                    .await;
+                    return;
+                }
+                if backend.writer.write_all(&frame.raw).await.is_err() {
+                    return;
+                }
+                if relay_extended_ready(
+                    &mut backend,
+                    &mut frontend,
                     &mut frontend_write,
-                    "ERROR",
-                    "0A000",
-                    "PostgreSQL Sync without supported extended execution is not supported",
+                    &mut pending_frontend,
+                    &mut shutdown,
+                    &extended,
                 )
                 .await
                 .is_err()
-                    || send_ready(&mut frontend_write, backend.transaction_status)
-                        .await
-                        .is_err()
                 {
                     return;
                 }
+                extended.complete_sync(backend.transaction_status);
             }
             b'F' => {
                 if send_local_error(
@@ -514,6 +706,829 @@ async fn handle_client(
             }
         }
     }
+}
+
+struct ExtendedIo<'a> {
+    frontend: &'a mut FrameReader<tokio::net::tcp::OwnedReadHalf>,
+    client: &'a mut tokio::net::tcp::OwnedWriteHalf,
+    backend: &'a mut BackendSession,
+    pending_frontend: &'a mut Option<Frame>,
+    shutdown: &'a mut watch::Receiver<bool>,
+}
+
+#[derive(Clone, Copy)]
+enum ExtendedBoundary {
+    Parse,
+    Bind,
+    Describe,
+    Close,
+    Execute,
+}
+
+enum ExtendedResponse {
+    Complete(u8),
+    Error,
+}
+
+async fn process_extended_frame(
+    frame: Frame,
+    state: &mut ExtendedState,
+    config: Arc<ProxyConfig>,
+    session_id: Option<String>,
+    io: ExtendedIo<'_>,
+) -> Result<(), ()> {
+    let ExtendedIo {
+        frontend,
+        client,
+        backend,
+        pending_frontend,
+        shutdown,
+    } = io;
+    match frame.kind {
+        b'P' => {
+            let parsed = match protocol::parse_extended_parse(frame.payload()) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let (code, message) =
+                        extended_decode_error(error, "invalid PostgreSQL Parse message");
+                    return reject_extended(state, client, code, message).await;
+                }
+            };
+            if parsed.name.is_empty() {
+                state.begin_unnamed_parse();
+            }
+            let new_statement_bytes = parsed.sql.len().saturating_add(
+                parsed.parameter_type_hints.len() * std::mem::size_of::<Option<u32>>(),
+            );
+            let existing_named =
+                !parsed.name.is_empty() && state.statements.contains_key(&parsed.name);
+            if !existing_named
+                && !state.statements.contains_key(&parsed.name)
+                && state.statements.len() >= MAX_STATEMENTS_PER_CLIENT
+            {
+                return reject_extended(state, client, "54000", "prepared statement limit reached")
+                    .await;
+            }
+            if !existing_named
+                && state.retained_bytes.saturating_add(new_statement_bytes)
+                    > MAX_CLIENT_EXTENDED_STATE_BYTES
+            {
+                return reject_extended(
+                    state,
+                    client,
+                    "54000",
+                    "prepared statement state limit reached",
+                )
+                .await;
+            }
+            let Some(version) = state.next_statement_version.checked_add(1) else {
+                return reject_extended(state, client, "54000", "statement version limit reached")
+                    .await;
+            };
+            let pending_statement = Arc::new(PreparedStatement {
+                sql: parsed.sql,
+                parameter_type_hints: parsed.parameter_type_hints,
+                version,
+            });
+            backend.writer.write_all(&frame.raw).await.map_err(|_| ())?;
+            flush_backend_output(&mut backend.writer).await?;
+            match relay_extended_response(
+                backend,
+                frontend,
+                client,
+                pending_frontend,
+                shutdown,
+                ExtendedBoundary::Parse,
+                None,
+            )
+            .await?
+            {
+                ExtendedResponse::Complete(b'1') => {
+                    state.next_statement_version = version;
+                    state.insert_statement(parsed.name, pending_statement);
+                }
+                ExtendedResponse::Error => state.error_until_sync = true,
+                _ => return Err(()),
+            }
+        }
+        b'B' => {
+            if frame.payload().first() == Some(&0) {
+                state.begin_unnamed_bind();
+            }
+            let mut bound = match protocol::parse_extended_bind(frame.payload(), &[]) {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let (code, message) =
+                        extended_decode_error(error, "invalid PostgreSQL Bind message");
+                    return reject_extended(state, client, code, message).await;
+                }
+            };
+            let Some(statement) = state.statements.get(&bound.statement_name).cloned() else {
+                return reject_extended(
+                    state,
+                    client,
+                    "26000",
+                    "prepared statement does not exist",
+                )
+                .await;
+            };
+            for (index, parameter) in bound.execution_params.iter_mut().enumerate() {
+                if let ExecutionParam::Wire { type_hint, .. } = parameter {
+                    *type_hint = statement.parameter_type_hints.get(index).copied().flatten();
+                }
+            }
+            if !bound.portal_name.is_empty()
+                && !state.portals.contains_key(&bound.portal_name)
+                && state.portals.len() >= MAX_PORTALS_PER_CLIENT
+            {
+                return reject_extended(state, client, "54000", "portal limit reached").await;
+            }
+            let portal_name = bound.portal_name.clone();
+            let pending_portal = Portal {
+                statement,
+                execution_params: bound.execution_params,
+                parameter_formats: bound.parameter_formats,
+                result_formats: bound.result_formats,
+                backend_state: PortalState::Bound,
+            };
+            if !state.portals.contains_key(&portal_name)
+                && state
+                    .retained_bytes
+                    .saturating_add(portal_state_bytes(&pending_portal))
+                    > MAX_CLIENT_EXTENDED_STATE_BYTES
+            {
+                return reject_extended(state, client, "54000", "portal state limit reached").await;
+            }
+            let redaction_parameters = [pending_portal.execution_params.as_slice()];
+            backend.writer.write_all(&frame.raw).await.map_err(|_| ())?;
+            flush_backend_output(&mut backend.writer).await?;
+            match relay_extended_response(
+                backend,
+                frontend,
+                client,
+                pending_frontend,
+                shutdown,
+                ExtendedBoundary::Bind,
+                Some(&redaction_parameters),
+            )
+            .await?
+            {
+                ExtendedResponse::Complete(b'2') => {
+                    state.insert_portal(portal_name, pending_portal);
+                }
+                ExtendedResponse::Error => state.error_until_sync = true,
+                _ => return Err(()),
+            }
+        }
+        b'D' => {
+            let target = match protocol::parse_extended_target(frame.payload()) {
+                Ok(target) => target,
+                Err(_) => {
+                    return reject_extended(
+                        state,
+                        client,
+                        "08P01",
+                        "invalid PostgreSQL Describe target",
+                    )
+                    .await;
+                }
+            };
+            let exists = match target.target {
+                protocol::ExtendedTarget::Statement => state.statements.contains_key(&target.name),
+                protocol::ExtendedTarget::Portal => state.portals.contains_key(&target.name),
+            };
+            if !exists {
+                let (code, message) = match target.target {
+                    protocol::ExtendedTarget::Statement => {
+                        ("26000", "prepared statement does not exist")
+                    }
+                    protocol::ExtendedTarget::Portal => ("34000", "portal does not exist"),
+                };
+                return reject_extended(state, client, code, message).await;
+            }
+            let redaction_parameters = match target.target {
+                protocol::ExtendedTarget::Statement => Vec::new(),
+                protocol::ExtendedTarget::Portal => state
+                    .portals
+                    .get(&target.name)
+                    .map(|portal| vec![portal.execution_params.as_slice()])
+                    .unwrap_or_default(),
+            };
+            backend.writer.write_all(&frame.raw).await.map_err(|_| ())?;
+            flush_backend_output(&mut backend.writer).await?;
+            match relay_extended_response(
+                backend,
+                frontend,
+                client,
+                pending_frontend,
+                shutdown,
+                ExtendedBoundary::Describe,
+                Some(&redaction_parameters),
+            )
+            .await?
+            {
+                ExtendedResponse::Complete(b'T' | b'n') => {}
+                ExtendedResponse::Error => state.error_until_sync = true,
+                _ => return Err(()),
+            }
+        }
+        b'C' => {
+            let target = match protocol::parse_extended_target(frame.payload()) {
+                Ok(target) => target,
+                Err(_) => {
+                    return reject_extended(
+                        state,
+                        client,
+                        "08P01",
+                        "invalid PostgreSQL Close target",
+                    )
+                    .await;
+                }
+            };
+            backend.writer.write_all(&frame.raw).await.map_err(|_| ())?;
+            flush_backend_output(&mut backend.writer).await?;
+            match relay_extended_response(
+                backend,
+                frontend,
+                client,
+                pending_frontend,
+                shutdown,
+                ExtendedBoundary::Close,
+                None,
+            )
+            .await?
+            {
+                ExtendedResponse::Complete(b'3') => match target.target {
+                    protocol::ExtendedTarget::Statement => state.remove_statement(&target.name),
+                    protocol::ExtendedTarget::Portal => {
+                        state.remove_portal(&target.name);
+                    }
+                },
+                ExtendedResponse::Error => state.error_until_sync = true,
+                _ => return Err(()),
+            }
+        }
+        b'H' => {
+            if protocol::validate_empty_message(frame.payload()).is_err() {
+                return reject_extended(state, client, "08P01", "invalid PostgreSQL Flush message")
+                    .await;
+            }
+            backend.writer.write_all(&frame.raw).await.map_err(|_| ())?;
+            backend.writer.flush().await.map_err(|_| ())?;
+        }
+        b'E' => {
+            let execute = match protocol::parse_extended_execute(frame.payload()) {
+                Ok(execute) => execute,
+                Err(_) => {
+                    return reject_extended(
+                        state,
+                        client,
+                        "08P01",
+                        "invalid PostgreSQL Execute message",
+                    )
+                    .await;
+                }
+            };
+            let Some(portal) = state.portals.get(&execute.portal_name) else {
+                return reject_extended(state, client, "34000", "portal does not exist").await;
+            };
+            if portal.backend_state == PortalState::Failed {
+                return reject_extended(state, client, "34000", "portal is not executable").await;
+            }
+            if portal.parameter_formats.len() != portal.execution_params.len()
+                || portal
+                    .result_formats
+                    .iter()
+                    .any(|format| !matches!(format, 0 | 1))
+                || !portal
+                    .parameter_formats
+                    .iter()
+                    .zip(&portal.execution_params)
+                    .all(|(format, parameter)| match parameter {
+                        ExecutionParam::Wire { representation, .. } => format == representation,
+                        ExecutionParam::Null => true,
+                        _ => false,
+                    })
+            {
+                return Err(());
+            }
+            let redaction_parameters = [portal.execution_params.as_slice()];
+            let statement_version = portal.statement.version;
+            let sql = portal.statement.sql.clone();
+            let params = portal.execution_params.clone();
+            let authorization = match authorize_extended_execute(
+                config.clone(),
+                session_id.clone(),
+                sql.clone(),
+                params,
+                AuthorizationIo {
+                    frontend,
+                    client,
+                    backend_writer: &mut backend.writer,
+                    pending_frontend,
+                    shutdown,
+                },
+            )
+            .await
+            {
+                Some(outcome) => outcome,
+                None => return Err(()),
+            };
+            let permit = match authorization {
+                AuthorizationOutcome::Blocked(reason) => {
+                    let code = if reason.code == "UNSUPPORTED_OPERATION" {
+                        "0A000"
+                    } else {
+                        "42501"
+                    };
+                    return reject_extended(state, client, code, &reason.message).await;
+                }
+                AuthorizationOutcome::PendingApproval(pending) => {
+                    let message = format!("waiting for approval: {}", pending.approval_id);
+                    return reject_extended(state, client, "42501", &message).await;
+                }
+                AuthorizationOutcome::Failed(error) => {
+                    return reject_extended(state, client, "42501", error.message()).await;
+                }
+                AuthorizationOutcome::Permitted(permit) => permit,
+            };
+            if permit.dialect() != qk_sql::SqlDialect::PostgreSql
+                || permit.includes_operation(&Operation::Copy)
+                || permit.includes_operation(&Operation::Set)
+            {
+                return reject_extended(
+                    state,
+                    client,
+                    "0A000",
+                    "statement operation is not supported by this proxy",
+                )
+                .await;
+            }
+            if !record_history(
+                &config,
+                session_id.as_deref(),
+                &sql,
+                frontend,
+                client,
+                pending_frontend,
+                shutdown,
+            )
+            .await
+            {
+                return Err(());
+            }
+            forward_permitted_execute(*permit, frame, &mut backend.writer)
+                .await
+                .map_err(|_| ())?;
+            flush_backend_output(&mut backend.writer).await?;
+            match relay_extended_response(
+                backend,
+                frontend,
+                client,
+                pending_frontend,
+                shutdown,
+                ExtendedBoundary::Execute,
+                Some(&redaction_parameters),
+            )
+            .await?
+            {
+                ExtendedResponse::Complete(b'C' | b'I') => {
+                    if let Some(portal) = state.portals.get_mut(&execute.portal_name) {
+                        if portal.statement.version != statement_version {
+                            return Err(());
+                        }
+                        portal.backend_state = PortalState::Completed;
+                    }
+                }
+                ExtendedResponse::Complete(b's') => {
+                    if let Some(portal) = state.portals.get_mut(&execute.portal_name) {
+                        if portal.statement.version != statement_version {
+                            return Err(());
+                        }
+                        portal.backend_state = PortalState::Suspended;
+                    }
+                }
+                ExtendedResponse::Error => {
+                    if let Some(portal) = state.portals.get_mut(&execute.portal_name) {
+                        portal.backend_state = PortalState::Failed;
+                    }
+                    state.error_until_sync = true;
+                }
+                _ => return Err(()),
+            }
+        }
+        _ => return Err(()),
+    }
+    Ok(())
+}
+
+fn extended_decode_error(
+    error: FrameError,
+    malformed: &'static str,
+) -> (&'static str, &'static str) {
+    if error == FrameError::TooLarge {
+        (
+            "54000",
+            "PostgreSQL extended message exceeds the proxy limit",
+        )
+    } else {
+        ("08P01", malformed)
+    }
+}
+
+async fn reject_extended(
+    state: &mut ExtendedState,
+    client: &mut tokio::net::tcp::OwnedWriteHalf,
+    code: &str,
+    message: &str,
+) -> Result<(), ()> {
+    send_error_only(client, "ERROR", code, message).await?;
+    state.error_until_sync = true;
+    Ok(())
+}
+
+async fn relay_extended_response(
+    backend: &mut BackendSession,
+    frontend: &mut FrameReader<tokio::net::tcp::OwnedReadHalf>,
+    client: &mut tokio::net::tcp::OwnedWriteHalf,
+    pending_frontend: &mut Option<Frame>,
+    shutdown: &mut watch::Receiver<bool>,
+    boundary: ExtendedBoundary,
+    parameters: Option<&[&[ExecutionParam]]>,
+) -> Result<ExtendedResponse, ()> {
+    loop {
+        let incoming = tokio::select! {
+            _ = wait_shutdown(shutdown) => return Err(()),
+            frontend_frame = frontend.message(), if pending_frontend.is_none() => {
+                match frontend_frame {
+                    Ok(frame) => {
+                        *pending_frontend = Some(frame);
+                    }
+                    Err(_) => return Err(()),
+                }
+                continue;
+            }
+            backend_frame = backend.reader.message() => backend_frame.map_err(|_| ())?,
+        };
+        if matches!(incoming.kind, b'G' | b'H' | b'W' | b'd' | b'c' | b'f') {
+            return Err(());
+        }
+        if incoming.kind == b'S' {
+            let (name, value) = parse_parameter_status(incoming.payload()).ok_or(())?;
+            if name == "client_encoding" {
+                backend.client_encoding = Some(value);
+            }
+        }
+        if incoming.kind == b'E' {
+            let redacted = match parameters {
+                Some(parameters) => redact_backend_error(&incoming, parameters)?,
+                None => None,
+            };
+            client
+                .write_all(redacted.as_deref().unwrap_or(&incoming.raw))
+                .await
+                .map_err(|_| ())?;
+            return Ok(ExtendedResponse::Error);
+        }
+        if incoming.kind == b'Z' {
+            return Err(());
+        }
+        let kind = incoming.kind;
+        client.write_all(&incoming.raw).await.map_err(|_| ())?;
+        let complete = match boundary {
+            ExtendedBoundary::Parse => kind == b'1',
+            ExtendedBoundary::Bind => kind == b'2',
+            ExtendedBoundary::Describe => matches!(kind, b'T' | b'n'),
+            ExtendedBoundary::Close => kind == b'3',
+            ExtendedBoundary::Execute => matches!(kind, b'C' | b'I' | b's'),
+        };
+        if complete {
+            return Ok(ExtendedResponse::Complete(kind));
+        }
+    }
+}
+
+async fn relay_extended_ready(
+    backend: &mut BackendSession,
+    frontend: &mut FrameReader<tokio::net::tcp::OwnedReadHalf>,
+    client: &mut tokio::net::tcp::OwnedWriteHalf,
+    pending_frontend: &mut Option<Frame>,
+    shutdown: &mut watch::Receiver<bool>,
+    state: &ExtendedState,
+) -> Result<(), ()> {
+    let parameter_groups: Vec<&[ExecutionParam]> = state
+        .portals
+        .values()
+        .map(|portal| portal.execution_params.as_slice())
+        .collect();
+    loop {
+        tokio::select! {
+            _ = wait_shutdown(shutdown) => return Err(()),
+            frontend_frame = frontend.message(), if pending_frontend.is_none() => {
+                match frontend_frame {
+                    Ok(frame) => *pending_frontend = Some(frame),
+                    Err(_) => return Err(()),
+                }
+            }
+            backend_frame = backend.reader.message() => {
+                let message = backend_frame.map_err(|_| ())?;
+                if matches!(message.kind, b'G' | b'H' | b'W' | b'd' | b'c' | b'f') {
+                    return Err(());
+                }
+                if message.kind == b'S' {
+                    let (name, value) = parse_parameter_status(message.payload()).ok_or(())?;
+                    if name == "client_encoding" {
+                        backend.client_encoding = Some(value);
+                    }
+                }
+                if message.kind == b'E' {
+                    let redacted = redact_backend_error(&message, &parameter_groups)?;
+                    client
+                        .write_all(redacted.as_deref().unwrap_or(&message.raw))
+                        .await
+                        .map_err(|_| ())?;
+                    continue;
+                }
+                if message.kind == b'Z' {
+                    backend.transaction_status = parse_ready_status(message.payload()).map_err(|_| ())?;
+                    client.write_all(&message.raw).await.map_err(|_| ())?;
+                    return Ok(());
+                }
+                client.write_all(&message.raw).await.map_err(|_| ())?;
+            }
+        }
+    }
+}
+
+const MAX_ERROR_REDACTION_PARAMETERS: usize = 16;
+const MAX_ERROR_REDACTION_PARAMETER_BYTES: usize = 512;
+const MAX_ERROR_REDACTION_FRAME_BYTES: usize = 8 * 1024;
+
+fn parameter_bytes(parameter: &ExecutionParam) -> Option<&[u8]> {
+    match parameter {
+        ExecutionParam::Wire { bytes, .. } => Some(bytes),
+        ExecutionParam::Text(text) => Some(text.as_bytes()),
+        ExecutionParam::Bytes(bytes) => Some(bytes),
+        ExecutionParam::Null
+        | ExecutionParam::Bool(_)
+        | ExecutionParam::Int(_)
+        | ExecutionParam::UInt(_)
+        | ExecutionParam::FloatBits(_) => None,
+    }
+}
+
+fn contains_bind_bytes(field: &[u8], parameter_groups: &[&[ExecutionParam]]) -> bool {
+    parameter_groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .any(|parameter| {
+            let Some(value) = parameter_bytes(parameter) else {
+                return false;
+            };
+            !value.is_empty()
+                && value.len() <= field.len()
+                && field.windows(value.len()).any(|window| window == value)
+        })
+}
+
+fn error_field_has_bind_bytes(
+    payload: &[u8],
+    parameter_groups: &[&[ExecutionParam]],
+) -> Result<bool, ()> {
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        let tag = payload[offset];
+        offset += 1;
+        if tag == 0 {
+            return (offset == payload.len()).then_some(false).ok_or(());
+        }
+        let end = payload
+            .get(offset..)
+            .and_then(|rest| rest.iter().position(|byte| *byte == 0))
+            .map(|relative| offset + relative)
+            .ok_or(())?;
+        if contains_bind_bytes(&payload[offset..end], parameter_groups) {
+            return Ok(true);
+        }
+        offset = end + 1;
+    }
+    Err(())
+}
+
+fn redacted_error_message(parameter_groups: &[&[ExecutionParam]]) -> Option<&'static [u8]> {
+    [
+        b"backend details redacted".as_slice(),
+        b"query details omitted".as_slice(),
+        b"database response withheld".as_slice(),
+    ]
+    .into_iter()
+    .find(|message| !contains_bind_bytes(message, parameter_groups))
+}
+
+/// Preserve backend ErrorResponse fields unless they contain a bound value.
+/// Large/high-arity requests use conservative message-field removal instead
+/// of an unbounded many-pattern scan.
+fn redact_backend_error(
+    frame: &Frame,
+    parameter_groups: &[&[ExecutionParam]],
+) -> Result<Option<Vec<u8>>, ()> {
+    let mut aggregate_bytes = 0usize;
+    let mut nonempty_count = 0usize;
+    for parameter in parameter_groups.iter().flat_map(|group| group.iter()) {
+        if let Some(bytes) = parameter_bytes(parameter) {
+            if !bytes.is_empty() {
+                aggregate_bytes = aggregate_bytes.saturating_add(bytes.len());
+                nonempty_count += 1;
+            }
+        }
+    }
+    if nonempty_count == 0 {
+        return Ok(None);
+    }
+    let payload = frame.payload();
+    let conservative = frame.raw.len() > MAX_ERROR_REDACTION_FRAME_BYTES
+        || aggregate_bytes > MAX_ERROR_REDACTION_PARAMETER_BYTES
+        || nonempty_count > MAX_ERROR_REDACTION_PARAMETERS;
+    if !conservative && !error_field_has_bind_bytes(payload, parameter_groups)? {
+        return Ok(None);
+    }
+
+    let generic_message = redacted_error_message(parameter_groups);
+    let mut redacted = Vec::with_capacity(payload.len().min(MAX_ERROR_REDACTION_FRAME_BYTES));
+    let mut offset = 0usize;
+    let mut has_message = false;
+    while offset < payload.len() {
+        let tag = payload[offset];
+        offset += 1;
+        if tag == 0 {
+            if offset != payload.len() {
+                return Err(());
+            }
+            break;
+        }
+        let end = payload
+            .get(offset..)
+            .and_then(|rest| rest.iter().position(|byte| *byte == 0))
+            .map(|relative| offset + relative)
+            .ok_or(())?;
+        let value = &payload[offset..end];
+        let matches_parameter = contains_bind_bytes(value, parameter_groups);
+        let control_field = matches!(tag, b'S' | b'V' | b'C');
+        let keep = if conservative {
+            control_field && !matches_parameter
+        } else {
+            !matches_parameter && tag != b'M'
+        };
+        if keep {
+            redacted.push(tag);
+            redacted.extend_from_slice(value);
+            redacted.push(0);
+            has_message |= tag == b'M';
+        } else if tag == b'M' {
+            if let Some(message) = generic_message {
+                redacted.push(b'M');
+                redacted.extend_from_slice(message);
+                redacted.push(0);
+                has_message = true;
+            }
+        }
+        offset = end + 1;
+    }
+    if !has_message {
+        if let Some(message) = generic_message {
+            redacted.push(b'M');
+            redacted.extend_from_slice(message);
+            redacted.push(0);
+        }
+    }
+    redacted.push(0);
+    protocol::encode_message(b'E', &redacted)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+async fn authorize_extended_execute(
+    config: Arc<ProxyConfig>,
+    session_id: Option<String>,
+    sql: String,
+    params: Vec<ExecutionParam>,
+    io: AuthorizationIo<'_>,
+) -> Option<AuthorizationOutcome> {
+    let AuthorizationIo {
+        frontend,
+        client,
+        backend_writer,
+        pending_frontend,
+        shutdown,
+    } = io;
+    let mut worker = tokio::task::spawn_blocking(move || {
+        let store = InMemoryApprovalStore::new();
+        let provider = match (config.control_plane.clone(), session_id.clone()) {
+            (Some(client), Some(session_id)) => Some(
+                DaemonApprovalProvider::new(
+                    client,
+                    Some(session_id),
+                    config.connection_key.clone(),
+                    None,
+                )
+                .with_exact_lookup_retry(),
+            ),
+            _ => None,
+        };
+        let setup = ApprovalSetup {
+            store: &store,
+            provider: provider
+                .as_ref()
+                .map(|provider| provider as &dyn ApprovalProvider),
+            ttl_ms: 60_000,
+            now_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        let auth = TrustedContext {
+            integration: "proxy_pg".to_owned(),
+            environment: config.environment.clone(),
+            database: config.database.clone(),
+            tool: "proxy_query".to_owned(),
+            session_id,
+        };
+        let mut request = AuthorizationRequest::new(sql, params);
+        request
+            .reject_operations
+            .extend([Operation::Copy, Operation::Set]);
+        authorize_guarded(
+            &CursorStore::new(),
+            &GuardedAuthorizationCall {
+                config: &config.db_config,
+                connection_key: &config.connection_key,
+                auth: &auth,
+                approval: Some(&setup),
+                policy: &config.policy,
+            },
+            &request,
+            ResolveMode::ResolveApprovals,
+        )
+    });
+
+    loop {
+        tokio::select! {
+            _ = wait_shutdown(shutdown) => {
+                let _ = backend_writer.shutdown().await;
+                let _ = (&mut worker).await;
+                return None;
+            }
+            incoming = frontend.message(), if pending_frontend.is_none() => {
+                match incoming {
+                    Ok(frame) if frame.kind == b'X' => {
+                        let _ = backend_writer.shutdown().await;
+                        let _ = (&mut worker).await;
+                        return None;
+                    }
+                    Ok(frame) => *pending_frontend = Some(frame),
+                    Err(FrameError::Eof) => {
+                        let _ = backend_writer.shutdown().await;
+                        let _ = (&mut worker).await;
+                        return None;
+                    }
+                    Err(_) => {
+                        let _ = write_error(client, "FATAL", "08P01", "invalid pipelined PostgreSQL frame").await;
+                        let _ = backend_writer.shutdown().await;
+                        let _ = (&mut worker).await;
+                        return None;
+                    }
+                }
+            }
+            result = &mut worker => {
+                return Some(result.unwrap_or_else(|_| {
+                    AuthorizationOutcome::Failed(qk_db::DbError::new(
+                        qk_db::DbErrorKind::Internal,
+                        "authorization worker failed",
+                    ))
+                }));
+            }
+        }
+    }
+}
+
+async fn forward_permitted_execute(
+    permit: qk_db::ExecutionPermit,
+    frame: Frame,
+    backend: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<(), ()> {
+    if permit.dialect() != qk_sql::SqlDialect::PostgreSql {
+        return Err(());
+    }
+    drop(permit);
+    backend.write_all(&frame.raw).await.map_err(|_| ())
+}
+
+async fn flush_backend_output(backend: &mut tokio::net::tcp::OwnedWriteHalf) -> Result<(), ()> {
+    backend
+        .write_all(&BACKEND_FLUSH_FRAME)
+        .await
+        .map_err(|_| ())?;
+    backend.flush().await.map_err(|_| ())
 }
 
 async fn read_startup_with_refusals(
@@ -943,37 +1958,6 @@ async fn relay_until_ready(
     }
 }
 
-async fn drain_until_sync(
-    frontend: &mut FrameReader<tokio::net::tcp::OwnedReadHalf>,
-    client: &mut tokio::net::tcp::OwnedWriteHalf,
-    backend: &mut BackendSession,
-    pending_frontend: &mut Option<Frame>,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<(), ()> {
-    loop {
-        let frame = match pending_frontend.take() {
-            Some(frame) => frame,
-            None => tokio::select! {
-                _ = wait_shutdown(shutdown) => return Err(()),
-                message = frontend.message() => message.map_err(|_| ())?,
-            },
-        };
-        if frame.kind == b'X' {
-            let _ = backend.writer.write_all(&frame.raw).await;
-            return Err(());
-        }
-        if frame.kind == b'S' {
-            if !frame.payload().is_empty() {
-                return Err(());
-            }
-            send_ready(client, backend.transaction_status).await?;
-            return Ok(());
-        }
-        // Ignore all messages after the synthetic error until Sync. No stale
-        // executable operation is sent to the backend.
-    }
-}
-
 fn parse_parameter_status(payload: &[u8]) -> Option<(String, String)> {
     let name_end = payload.iter().position(|byte| *byte == 0)?;
     let rest = payload.get(name_end + 1..)?;
@@ -1037,5 +2021,67 @@ async fn wait_shutdown(shutdown: &mut watch::Receiver<bool>) {
         if shutdown.changed().await.is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend_error(message: &str) -> Frame {
+        let payload = [b"SERROR\0C22P02\0M".as_slice(), message.as_bytes(), b"\0\0"].concat();
+        Frame {
+            kind: b'E',
+            raw: protocol::encode_message(b'E', &payload).unwrap().into(),
+        }
+    }
+
+    fn wire_text(value: &[u8]) -> ExecutionParam {
+        ExecutionParam::Wire {
+            representation: qk_core::ParamRepresentation::Text,
+            type_hint: Some(25),
+            bytes: value.to_vec(),
+        }
+    }
+
+    #[test]
+    fn backend_parameter_echo_is_redacted_but_non_echo_error_is_preserved() {
+        let secret = b"PG_BIND_SECRET_8675309";
+        let frame = backend_error("invalid value PG_BIND_SECRET_8675309");
+        let parameters = [wire_text(secret)];
+        let groups = [parameters.as_slice()];
+        let redacted = redact_backend_error(&frame, &groups)
+            .unwrap()
+            .expect("matched bind bytes");
+        assert!(!redacted
+            .windows(secret.len())
+            .any(|window| window == secret));
+        assert!(redacted.windows(5).any(|window| window == b"22P02"));
+        assert!(redacted
+            .windows(b"backend details redacted".len())
+            .any(|window| window == b"backend details redacted"));
+
+        let unrelated = backend_error("invalid input syntax for type integer");
+        assert!(redact_backend_error(&unrelated, &groups).unwrap().is_none());
+    }
+
+    #[test]
+    fn large_bind_error_uses_conservative_redaction() {
+        let parameters: Vec<_> = (0..MAX_ERROR_REDACTION_PARAMETERS + 1)
+            .map(|index| wire_text(format!("large-secret-{index}").as_bytes()))
+            .collect();
+        let frame = backend_error("specific backend details may include an input value");
+        let groups = [parameters.as_slice()];
+        let redacted = redact_backend_error(&frame, &groups)
+            .unwrap()
+            .expect("large bind set uses conservative redaction");
+        for parameter in &parameters {
+            if let ExecutionParam::Wire { bytes, .. } = parameter {
+                assert!(!redacted
+                    .windows(bytes.len())
+                    .any(|window| window == bytes.as_slice()));
+            }
+        }
+        assert!(redacted.windows(5).any(|window| window == b"22P02"));
     }
 }
