@@ -53,6 +53,8 @@ pub struct AuthorizationRequest {
     /// Statement kinds this adapter refuses independently of policy (for
     /// example, protocol operations it cannot safely execute).
     pub reject_operations: Vec<qk_sql::Operation>,
+    /// Refuse parse/unknown fallback outcomes even if policy requests approval.
+    pub require_supported_analysis: bool,
     /// Retry with a previously issued approval id.
     pub approval_id: Option<String>,
     /// Requested row cap.
@@ -69,6 +71,7 @@ impl AuthorizationRequest {
             params,
             driver_params: Vec::new(),
             reject_operations: Vec::new(),
+            require_supported_analysis: false,
             approval_id: None,
             max_rows: None,
             cursor: None,
@@ -88,6 +91,7 @@ impl AuthorizationRequest {
             sql,
             driver_params: params,
             reject_operations: Vec::new(),
+            require_supported_analysis: false,
             approval_id,
             max_rows,
             cursor,
@@ -295,6 +299,19 @@ pub fn authorize_guarded(
         },
         &EvaluateOptions::default(),
     );
+    if request.require_supported_analysis
+        && matches!(
+            evaluation.reason_code,
+            qk_core::ReasonCode::DenyParseError | qk_core::ReasonCode::DenyUnknownStatement
+        )
+    {
+        return AuthorizationOutcome::Blocked(BlockedReason {
+            decision: Decision::Deny,
+            code: "UNSUPPORTED_SQL_ANALYSIS".to_owned(),
+            message: "SQL could not be fully analyzed for this adapter".to_owned(),
+            matched_policy: None,
+        });
+    }
     if evaluation.decision != Decision::Deny
         && request
             .reject_operations

@@ -219,6 +219,61 @@ fn unknown_dialect_is_typed_error() {
 }
 
 #[test]
+fn mysql_sql_mode_and_charset_changes_are_unknown_but_other_session_settings_remain_set() {
+    for sql in [
+        "SET NAMES latin1",
+        "SET NAMES DEFAULT",
+        "SET sql_mode = 'ANSI'",
+        "SET character_set_client = 'latin1'",
+        "SET character_set_connection = 'latin1'",
+    ] {
+        let analysis = analyze(sql, "mysql").expect("charset statement parses");
+        assert_eq!(
+            analysis.statements[0].operation,
+            Operation::Unsupported,
+            "{sql}"
+        );
+    }
+    for sql in ["START TRANSACTION", "COMMIT", "ROLLBACK"] {
+        let analysis = analyze(sql, "mysql").expect("transaction statement parses");
+        assert_eq!(analysis.statements[0].operation, Operation::Transaction);
+        assert_eq!(
+            analysis.statements[0].operation.category(),
+            qk_sql::OpCategory::Admin
+        );
+    }
+
+    for sql in [
+        "SET time_zone = '+00:00'",
+        "SET ROLE r",
+        "SET autocommit = 0",
+    ] {
+        let analysis = analyze(sql, "mysql").expect("session statement parses");
+        assert_eq!(analysis.statements[0].operation, Operation::Set, "{sql}");
+    }
+}
+
+#[test]
+fn mysql_select_into_side_effects_are_unsupported() {
+    for sql in [
+        "SELECT 1 INTO OUTFILE '/tmp/qk-outfile'",
+        "SELECT 1 INTO DUMPFILE '/tmp/qk-dumpfile'",
+        "SELECT 1 INTO @session_value",
+        "SELECT 1 /*!80000 INTO OUTFILE '/tmp/qk-comment-outfile' */",
+    ] {
+        match analyze(sql, "mysql") {
+            Ok(analysis) => assert_eq!(
+                analysis.statements[0].operation,
+                Operation::Unsupported,
+                "{sql}"
+            ),
+            Err(SqlAnalysisError::ParseError { .. }) => {}
+            Err(error) => panic!("unexpected analysis error for {sql}: {error}"),
+        }
+    }
+}
+
+#[test]
 fn mysql_update_delete_limit_and_returning_shapes() {
     let a = match analyze("DELETE FROM t WHERE a = 1 LIMIT 5", "mysql") {
         Ok(a) => a,

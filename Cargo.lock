@@ -1513,6 +1513,7 @@ dependencies = [
  "qk-daemon",
  "qk-db",
  "qk-mcp",
+ "qk-proxy-mysql",
  "qk-proxy-postgres",
  "qk-sql",
  "rusqlite",
@@ -1620,6 +1621,22 @@ dependencies = [
 [[package]]
 name = "qk-metrics"
 version = "0.1.0"
+
+[[package]]
+name = "qk-proxy-mysql"
+version = "0.1.0-beta.0"
+dependencies = [
+ "mysql_async",
+ "qk-approval",
+ "qk-control-plane",
+ "qk-core",
+ "qk-daemon",
+ "qk-db",
+ "qk-mcp",
+ "qk-sql",
+ "qk-store",
+ "tokio",
+]
 
 [[package]]
 name = "qk-proxy-postgres"

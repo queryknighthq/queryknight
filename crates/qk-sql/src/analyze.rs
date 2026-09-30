@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use sqlparser::ast::{
     AssignmentTarget, CopySource, Delete, Expr, FunctionArg, FunctionArgExpr, GrantObjects, Ident,
-    LimitClause, MergeAction, MergeUpdateKind, ObjectName, Query, Select, SelectItem, SetExpr,
+    LimitClause, MergeAction, MergeUpdateKind, ObjectName, Query, Select, SelectItem, Set, SetExpr,
     Statement, TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind, Value,
 };
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
@@ -349,6 +349,37 @@ fn column_ref_of(name: &ObjectName) -> Option<ColumnRef> {
     }
 }
 
+fn changes_sql_interpretation(set: &Set) -> bool {
+    match set {
+        Set::SetNames { .. } | Set::SetNamesDefault {} => true,
+        Set::SingleAssignment { variable, .. } => is_sql_interpretation_variable(variable),
+        Set::MultipleAssignments { assignments } => assignments
+            .iter()
+            .any(|assignment| is_sql_interpretation_variable(&assignment.name)),
+        _ => false,
+    }
+}
+
+fn is_sql_interpretation_variable(name: &ObjectName) -> bool {
+    let Some(identifier) = name.0.last().and_then(|part| part.as_ident()) else {
+        return false;
+    };
+    [
+        "character_set",
+        "character_set_client",
+        "character_set_connection",
+        "character_set_results",
+        "character_set_server",
+        "character_set_database",
+        "collation_connection",
+        "collation_server",
+        "collation_database",
+        "sql_mode",
+    ]
+    .iter()
+    .any(|setting| identifier.value.eq_ignore_ascii_case(setting))
+}
+
 // ---------------------------------------------------------------------------
 // Statement dispatch
 // ---------------------------------------------------------------------------
@@ -482,7 +513,13 @@ fn walk_statement(stmt: &Statement, col: &mut Collector, primary: bool, depth: u
             walk_function(f, col, depth + 1);
             Operation::Call
         }
-        Statement::Set(_) => Operation::Set,
+        Statement::Set(set) => {
+            if changes_sql_interpretation(set) {
+                Operation::Unsupported
+            } else {
+                Operation::Set
+            }
+        }
         Statement::ShowTables { .. } => Operation::Show,
         // SHOW COLUMNS carries its scope in `show_options`; the table filter
         // forms differ per dialect, so no table identity is claimed here.
@@ -724,7 +761,16 @@ fn walk_set_expr(
     match body {
         SetExpr::Select(s) => {
             walk_select(s, col, depth);
-            None
+            if s.into.is_some() {
+                if main {
+                    Some(Operation::Unsupported)
+                } else {
+                    col.nested.insert(Operation::Unsupported);
+                    None
+                }
+            } else {
+                None
+            }
         }
         SetExpr::Query(q) => walk_query(q, col, main, depth),
         SetExpr::SetOperation { left, right, .. } => {

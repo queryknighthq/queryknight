@@ -73,8 +73,15 @@ port, not a byte-for-byte reproduction of those unsafe paths.
 
 The PostgreSQL Rust ingress uses `proxy_pg` as trusted integration identity,
 one backend session per frontend, and a fresh `ExecutionPermit` before every
-executable Q/Execute. It is not a generic proxy framework. MySQL and OpenShell
-remain separate/deferred.
+executable Q/Execute. It is not a generic proxy framework. The MySQL Rust
+ingress is a separate classic-protocol COM_QUERY proxy; prepared execution is
+deferred to a later reviewed commit, and OpenShell remains deferred.
+## MySQL proxy audit (source-verified)
+
+The TypeScript MySQL proxy's exact behavior, security gaps, and the hardened
+Rust COM_QUERY protocol-state table are documented in [`proxy-mysql.md`](proxy-mysql.md).
+MySQL has its own protocol crate and state machine; it does not share a generic
+wire-proxy engine with PostgreSQL.
 packages/integrations/openshell/  NVIDIA OpenShell supervisor-middleware (dependency-free, gRPC optional peer dep)
   inspector.ts                  parseInspectorConfig, baseContext, inspectHttpRequest/inspectWebSocketMessage, WaitingProvider (approvals always waiting), approvalAction deny|allow_with_findings, toReasonCode
   sql-extract.ts                SQL extraction: raw-SQL lead regex, MCP JSON-RPC tools/call, OpenAI tool_calls, generic sql/query/statement fields; caps 8 candidates / 200k chars; strips leading -- and /* */ comments

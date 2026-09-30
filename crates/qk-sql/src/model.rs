@@ -119,7 +119,8 @@ pub enum Operation {
     /// EXPLAIN of another statement. The inner write, when any, is also
     /// recorded in `nested_operations` so it stays visible.
     Explain,
-    /// Transaction control (BEGIN / COMMIT / ROLLBACK / ...).
+    /// Transaction control (BEGIN / COMMIT / ROLLBACK / ...); policy-matchable
+    /// only through an explicit transaction rule.
     Transaction,
     /// Parsed but deliberately unmapped: never read, never executed-blind.
     Unsupported,
@@ -161,8 +162,10 @@ impl Operation {
             Self::Create | Self::Alter => OpCategory::Ddl,
             Self::Drop | Self::Truncate => OpCategory::Destructive,
             Self::Grant | Self::Revoke => OpCategory::Privilege,
-            Self::Copy | Self::Call | Self::Set | Self::Vacuum => OpCategory::Admin,
-            Self::Transaction | Self::Unsupported => OpCategory::Unknown,
+            Self::Copy | Self::Call | Self::Set | Self::Vacuum | Self::Transaction => {
+                OpCategory::Admin
+            }
+            Self::Unsupported => OpCategory::Unknown,
         }
     }
 }

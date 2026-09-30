@@ -323,6 +323,36 @@ fn denied_authorization_returns_blocked_not_a_permit() {
 }
 
 #[test]
+fn strict_analysis_rejects_parse_and_unknown_approval_fallbacks() {
+    let store = InMemoryApprovalStore::new();
+    let config = sqlite_config();
+    let trusted = auth();
+    let policy = qk_core::parse_policy(
+        "version: 1\ndefaults:\n  decision: deny\n  on_parse_error: require_approval\n  on_unknown: require_approval\nenvironments: {}\n",
+    )
+    .expect("policy");
+    let provider = TestProvider::new(vec![ProviderDecision::Approved, ProviderDecision::Approved]);
+    for sql in ["FROBNICATE t", "CALL arbitrary_proc()"] {
+        let mut request = auth_request(sql);
+        request.require_supported_analysis = true;
+        let outcome = authorize(
+            &store,
+            Some(&provider),
+            &config,
+            &trusted,
+            &policy,
+            &request,
+        );
+        assert!(matches!(outcome, AuthorizationOutcome::Blocked(_)), "{sql}");
+    }
+    assert_eq!(
+        provider.calls(),
+        0,
+        "unsupported SQL never reaches approvals"
+    );
+}
+
+#[test]
 fn unbounded_write_authorization_runs_no_impact_explain() {
     // A RequireApproval unbounded UPDATE is the one case that used to
     // trigger a planner impact EXPLAIN before approval. Authorization

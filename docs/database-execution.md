@@ -419,12 +419,14 @@ identity. COPY, SQL SET, and FunctionCall remain blocked.
 
 The protocol-neutral Exact V2 encoder is shared across ingress adapters;
 text and binary bytes are hashed exactly as represented, and no proxy-local
-digest is permitted. MySQL behavior is unchanged.
+digest is permitted. MySQL COM_QUERY has no bind parameters and uses SQL-only
+Exact V1; MySQL prepared messages remain unsupported in the first proxy commit.
 
 ## Shared daemon approval path
 
 The daemon-backed provider and authenticated control-plane HTTP client live
-in `qk-control-plane`; MCP and the PostgreSQL proxy consume the same provider.
+in `qk-control-plane`; MCP and both PostgreSQL and MySQL proxies consume the
+same provider.
 Runtime discovery reuses `qk-daemon::runtime`. The provider maps a typed
 `ApprovalRequest` through the existing `qk-approval::ApprovalProvider`
 trait, then `authorize_guarded` returns a request-specific permit. Only
@@ -439,7 +441,7 @@ ingress adapter → authorize_guarded → qk-approval resolve
 ```
 
 The provider performs bounded synchronous loopback I/O during authorization.
-The PostgreSQL proxy schedules this work on a blocking task so it cannot block
+Both protocol proxies schedule this work on a blocking task so it cannot block
 a Tokio core worker; the provider trait and authorization plane remain
 synchronous.
 

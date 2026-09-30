@@ -124,9 +124,9 @@ enum TopCommand {
         #[arg(long)]
         home: Option<std::path::PathBuf>,
     },
-    /// Start the PostgreSQL Simple Query wire proxy (default listen port 5434).
+    /// Start the local MySQL or PostgreSQL wire proxy (default port 3308 or 5434).
     Proxy {
-        /// Loopback listener port.
+        /// Loopback listener port (default 3308 for MySQL, 5434 for PostgreSQL).
         #[arg(long)]
         listen: Option<u16>,
     },
