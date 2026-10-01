@@ -64,6 +64,35 @@ fn blocked_deny() -> ExecutionOutcome {
     })
 }
 
+fn authorize_select() -> qk_db::AuthorizationOutcome {
+    authorize_query("SELECT id FROM users", Vec::new())
+}
+
+fn authorize_query(sql: &str, params: Vec<qk_core::ExecutionParam>) -> qk_db::AuthorizationOutcome {
+    let config = qk_db::DbConfig::from_url("postgresql://localhost/app").expect("config");
+    let connection_key = config.redacted_url();
+    let auth = qk_db::TrustedContext {
+        integration: "openshell".to_owned(),
+        environment: "production".to_owned(),
+        database: "main".to_owned(),
+        tool: String::new(),
+        session_id: Some("sandbox-1".to_owned()),
+    };
+    let policy = qk_core::demo_policy().expect("demo policy");
+    let request = qk_db::AuthorizationRequest::new(sql.to_owned(), params);
+    qk_db::authorize_guarded(
+        &qk_db::CursorStore::new(),
+        &qk_db::GuardedAuthorizationCall {
+            config: &config,
+            connection_key: &connection_key,
+            auth: &auth,
+            approval: None,
+            policy: &policy,
+        },
+        &request,
+        qk_db::ResolveMode::ResolveApprovals,
+    )
+}
 // ---------------------------------------------------------------------------
 // One attempt = one event, typed facts.
 // ---------------------------------------------------------------------------
@@ -108,7 +137,6 @@ fn deny_observes_without_execution_implication() {
     assert_eq!(event.outcome, qk_audit::AttemptOutcome::Blocked);
     assert!(event.rows_affected.is_none());
     assert_eq!(event.operation, "drop");
-    assert!(event.tables.is_empty() || !event.tables.is_empty());
     // Metadata level: normalized SQL present, raw absent.
     let normalized = event.normalized_sql.expect("normalized");
     assert!(!normalized.contains("DROP") || normalized.contains("drop"));
@@ -191,6 +219,128 @@ fn ocsf_allow_golden() {
     assert_eq!(ocsf["time"], serde_json::Value::from(1_790_769_600_000u64));
     // Undefined stays omitted (never null).
     assert!(ocsf.get("src_endpoint").is_none());
+}
+#[test]
+fn authorization_allow_is_never_an_execution_success() {
+    let sql = "SELECT $1 WHERE note = 'OPENSHELL_SQL_SECRET_12345'";
+    let outcome = authorize_query(
+        sql,
+        vec![qk_core::ExecutionParam::Text(
+            "OPENSHELL_PARAM_SECRET_67890".to_owned(),
+        )],
+    );
+    assert!(matches!(
+        &outcome,
+        qk_db::AuthorizationOutcome::Permitted(_)
+    ));
+    let observation = Observation::from_authorization_outcome(
+        "22222222-2222-4222-8222-222222222222".to_owned(),
+        1_790_769_600_001,
+        9,
+        Some(4),
+        Some("openshell-request-1".to_owned()),
+        "openshell".to_owned(),
+        "production".to_owned(),
+        Some("main".to_owned()),
+        None,
+        Some("sandbox-1".to_owned()),
+        None,
+        None,
+        qk_sql::SqlDialect::PostgreSql,
+        sql.to_owned(),
+        &outcome,
+    );
+    let memory = Arc::new(MemorySink::new());
+    let observer = Observer::new(vec![memory.clone()]);
+    assert!(observer
+        .observe(&observation, SqlLogLevel::Fingerprint)
+        .is_empty());
+    assert_eq!(memory.len(), 1);
+
+    let events = memory.events();
+    let event = &events[0];
+    assert_eq!(event.integration, "openshell");
+    assert_eq!(event.decision, AuditDecision::Allow);
+    assert_eq!(event.reason_code, "ALLOW_RULE");
+    assert_eq!(event.outcome, qk_audit::AttemptOutcome::Authorized);
+    assert!(event.rows_affected.is_none());
+    assert!(event.rows_shown.is_none());
+    assert!(event.truncated.is_none());
+    assert!(event.sql.is_none());
+    assert!(event.normalized_sql.is_none());
+    assert_eq!(event.session_id.as_deref(), Some("sandbox-1"));
+
+    let ocsf = ocsf_json(event);
+    assert_eq!(ocsf["activity_name"], "Allow");
+    assert_eq!(ocsf["status_id"], 0);
+    assert_eq!(ocsf["status"], "Unknown");
+    assert_eq!(ocsf["unmapped"]["qk_outcome"], "authorized");
+
+    for level in [
+        SqlLogLevel::None,
+        SqlLogLevel::Fingerprint,
+        SqlLogLevel::Metadata,
+    ] {
+        let event = observation.audit_event(level);
+        let surfaces = [
+            serde_json::to_string(&event).expect("event json"),
+            serde_json::to_string(&ocsf_json(&event)).expect("OCSF json"),
+            format!("{event:?}"),
+        ];
+        for surface in surfaces {
+            assert!(!surface.contains("OPENSHELL_SQL_SECRET_12345"));
+            assert!(!surface.contains("OPENSHELL_PARAM_SECRET_67890"));
+        }
+    }
+    assert!(!observer
+        .metrics()
+        .render()
+        .contains("OPENSHELL_PARAM_SECRET_67890"));
+
+    let full_sql = observation.audit_event(SqlLogLevel::FullSql);
+    assert!(full_sql
+        .sql
+        .as_deref()
+        .is_some_and(|value| value.contains("OPENSHELL_SQL_SECRET_12345")));
+    assert!(!serde_json::to_string(&full_sql)
+        .expect("full SQL event")
+        .contains("OPENSHELL_PARAM_SECRET_67890"));
+}
+
+#[test]
+fn authorization_only_ocsf_status_is_unknown_and_db_failure_is_failure() {
+    let authorized = Observation::from_authorization_outcome(
+        "33333333-3333-4333-8333-333333333333".to_owned(),
+        1_790_769_600_002,
+        4,
+        Some(4),
+        None,
+        "openshell".to_owned(),
+        "production".to_owned(),
+        Some("main".to_owned()),
+        None,
+        None,
+        None,
+        None,
+        qk_sql::SqlDialect::PostgreSql,
+        "SELECT 1".to_owned(),
+        &authorize_select(),
+    )
+    .audit_event(SqlLogLevel::Fingerprint);
+    let authorized_ocsf = ocsf_json(&authorized);
+    assert_eq!(authorized_ocsf["activity_name"], "Allow");
+    assert_eq!(authorized_ocsf["status"], "Unknown");
+    assert_eq!(authorized_ocsf["unmapped"]["qk_outcome"], "authorized");
+
+    let failed = observation(
+        &ExecutionOutcome::Failed(DbError::new(DbErrorKind::Query, "query failed")),
+        "SELECT 1",
+    )
+    .audit_event(SqlLogLevel::Fingerprint);
+    let failed_ocsf = ocsf_json(&failed);
+    assert_eq!(failed_ocsf["activity_name"], "Allow");
+    assert_eq!(failed_ocsf["status"], "Failure");
+    assert_eq!(failed_ocsf["unmapped"]["qk_outcome"], "failed");
 }
 
 #[test]

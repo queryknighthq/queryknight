@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use qk_audit::{AttemptOutcome, AuditDecision, MemorySink, Observer};
 use qk_control_plane::{ApprovalBindingKind, ApprovalDecision, ApprovalStatus, ControlPlaneClient};
 use qk_db::DbConfig;
 use qk_openshell::proto::supervisor_middleware_client::SupervisorMiddlewareClient;
@@ -59,6 +62,14 @@ fn request(body: Vec<u8>, input: prost_types::Struct, sandbox_id: &str) -> HttpR
         middleware_name: "queryknight".to_owned(),
     }
 }
+fn assert_decision_only_response(response: &proto::HttpRequestResult) {
+    assert!(response.reason.is_empty());
+    assert!(response.body.is_empty());
+    assert!(!response.has_body);
+    assert!(response.header_mutations.is_empty());
+    assert!(response.findings.is_empty());
+    assert!(response.metadata.is_empty());
+}
 
 async fn openshell_client(
     service: OpenShellService,
@@ -84,7 +95,10 @@ async fn openshell_client(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn generated_client_describes_validates_and_evaluates_http_and_websocket() {
     let db = DbConfig::from_url("postgresql://user:secret@127.0.0.1/app").expect("db config");
-    let service = OpenShellService::new(OpenShellServiceConfig::new(db));
+    let sink = Arc::new(MemorySink::new());
+    let observer = Observer::new(vec![sink.clone()]);
+    let service =
+        OpenShellService::new(OpenShellServiceConfig::new(db).with_observer(observer.clone()));
     let (mut client, server) = openshell_client(service).await;
 
     let manifest = client
@@ -123,6 +137,10 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
         .expect("ValidateConfig")
         .into_inner();
     assert!(validation.valid, "{}", validation.reason);
+    assert!(
+        sink.is_empty(),
+        "Describe and ValidateConfig are not audited"
+    );
 
     let allow = client
         .evaluate_http_request(request(
@@ -136,6 +154,21 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
     assert_eq!(allow.decision, Decision::Allow as i32);
     assert!(!allow.has_body);
     assert!(allow.header_mutations.is_empty());
+    let events = sink.events();
+    assert_eq!(events.len(), 1);
+    let authorization = &events[0];
+    assert_eq!(authorization.integration, "openshell");
+    assert_eq!(authorization.decision, AuditDecision::Allow);
+    assert_eq!(authorization.reason_code, "ALLOW_RULE");
+    assert_eq!(authorization.outcome, AttemptOutcome::Authorized);
+    assert!(authorization.rows_affected.is_none());
+    assert!(authorization.rows_shown.is_none());
+    assert!(authorization.truncated.is_none());
+    assert!(authorization.sql.is_none());
+    assert!(authorization.normalized_sql.is_none());
+    assert_eq!(authorization.session_id.as_deref(), Some("sandbox-one"));
+    let ocsf = qk_audit::to_ocsf(authorization, "0.1.0-beta.0");
+    assert_eq!(ocsf.status, "Unknown");
 
     let deny = client
         .evaluate_http_request(request(
@@ -148,6 +181,16 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
         .into_inner();
     assert_eq!(deny.decision, Decision::Deny as i32);
     assert_eq!(deny.reason_code, "queryknight_deny_rule");
+    let events = sink.events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].decision, AuditDecision::Deny);
+    assert_eq!(events[1].outcome, AttemptOutcome::Blocked);
+    assert_eq!(events[1].reason_code, "DENY_RULE");
+    assert!(events[1].rows_affected.is_none());
+    assert_eq!(
+        qk_audit::to_ocsf(&events[1], "0.1.0-beta.0").status,
+        "Failure"
+    );
     let mut allow_client = client.clone();
     let mut deny_client = client.clone();
     let (concurrent_allow, concurrent_deny) = tokio::join!(
@@ -176,6 +219,16 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
             .decision,
         Decision::Deny as i32
     );
+    let events = sink.events();
+    assert_eq!(events.len(), 4);
+    assert!(events[2..]
+        .iter()
+        .any(|event| event.session_id.as_deref() == Some("sandbox-allow")
+            && event.decision == AuditDecision::Allow));
+    assert!(events[2..]
+        .iter()
+        .any(|event| event.session_id.as_deref() == Some("sandbox-deny")
+            && event.decision == AuditDecision::Deny));
 
     let invalid_utf8 = client
         .evaluate_http_request(request(vec![0xff], input.clone(), "sandbox-one"))
@@ -195,6 +248,11 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
         .into_inner();
     assert_eq!(oversized_body.decision, Decision::Deny as i32);
     assert_eq!(oversized_body.reason_code, "queryknight_payload_too_large");
+    assert_eq!(
+        sink.len(),
+        4,
+        "malformed/oversized bodies never reach SQL audit"
+    );
     let unbound = client
         .evaluate_http_request(request(
             br#"{"sql":"SELECT * FROM users WHERE id = $1"}"#.to_vec(),
@@ -206,6 +264,11 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
         .into_inner();
     assert_eq!(unbound.decision, Decision::Deny as i32);
     assert_eq!(unbound.reason_code, "queryknight_unbound_parameters");
+    let events = sink.events();
+    assert_eq!(events.len(), 5);
+    assert_eq!(events[4].decision, AuditDecision::Deny);
+    assert_eq!(events[4].reason_code, "POLICY_ERROR");
+    assert_eq!(events[4].outcome, AttemptOutcome::Blocked);
 
     let quoted_marker = client
         .evaluate_http_request(request(
@@ -217,6 +280,10 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
         .expect("quoted placeholder is not a bind")
         .into_inner();
     assert_eq!(quoted_marker.decision, Decision::Allow as i32);
+    let events = sink.events();
+    assert_eq!(events.len(), 6);
+    assert_eq!(events[5].decision, AuditDecision::Allow);
+    assert_eq!(events[5].outcome, AttemptOutcome::Authorized);
 
     let mut unsafe_config = input.clone();
     unsafe_config.fields.insert(
@@ -232,6 +299,7 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
         .expect("invalid ValidateConfig")
         .into_inner();
     assert!(!invalid.valid);
+    assert_eq!(sink.len(), 6, "config validation is not a SQL audit");
 
     let preflight = WebSocketSessionEvent {
         event: Some(web_socket_session_event::Event::Preflight(
@@ -274,6 +342,20 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
                 payload: Some(web_socket_message::Payload::Text("SELECT 1".to_owned())),
             })),
         },
+        WebSocketSessionEvent {
+            event: Some(web_socket_session_event::Event::Message(WebSocketMessage {
+                sequence: 3,
+                payload: Some(web_socket_message::Payload::Text(
+                    "DROP TABLE users".to_owned(),
+                )),
+            })),
+        },
+        WebSocketSessionEvent {
+            event: Some(web_socket_session_event::Event::Message(WebSocketMessage {
+                sequence: 4,
+                payload: Some(web_socket_message::Payload::Text("hello".to_owned())),
+            })),
+        },
     ];
     let mut stream = client
         .evaluate_web_socket_session(tokio_stream::iter(events))
@@ -293,6 +375,50 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
         }
         _ => panic!("expected WebSocket message result"),
     }
+    let denied_message = stream
+        .message()
+        .await
+        .expect("second message response")
+        .unwrap();
+    match denied_message.result.expect("second message result") {
+        proto::web_socket_session_event_result::Result::MessageResult(result) => {
+            assert_eq!(result.sequence, 3);
+            assert_eq!(result.decision, Decision::Deny as i32);
+        }
+        _ => panic!("expected denied WebSocket message result"),
+    }
+    let non_sql_message = stream
+        .message()
+        .await
+        .expect("non-SQL message response")
+        .unwrap();
+    match non_sql_message.result.expect("non-SQL message result") {
+        proto::web_socket_session_event_result::Result::MessageResult(result) => {
+            assert_eq!(result.sequence, 4);
+            assert_eq!(result.decision, Decision::Allow as i32);
+        }
+        _ => panic!("expected non-SQL WebSocket message result"),
+    }
+    let events = sink.events();
+    assert_eq!(events.len(), 8);
+    assert_eq!(events[6].decision, AuditDecision::Allow);
+    assert_eq!(events[6].outcome, AttemptOutcome::Authorized);
+    assert_eq!(events[6].request_id.as_deref(), Some("request-ws"));
+    assert_eq!(events[7].decision, AuditDecision::Deny);
+    assert_eq!(events[7].outcome, AttemptOutcome::Blocked);
+    assert_eq!(events[7].request_id.as_deref(), Some("request-ws"));
+    assert_ne!(events[6].event_id, events[7].event_id);
+    let metrics = observer.metrics().render();
+    assert!(metrics.contains(
+        "queryknight_requests_total{database=\"main\",environment=\"production\",integration=\"openshell\",operation=\"select\"} 5"
+    ));
+    assert!(metrics.contains(
+        "queryknight_decisions_total{database=\"main\",decision=\"allow\",environment=\"production\",integration=\"openshell\",operation=\"select\",reason_code=\"ALLOW_RULE\"} 4"
+    ));
+    assert!(metrics.contains("queryknight_policy_denials_total{"));
+    assert!(metrics.contains("queryknight_evaluation_duration_seconds_count 8"));
+    assert!(!metrics.contains("sandbox-one"));
+    assert!(!metrics.contains("request-1"));
 
     assert!(OpenShellServer::bind_tcp(
         "0.0.0.0:0".parse().expect("non-loopback address"),
@@ -302,6 +428,61 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
     )
     .await
     .is_err());
+    server.stop().await.expect("graceful server shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raw_sql_logging_requires_explicit_full_sql_level_and_never_logs_params() {
+    let db = DbConfig::from_url("postgresql://localhost/app").expect("db config");
+    let sink = Arc::new(MemorySink::new());
+    let observer = Observer::new(vec![sink.clone()]);
+    let service = OpenShellService::new(
+        OpenShellServiceConfig::new(db)
+            .with_observer(observer.clone())
+            .with_sql_log_level(qk_audit::SqlLogLevel::FullSql),
+    );
+    let (mut client, server) = openshell_client(service).await;
+    let input = config(qk_core::DEMO_POLICY);
+    let validation = client
+        .validate_config(ValidateConfigRequest {
+            config: Some(input.clone()),
+            middleware_name: "queryknight".to_owned(),
+        })
+        .await
+        .expect("ValidateConfig")
+        .into_inner();
+    assert!(validation.valid, "{}", validation.reason);
+
+    let result = client
+        .evaluate_http_request(request(
+            br#"{"sql":"SELECT $1 WHERE note = 'OPENSHELL_SQL_SECRET_12345'","params":["OPENSHELL_PARAM_SECRET_67890"]}"#.to_vec(),
+            input,
+            "sandbox-full-sql",
+        ))
+        .await
+        .expect("parameterized request")
+        .into_inner();
+    assert_eq!(result.decision, Decision::Allow as i32);
+    let events = sink.events();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert!(event
+        .sql
+        .as_deref()
+        .is_some_and(|sql| sql.contains("OPENSHELL_SQL_SECRET_12345")));
+    assert!(!serde_json::to_string(event)
+        .expect("full SQL event")
+        .contains("OPENSHELL_PARAM_SECRET_67890"));
+    assert!(!format!("{event:?}").contains("OPENSHELL_PARAM_SECRET_67890"));
+    assert!(!observer
+        .metrics()
+        .render()
+        .contains("OPENSHELL_PARAM_SECRET_67890"));
+    let ocsf = qk_audit::to_ocsf(event, "0.1.0-beta.0");
+    assert_eq!(ocsf.status, "Unknown");
+    assert!(!serde_json::to_string(&ocsf)
+        .expect("OCSF event")
+        .contains("OPENSHELL_PARAM_SECRET_67890"));
     server.stop().await.expect("graceful server shutdown");
 }
 
@@ -389,8 +570,13 @@ async fn approvals_are_daemon_backed_and_exact_v2_binds_json_parameters() {
     let sandbox_id = control
         .create_session(&connection_key, "openshell")
         .expect("create session for sandbox scope");
-    let service =
-        OpenShellService::new(OpenShellServiceConfig::new(db).with_control_plane(control.clone()));
+    let sink = Arc::new(MemorySink::new());
+    let observer = Observer::new(vec![sink.clone()]);
+    let service = OpenShellService::new(
+        OpenShellServiceConfig::new(db)
+            .with_control_plane(control.clone())
+            .with_observer(observer.clone()),
+    );
     let (mut client, server) = openshell_client(service).await;
     let policy = "version: 1\ndefaults:\n  decision: deny\n  on_parse_error: deny\n  on_unknown: deny\nenvironments:\n  production:\n    databases:\n      main:\n        approval_required:\n          - operations: [delete]\n";
     let input = config(policy);
@@ -403,6 +589,7 @@ async fn approvals_are_daemon_backed_and_exact_v2_binds_json_parameters() {
         .expect("ValidateConfig")
         .into_inner();
     assert!(validation.valid, "{}", validation.reason);
+    assert!(sink.is_empty(), "ValidateConfig is not a SQL activity");
 
     let body = |value| {
         serde_json::json!({
@@ -429,6 +616,15 @@ async fn approvals_are_daemon_backed_and_exact_v2_binds_json_parameters() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].binding_kind, ApprovalBindingKind::ExactV2);
     assert_eq!(pending[0].status, ApprovalStatus::Waiting);
+    let events = sink.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].decision, AuditDecision::RequireApproval);
+    assert_eq!(events[0].outcome, AttemptOutcome::Pending);
+    assert_eq!(events[0].reason_code, "REQUIRE_APPROVAL");
+    assert_eq!(
+        events[0].approval_id.as_deref(),
+        Some(pending[0].id.as_str())
+    );
     control
         .decide_approval(
             &pending[0].id,
@@ -444,6 +640,15 @@ async fn approvals_are_daemon_backed_and_exact_v2_binds_json_parameters() {
         .expect("exact approval retry")
         .into_inner();
     assert_eq!(exact_retry.decision, Decision::Allow as i32);
+    let events = sink.events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].decision, AuditDecision::Allow);
+    assert_eq!(events[1].reason_code, "APPROVAL_GRANTED");
+    assert_eq!(events[1].outcome, AttemptOutcome::Authorized);
+    assert_eq!(
+        events[1].approval_id.as_deref(),
+        Some(pending[0].id.as_str())
+    );
     let other_sandbox = control
         .create_session(&connection_key, "openshell")
         .expect("create second sandbox session");
@@ -476,6 +681,20 @@ async fn approvals_are_daemon_backed_and_exact_v2_binds_json_parameters() {
     assert!(rows
         .iter()
         .all(|row| row.binding_kind == ApprovalBindingKind::ExactV2));
+    let events = sink.events();
+    assert_eq!(events.len(), 5);
+    assert_eq!(events[2].decision, AuditDecision::RequireApproval);
+    assert_eq!(events[3].decision, AuditDecision::RequireApproval);
+    assert_eq!(events[4].decision, AuditDecision::RequireApproval);
+    assert!(events.iter().all(|event| event.integration == "openshell"));
+    let metrics = observer.metrics().render();
+    assert!(metrics.contains(
+        "queryknight_approval_requests_total{database=\"main\",environment=\"production\",integration=\"openshell\",operation=\"delete\",result=\"approved\"} 1"
+    ));
+    assert!(metrics.contains(
+        "queryknight_approval_requests_total{database=\"main\",environment=\"production\",integration=\"openshell\",operation=\"delete\",result=\"waiting\"} 4"
+    ));
+    assert!(!metrics.contains(&sandbox_id));
 
     server.stop().await.expect("graceful server shutdown");
     daemon.stop().await;
@@ -487,8 +706,13 @@ async fn unavailable_control_plane_denies_approval_required_sql() {
     daemon.stop().await;
 
     let db = DbConfig::from_url("postgresql://user:secret@127.0.0.1/app").expect("db config");
-    let service =
-        OpenShellService::new(OpenShellServiceConfig::new(db).with_control_plane(control));
+    let sink = Arc::new(MemorySink::new());
+    let observer = Observer::new(vec![sink.clone()]);
+    let service = OpenShellService::new(
+        OpenShellServiceConfig::new(db)
+            .with_control_plane(control)
+            .with_observer(observer),
+    );
     let (mut client, server) = openshell_client(service).await;
     let policy = "version: 1\ndefaults:\n  decision: deny\n  on_parse_error: deny\n  on_unknown: deny\nenvironments:\n  production:\n    databases:\n      main:\n        approval_required:\n          - operations: [delete]\n";
     let input = config(policy);
@@ -513,5 +737,174 @@ async fn unavailable_control_plane_denies_approval_required_sql() {
         .into_inner();
     assert_eq!(result.decision, Decision::Deny as i32);
     assert_eq!(result.reason_code, "queryknight_approval_error");
+    let events = sink.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].decision, AuditDecision::Deny);
+    assert_eq!(events[0].reason_code, "APPROVAL_ERROR");
+    assert_eq!(events[0].outcome, AttemptOutcome::Blocked);
+    assert!(events[0].rows_affected.is_none());
     server.stop().await.expect("graceful server shutdown");
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failing_audit_sink_never_changes_allow_deny_or_pending_responses() {
+    let mut daemon = TestDaemon::start().await;
+    let control = daemon.client();
+    let db = DbConfig::from_url("postgresql://user:secret@127.0.0.1/app").expect("db config");
+    let sink = Arc::new(MemorySink::new());
+    sink.fail_next(3);
+    let observer = Observer::new(vec![sink.clone()]);
+    let service = OpenShellService::new(
+        OpenShellServiceConfig::new(db)
+            .with_control_plane(control.clone())
+            .with_observer(observer.clone()),
+    );
+    let (mut client, server) = openshell_client(service).await;
+    let input = config(qk_core::DEMO_POLICY);
+    let validation = client
+        .validate_config(ValidateConfigRequest {
+            config: Some(input.clone()),
+            middleware_name: "queryknight".to_owned(),
+        })
+        .await
+        .expect("ValidateConfig")
+        .into_inner();
+    assert!(validation.valid, "{}", validation.reason);
+
+    let allow = client
+        .evaluate_http_request(request(b"SELECT 1".to_vec(), input.clone(), ""))
+        .await
+        .expect("audit failure must preserve Allow")
+        .into_inner();
+    assert_eq!(allow.decision, Decision::Allow as i32);
+    assert_decision_only_response(&allow);
+
+    let deny = client
+        .evaluate_http_request(request(b"DROP TABLE users".to_vec(), input.clone(), ""))
+        .await
+        .expect("audit failure must preserve Deny")
+        .into_inner();
+    assert_eq!(deny.decision, Decision::Deny as i32);
+    assert_eq!(deny.reason_code, "queryknight_deny_rule");
+    assert_decision_only_response(&deny);
+
+    let pending = client
+        .evaluate_http_request(request(
+            b"DELETE FROM users WHERE id = 42".to_vec(),
+            input.clone(),
+            "",
+        ))
+        .await
+        .expect("audit failure must preserve pending approval denial")
+        .into_inner();
+    assert_eq!(pending.decision, Decision::Deny as i32);
+    assert_eq!(pending.reason_code, "queryknight_require_approval");
+    assert_decision_only_response(&pending);
+    assert!(sink.is_empty());
+    assert_eq!(control.list_approvals().expect("waiting approval").len(), 1);
+    let after_failures = client
+        .evaluate_http_request(request(b"SELECT 1".to_vec(), input, ""))
+        .await
+        .expect("audit failure is not retried")
+        .into_inner();
+    assert_eq!(after_failures.decision, Decision::Allow as i32);
+    assert_eq!(sink.len(), 1);
+    assert_eq!(sink.events()[0].outcome, AttemptOutcome::Authorized);
+    assert!(observer
+        .metrics()
+        .render()
+        .contains("queryknight_evaluation_duration_seconds_count 4"));
+
+    server.stop().await.expect("graceful server shutdown");
+    daemon.stop().await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_approval_is_scoped_and_audited_as_authorization_only() {
+    let mut daemon = TestDaemon::start().await;
+    let control = daemon.client();
+    let db = DbConfig::from_url("postgresql://user:secret@127.0.0.1/app").expect("db config");
+    let connection_key = db.redacted_url();
+    let sandbox_id = control
+        .create_session(&connection_key, "openshell")
+        .expect("create sandbox session");
+    let other_sandbox = control
+        .create_session(&connection_key, "openshell")
+        .expect("create second sandbox session");
+    let sink = Arc::new(MemorySink::new());
+    let observer = Observer::new(vec![sink.clone()]);
+    let service = OpenShellService::new(
+        OpenShellServiceConfig::new(db)
+            .with_control_plane(control.clone())
+            .with_observer(observer),
+    );
+    let (mut client, server) = openshell_client(service).await;
+    let policy = "version: 1\ndefaults:\n  decision: deny\n  on_parse_error: deny\n  on_unknown: deny\nenvironments:\n  production:\n    databases:\n      main:\n        approval_required:\n          - operations: [delete]\n";
+    let input = config(policy);
+    let validation = client
+        .validate_config(ValidateConfigRequest {
+            config: Some(input.clone()),
+            middleware_name: "queryknight".to_owned(),
+        })
+        .await
+        .expect("ValidateConfig")
+        .into_inner();
+    assert!(validation.valid, "{}", validation.reason);
+
+    let body = |value| {
+        serde_json::json!({
+            "sql": "DELETE FROM users WHERE id = $1",
+            "params": [value]
+        })
+        .to_string()
+        .into_bytes()
+    };
+    let pending = client
+        .evaluate_http_request(request(body(1), input.clone(), &sandbox_id))
+        .await
+        .expect("initial session-scoped request")
+        .into_inner();
+    assert_eq!(pending.decision, Decision::Deny as i32);
+    let row = control.list_approvals().expect("list approvals");
+    assert_eq!(row.len(), 1);
+    assert_eq!(row[0].binding_kind, ApprovalBindingKind::ExactV2);
+    control
+        .decide_approval(
+            &row[0].id,
+            ApprovalDecision::Approved,
+            qk_approval::DecisionSource::Ui,
+            Some(qk_approval::Scope::Session),
+        )
+        .expect("approve for session");
+
+    let session_retry = client
+        .evaluate_http_request(request(body(2), input.clone(), &sandbox_id))
+        .await
+        .expect("same-session shape authorization")
+        .into_inner();
+    assert_eq!(session_retry.decision, Decision::Allow as i32);
+
+    let other_scope = client
+        .evaluate_http_request(request(body(2), input, &other_sandbox))
+        .await
+        .expect("session grant must not cross sandbox scope")
+        .into_inner();
+    assert_eq!(other_scope.decision, Decision::Deny as i32);
+    assert_eq!(other_scope.reason_code, "queryknight_require_approval");
+
+    let events = sink.events();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].decision, AuditDecision::RequireApproval);
+    assert_eq!(events[0].outcome, AttemptOutcome::Pending);
+    assert_eq!(events[1].decision, AuditDecision::Allow);
+    assert_eq!(events[1].reason_code, "APPROVAL_GRANTED");
+    assert_eq!(events[1].outcome, AttemptOutcome::Authorized);
+    assert!(events[1].rows_affected.is_none());
+    assert_eq!(events[2].decision, AuditDecision::RequireApproval);
+    assert_eq!(events[2].outcome, AttemptOutcome::Pending);
+    assert_eq!(
+        qk_audit::to_ocsf(&events[1], "0.1.0-beta.0").status,
+        "Unknown"
+    );
+
+    server.stop().await.expect("graceful server shutdown");
+    daemon.stop().await;
 }

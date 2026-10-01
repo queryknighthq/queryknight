@@ -1,12 +1,10 @@
-//! Observation: one guarded execution attempt distilled into audit
-//! inputs. Derived from already-existing typed outcomes (`Decision`,
-//! `ReasonCode`, approval resolution, `ExecutionOutcome`) plus
-//! structural facts re-read from `qk-sql` analysis (deterministic,
-//! side-effect-free — never a second policy evaluation and never an
-//! approval contact).
+//! Observation: one guarded authorization/execution attempt distilled into
+//! audit inputs. Derived from typed policy/approval outcomes plus structural
+//! facts re-read from `qk-sql` analysis (deterministic, side-effect-free —
+//! never a second policy evaluation and never an approval contact).
 
 use qk_core::{Decision, ReasonCode};
-use qk_db::{DbErrorKind, ExecutionOutcome};
+use qk_db::{AuthorizationOutcome, DbErrorKind, ExecutionOutcome};
 use qk_sql::SqlDialect;
 
 use crate::event::level_sql;
@@ -36,9 +34,11 @@ pub enum ObservedApproval {
     Error,
 }
 
-/// Execution facts for an observed attempt, from the typed outcome.
+/// Authorization/execution facts for an observed attempt, from its typed outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObservedExecution {
+    /// Authorized for an external executor; this process did not execute the statement.
+    Authorized,
     /// Refused without database contact.
     Refused,
     /// Waiting on a human (no contact).
@@ -63,8 +63,8 @@ pub enum ObservedExecution {
     },
 }
 
-/// One completed attempt: everything the observer needs, nothing it
-/// must infer. Identity/timing inputs are caller-supplied.
+/// One completed authorization/execution attempt: everything the observer
+/// needs, nothing it must infer. Identity/timing inputs are caller-supplied.
 #[derive(Debug, Clone)]
 pub struct Observation {
     /// UUID v4 event id (caller-supplied; CSPRNG in production).
@@ -203,6 +203,101 @@ impl Observation {
         }
     }
 
+    /// Build from a zero-database-contact authorization outcome.
+    ///
+    /// A permitted capability becomes `Authorized`, never `Done`; callers
+    /// must drop the permit after extracting these safe decision facts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_authorization_outcome(
+        event_id: String,
+        timestamp_ms: u64,
+        duration_ms: u64,
+        evaluation_duration_ms: Option<u64>,
+        request_id: Option<String>,
+        integration: String,
+        environment: String,
+        database: Option<String>,
+        agent_id: Option<String>,
+        session_id: Option<String>,
+        user: Option<String>,
+        tool: Option<String>,
+        dialect: SqlDialect,
+        sql: String,
+        outcome: &AuthorizationOutcome,
+    ) -> Self {
+        let (decision, reason_code, matched_policy, approval, execution) = match outcome {
+            AuthorizationOutcome::Permitted(permit) => (
+                Decision::Allow,
+                *permit.reason_code(),
+                permit.matched_policy().map(str::to_owned),
+                permit
+                    .approval_id()
+                    .map(|id| ObservedApproval::Resolved {
+                        id: Some(id.as_str().to_owned()),
+                        approved: true,
+                    })
+                    .unwrap_or(ObservedApproval::None),
+                ObservedExecution::Authorized,
+            ),
+            AuthorizationOutcome::Blocked(reason) => {
+                let reason_code = parse_reason(&reason.code);
+                let approval = match reason_code {
+                    ReasonCode::ApprovalUnavailable => ObservedApproval::Unavailable,
+                    ReasonCode::ApprovalError => ObservedApproval::Error,
+                    ReasonCode::ApprovalDenied => ObservedApproval::Resolved {
+                        id: None,
+                        approved: false,
+                    },
+                    _ => ObservedApproval::None,
+                };
+                (
+                    Decision::Deny,
+                    reason_code,
+                    reason.matched_policy.clone(),
+                    approval,
+                    ObservedExecution::Refused,
+                )
+            }
+            AuthorizationOutcome::PendingApproval(pending) => (
+                Decision::RequireApproval,
+                parse_reason(&pending.reason_code),
+                None,
+                ObservedApproval::Waiting {
+                    id: pending.approval_id.clone(),
+                },
+                ObservedExecution::Pending,
+            ),
+            AuthorizationOutcome::Failed(_) => (
+                Decision::Deny,
+                ReasonCode::PolicyError,
+                None,
+                ObservedApproval::None,
+                ObservedExecution::Refused,
+            ),
+        };
+        Self {
+            event_id,
+            timestamp_ms,
+            duration_ms,
+            evaluation_duration_ms,
+            request_id,
+            integration,
+            environment,
+            database,
+            agent_id,
+            session_id,
+            user,
+            tool,
+            dialect,
+            sql,
+            decision,
+            reason_code,
+            matched_policy,
+            approval,
+            execution,
+        }
+    }
+
     /// Render the frozen `AuditEvent` at a SQL log level.
     pub fn audit_event(&self, level: SqlLogLevel) -> AuditEvent {
         let analysis = qk_sql::analyze(&self.sql, &self.dialect.to_string()).ok();
@@ -237,6 +332,15 @@ impl Observation {
             truncated,
             timeout_may_still_run,
         ) = match &self.execution {
+            ObservedExecution::Authorized => (
+                AttemptOutcome::Authorized,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
             ObservedExecution::Refused => {
                 (AttemptOutcome::Blocked, None, None, None, None, None, None)
             }
@@ -322,9 +426,12 @@ impl Observation {
 }
 
 fn parse_reason(code: &str) -> ReasonCode {
-    qk_core::parse_reason_code(code).unwrap_or(ReasonCode::ApprovalError)
+    match code {
+        "UNSUPPORTED_SQL_ANALYSIS" => ReasonCode::DenyParseError,
+        "UNSUPPORTED_OPERATION" => ReasonCode::DenyUnknownStatement,
+        _ => qk_core::parse_reason_code(code).unwrap_or(ReasonCode::ApprovalError),
+    }
 }
-
 /// Frozen engine-name dialect rendering (`postgres`, not
 /// `postgresql` — matches the reference analysis dialect strings).
 fn dialect_name(dialect: &SqlDialect) -> String {

@@ -1937,6 +1937,7 @@ dependencies = [
  "prost-types",
  "protoc-bin-vendored",
  "qk-approval",
+ "qk-audit",
  "qk-control-plane",
  "qk-core",
  "qk-daemon",

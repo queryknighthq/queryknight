@@ -60,3 +60,14 @@ reference (no newline escaping — frozen behavior).
   registries.
 - No metrics HTTP endpoint exists in the frozen product — none is
   added (`/health` stays metrics-free).
+
+## Authorization-only integrations
+
+OpenShell uses the same `Observer`/`MetricsRegistry` for each recognized SQL
+candidate. Its counters describe QueryKnight authorization decisions only:
+an Allow means “authorized for an external executor,” not DB success. The
+frozen set has no execution-success or row-count metrics. The evaluation
+histogram measures the `authorize_guarded` path (policy and approval
+resolution), not downstream execution or audit-sink time. The embedding host
+can access the service’s registry through `OpenShellService::observer()`; no
+metrics HTTP endpoint or exporter is added.

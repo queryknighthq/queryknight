@@ -1,5 +1,5 @@
-//! The single observation hook: one guarded execution attempt in,
-//! one audit event plus metric increments out. Sinks and the registry
+//! The single observation hook: one guarded authorization/execution attempt
+//! in, one audit event plus metric increments out. Sinks and the registry
 //! are owned here (no globals); failures are returned for operational
 //! visibility and never feed back into authorization.
 

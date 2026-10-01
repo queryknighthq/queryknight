@@ -17,10 +17,12 @@ pub enum AuditDecision {
     RequireApproval,
 }
 
-/// Execution phase facts for an observed attempt.
+/// Authorization/execution phase of one observed attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AttemptOutcome {
+    /// Authorized by QueryKnight for an external executor; QueryKnight did not execute it.
+    Authorized,
     /// The statement executed.
     Executed,
     /// Refused without database contact.
@@ -99,7 +101,7 @@ pub struct AuditEvent {
     pub parser_ok: bool,
     /// Enforcement active (always true; observe mode is not ported).
     pub enforced: bool,
-    /// Execution phase of this attempt.
+    /// Authorization/execution outcome. `Authorized` never means that an external operation ran.
     pub outcome: AttemptOutcome,
     /// Database error kind, when failed.
     #[serde(skip_serializing_if = "Option::is_none")]

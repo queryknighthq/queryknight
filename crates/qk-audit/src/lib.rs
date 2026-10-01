@@ -1,12 +1,12 @@
 //! Observation-only security audit + OCSF export.
 //!
 //! ```text
-//! guarded execution outcome → Observation → AuditEvent → sinks
-//!                                              ↘ OCSF → SIEM shape
+//! guarded authorization/execution outcome → Observation → AuditEvent → sinks
+//!                                                   ↘ OCSF → SIEM shape
 //! ```
 //!
-//! Audit observes typed outcomes; it never authorizes, never retries,
-//! and sink failures never feed back into enforcement. Contract:
+//! Audit observes typed authorization/execution outcomes; it never
+//! authorizes, never retries, and sink failures never feed back into enforcement.
 //! `docs/audit.md`.
 
 #![deny(unsafe_code)]

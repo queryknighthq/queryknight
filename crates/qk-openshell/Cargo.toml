@@ -7,6 +7,7 @@ build = "build.rs"
 [dependencies]
 async-stream = "0.3"
 qk-control-plane = { path = "../qk-control-plane" }
+qk-audit = { path = "../qk-audit" }
 futures-core = "0.3"
 prost = "0.14"
 prost-types = "0.14"

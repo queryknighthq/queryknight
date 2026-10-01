@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 
-use crate::event::{AuditDecision, AuditEvent};
+use crate::event::{AttemptOutcome, AuditDecision, AuditEvent};
 
 /// OCSF version emitted (frozen).
 pub const OCSF_VERSION: &str = "1.5.0";
@@ -134,23 +134,27 @@ pub struct OcsfApi {
 }
 
 /// Convert an audit event to OCSF. Deny → 7/Deny/High/Failure;
-/// RequireApproval → 0/Unknown/Low/Unknown; Allow → 6/Allow/
-/// Informational/Success. Non-executed attempts still emit (never
-/// labeled successful DB activity). `product_version` feeds the
-/// product block (package metadata at call sites).
+/// RequireApproval → 0/Unknown/Low/Unknown. Allow is a successful OCSF
+/// operation only for `AttemptOutcome::Executed`; authorization-only
+/// `Authorized` remains status Unknown, and a database `Failed` remains
+/// Failure. `product_version` feeds the product block (package metadata at
+/// call sites).
 pub fn to_ocsf(event: &AuditEvent, product_version: &str) -> OcsfEvent {
-    let (activity, severity, status) = match event.decision {
-        AuditDecision::Deny => (OcsfActivity::Deny, OcsfSeverity::High, OcsfStatus::Failure),
-        AuditDecision::RequireApproval => (
-            OcsfActivity::Unknown,
-            OcsfSeverity::Low,
-            OcsfStatus::Unknown,
-        ),
-        AuditDecision::Allow => (
-            OcsfActivity::Allow,
-            OcsfSeverity::Informational,
-            OcsfStatus::Success,
-        ),
+    let (activity, severity) = match event.decision {
+        AuditDecision::Deny => (OcsfActivity::Deny, OcsfSeverity::High),
+        AuditDecision::RequireApproval => (OcsfActivity::Unknown, OcsfSeverity::Low),
+        AuditDecision::Allow => (OcsfActivity::Allow, OcsfSeverity::Informational),
+    };
+    let status = match event.decision {
+        AuditDecision::Deny => OcsfStatus::Failure,
+        AuditDecision::RequireApproval => OcsfStatus::Unknown,
+        AuditDecision::Allow => match &event.outcome {
+            AttemptOutcome::Executed => OcsfStatus::Success,
+            AttemptOutcome::Failed => OcsfStatus::Failure,
+            AttemptOutcome::Authorized | AttemptOutcome::Blocked | AttemptOutcome::Pending => {
+                OcsfStatus::Unknown
+            }
+        },
     };
     let (activity_id, activity_name) = match activity {
         OcsfActivity::Allow => (6, "Allow"),
@@ -207,6 +211,7 @@ pub fn to_ocsf(event: &AuditEvent, product_version: &str) -> OcsfEvent {
             "qk_database": event.database,
             "qk_environment": event.environment,
             "qk_enforced": event.enforced,
+            "qk_outcome": &event.outcome,
             "qk_approval_id": event.approval_id,
         }),
     }

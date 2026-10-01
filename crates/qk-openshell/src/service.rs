@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_stream::try_stream;
 use prost::Message;
@@ -8,8 +8,8 @@ use qk_approval::{InMemoryApprovalStore, DEFAULT_APPROVAL_TTL_MS};
 use qk_control_plane::{ControlPlaneClient, DaemonApprovalProvider};
 use qk_core::{parse_policy, PolicyFile};
 use qk_db::{
-    authorize_guarded, ApprovalSetup, AuthorizationOutcome, AuthorizationRequest, CursorStore,
-    DbConfig, GuardedAuthorizationCall, ResolveMode, TrustedContext,
+    authorize_guarded, ApprovalSetup, AuthorizationOutcome, AuthorizationRequest, BlockedReason,
+    CursorStore, DbConfig, GuardedAuthorizationCall, ResolveMode, TrustedContext,
 };
 use tonic::{Request, Response, Status};
 
@@ -42,6 +42,8 @@ const MAX_SQL_BYTES: usize = 200_000;
 pub struct OpenShellServiceConfig {
     db_config: DbConfig,
     control_plane: Option<ControlPlaneClient>,
+    observer: qk_audit::Observer,
+    sql_log_level: qk_audit::SqlLogLevel,
 }
 
 impl OpenShellServiceConfig {
@@ -50,6 +52,8 @@ impl OpenShellServiceConfig {
         Self {
             db_config,
             control_plane: None,
+            observer: qk_audit::Observer::default(),
+            sql_log_level: qk_audit::SqlLogLevel::Fingerprint,
         }
     }
 
@@ -58,6 +62,20 @@ impl OpenShellServiceConfig {
     #[must_use]
     pub fn with_control_plane(mut self, client: ControlPlaneClient) -> Self {
         self.control_plane = Some(client);
+        self
+    }
+
+    /// Use a caller-owned canonical audit observer and metrics registry.
+    #[must_use]
+    pub fn with_observer(mut self, observer: qk_audit::Observer) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// Set the canonical SQL audit level. The default is fingerprint-only.
+    #[must_use]
+    pub fn with_sql_log_level(mut self, level: qk_audit::SqlLogLevel) -> Self {
+        self.sql_log_level = level;
         self
     }
 }
@@ -74,6 +92,8 @@ struct ServiceState {
     db_config: DbConfig,
     connection_key: String,
     control_plane: Option<ControlPlaneClient>,
+    observer: qk_audit::Observer,
+    sql_log_level: qk_audit::SqlLogLevel,
     configs: RwLock<HashMap<String, Arc<ValidatedConfig>>>,
     cursors: CursorStore,
 }
@@ -94,10 +114,17 @@ impl OpenShellService {
                 db_config: config.db_config,
                 connection_key,
                 control_plane: config.control_plane,
+                observer: config.observer,
+                sql_log_level: config.sql_log_level,
                 configs: RwLock::new(HashMap::new()),
                 cursors: CursorStore::new(),
             }),
         }
+    }
+    /// Shared observer used for audit events and frozen metrics.
+    #[must_use]
+    pub fn observer(&self) -> &qk_audit::Observer {
+        &self.state.observer
     }
 
     fn validate_and_store(
@@ -229,6 +256,7 @@ impl OpenShellService {
     async fn evaluate_candidates(
         &self,
         config: Arc<ValidatedConfig>,
+        request_id: Option<String>,
         sandbox_id: Option<String>,
         candidates: Vec<Candidate>,
     ) -> GateResult {
@@ -239,10 +267,10 @@ impl OpenShellService {
         match tokio::task::spawn_blocking(move || {
             let mut final_result = GateResult::allow();
             for candidate in candidates {
-                if candidate.sql.len() > config.max_sql_bytes {
-                    return GateResult::deny("query_too_large");
-                }
-                if candidate.params.is_empty() && !candidate.sql.trim().is_empty() {
+                let started = Instant::now();
+                let safety_failure = if candidate.sql.len() > config.max_sql_bytes {
+                    Some((qk_core::ReasonCode::QueryTooLarge, "query_too_large"))
+                } else if candidate.params.is_empty() && !candidate.sql.trim().is_empty() {
                     match qk_sql::analyze::has_parameter_markers(
                         &candidate.sql,
                         state.db_config.dialect(),
@@ -250,72 +278,114 @@ impl OpenShellService {
                             max_bytes: config.max_sql_bytes,
                         },
                     ) {
-                        Ok(true) => return GateResult::deny("unbound_parameters"),
-                        Ok(false) => {}
-                        Err(_) => return GateResult::deny("unsupported_sql_analysis"),
+                        Ok(true) => Some((qk_core::ReasonCode::PolicyError, "unbound_parameters")),
+                        Ok(false) => None,
+                        Err(_) => Some((
+                            qk_core::ReasonCode::DenyParseError,
+                            "unsupported_sql_analysis",
+                        )),
                     }
-                }
-                let request = AuthorizationRequest::new(candidate.sql, candidate.params);
-                let mut request = request;
-                request.require_supported_analysis = true;
-                let auth = TrustedContext {
-                    integration: "openshell".to_owned(),
-                    environment: config.environment.clone(),
-                    database: config.database.clone(),
-                    tool: String::new(),
-                    session_id: sandbox_id.clone(),
+                } else {
+                    None
                 };
-                let provider = state.control_plane.as_ref().map(|client| {
-                    DaemonApprovalProvider::new(
-                        client.clone(),
-                        sandbox_id.clone(),
-                        state.connection_key.clone(),
-                        None,
+
+                let (outcome, sql, response_reason) = if let Some((reason, response_reason)) =
+                    safety_failure
+                {
+                    (
+                        blocked_authorization(reason),
+                        candidate.sql,
+                        Some(response_reason),
                     )
-                    .with_exact_lookup_retry()
-                });
-                // The daemon is the durable authority. A request-local store
-                // holds only the shared resolver's temporary verdict; keeping
-                // it across calls would collide when a no-id wire retry finds
-                // the same daemon approval through exact-digest lookup.
-                let approval_store = InMemoryApprovalStore::new();
-                let approval = ApprovalSetup {
-                    store: &approval_store,
-                    provider: provider
-                        .as_ref()
-                        .map(|value| value as &dyn qk_approval::ApprovalProvider),
-                    ttl_ms: DEFAULT_APPROVAL_TTL_MS,
-                    now_ms: now_ms(),
+                } else {
+                    let mut request = AuthorizationRequest::new(candidate.sql, candidate.params);
+                    request.require_supported_analysis = true;
+                    let auth = TrustedContext {
+                        integration: "openshell".to_owned(),
+                        environment: config.environment.clone(),
+                        database: config.database.clone(),
+                        tool: String::new(),
+                        session_id: sandbox_id.clone(),
+                    };
+                    let provider = state.control_plane.as_ref().map(|client| {
+                        DaemonApprovalProvider::new(
+                            client.clone(),
+                            sandbox_id.clone(),
+                            state.connection_key.clone(),
+                            None,
+                        )
+                        .with_exact_lookup_retry()
+                    });
+                    // The daemon is the durable authority. A request-local store
+                    // holds only the resolver's temporary verdict; keeping it
+                    // across calls would collide on exact no-id retries.
+                    let approval_store = InMemoryApprovalStore::new();
+                    let approval = ApprovalSetup {
+                        store: &approval_store,
+                        provider: provider
+                            .as_ref()
+                            .map(|value| value as &dyn qk_approval::ApprovalProvider),
+                        ttl_ms: DEFAULT_APPROVAL_TTL_MS,
+                        now_ms: now_ms(),
+                    };
+                    let call = GuardedAuthorizationCall {
+                        config: &state.db_config,
+                        connection_key: &state.connection_key,
+                        auth: &auth,
+                        approval: Some(&approval),
+                        policy: &config.policy,
+                    };
+                    let outcome = authorize_guarded(
+                        &state.cursors,
+                        &call,
+                        &request,
+                        ResolveMode::ResolveApprovals,
+                    );
+                    (outcome, request.sql, None)
                 };
-                let call = GuardedAuthorizationCall {
-                    config: &state.db_config,
-                    connection_key: &state.connection_key,
-                    auth: &auth,
-                    approval: Some(&approval),
-                    policy: &config.policy,
-                };
-                match authorize_guarded(
-                    &state.cursors,
-                    &call,
-                    &request,
-                    ResolveMode::ResolveApprovals,
-                ) {
-                    AuthorizationOutcome::Permitted(permit) => {
-                        final_result = GateResult::allow();
-                        // This authorization-only integration never forwards or
-                        // executes the move-only permit.
-                        drop(permit);
-                    }
+
+                let gate = match &outcome {
+                    AuthorizationOutcome::Permitted(_) => GateResult::allow(),
                     AuthorizationOutcome::Blocked(reason) => {
-                        return GateResult::deny(&reason.code);
+                        GateResult::deny(response_reason.unwrap_or(&reason.code))
                     }
                     AuthorizationOutcome::PendingApproval(pending) => {
-                        return GateResult::deny(&pending.reason_code);
+                        GateResult::deny(response_reason.unwrap_or(&pending.reason_code))
                     }
                     AuthorizationOutcome::Failed(_) => {
-                        return GateResult::deny("policy_error");
+                        GateResult::deny(response_reason.unwrap_or("policy_error"))
                     }
+                };
+                let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                let observation = qk_audit::Observation::from_authorization_outcome(
+                    qk_audit::new_event_id(),
+                    now_ms(),
+                    duration_ms,
+                    Some(duration_ms),
+                    request_id.clone(),
+                    "openshell".to_owned(),
+                    config.environment.clone(),
+                    Some(config.database.clone()),
+                    None,
+                    sandbox_id.clone(),
+                    None,
+                    None,
+                    state.db_config.dialect(),
+                    sql,
+                    &outcome,
+                );
+                // Drop any process-local permit before calling user-owned sinks.
+                drop(outcome);
+                for failure in state.observer.observe(&observation, state.sql_log_level) {
+                    let _ = std::io::Write::write_fmt(
+                        &mut std::io::stderr().lock(),
+                        format_args!("audit sink failed: {failure}\n"),
+                    );
                 }
+                if gate.decision == Decision::Deny {
+                    return gate;
+                }
+                final_result = gate;
             }
             final_result
         })
@@ -344,10 +414,13 @@ impl OpenShellService {
             Ok(candidates) => candidates,
             Err(error) => return GateResult::deny(extract_error_code(error)),
         };
+        let request_id = context
+            .filter(|context| !context.request_id.is_empty())
+            .map(|context| context.request_id.clone());
         let sandbox_id = context
             .filter(|context| !context.sandbox_id.is_empty())
             .map(|context| context.sandbox_id.clone());
-        self.evaluate_candidates(config, sandbox_id, candidates)
+        self.evaluate_candidates(config, request_id, sandbox_id, candidates)
             .await
     }
 }
@@ -549,10 +622,16 @@ impl SupervisorMiddleware for OpenShellService {
             let Some(validated) = validated else {
                 return;
             };
+            let request_id = preflight
+                .context
+                .as_ref()
+                .filter(|context| !context.request_id.is_empty())
+                .map(|context| context.request_id.clone());
             let sandbox_id = preflight
                 .context
+                .as_ref()
                 .filter(|context| !context.sandbox_id.is_empty())
-                .map(|context| context.sandbox_id);
+                .map(|context| context.sandbox_id.clone());
             let mut session_started = false;
             let mut previous_sequence = 0u64;
             while let Some(event) = inbound.message().await? {
@@ -587,6 +666,7 @@ impl SupervisorMiddleware for OpenShellService {
                                             service
                                                 .evaluate_candidates(
                                                     Arc::clone(&validated),
+                                                    request_id.clone(),
                                                     sandbox_id.clone(),
                                                     candidates,
                                                 )
@@ -647,6 +727,15 @@ impl GateResult {
             reason_code: reason_code(reason),
         }
     }
+}
+
+fn blocked_authorization(reason_code: qk_core::ReasonCode) -> AuthorizationOutcome {
+    AuthorizationOutcome::Blocked(BlockedReason {
+        decision: qk_core::Decision::Deny,
+        code: reason_code.as_str().to_owned(),
+        message: "OpenShell authorization input failed closed".to_owned(),
+        matched_policy: None,
+    })
 }
 
 fn reason_code(reason: &str) -> String {
