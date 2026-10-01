@@ -5,10 +5,10 @@
 
 use mysql_async::consts::ColumnType;
 use mysql_async::prelude::*;
-use mysql_async::{Column, Conn, Opts, Params};
+use mysql_async::{Column, Conn, Params};
 
 use crate::adapter::{looks_like_read, Capabilities, DatabaseAdapter, Param};
-use crate::config::SecretUrl;
+use crate::config::{parse_mysql_opts, SecretUrl};
 use crate::error::{classify_driver_message, DbError, DbErrorKind};
 use crate::result::{
     ColumnInfo, ForeignKeyInfo, ImpactEstimate, IndexInfo, PingResult, RawResult, TableInfo,
@@ -42,12 +42,7 @@ fn connect_error(error: mysql_async::Error) -> DbError {
 }
 
 async fn connect(url: &SecretUrl) -> Result<Conn, DbError> {
-    let opts = Opts::from_url(url.expose()).map_err(|error| {
-        DbError::new(
-            DbErrorKind::Connection,
-            format!("invalid database URL: {error}"),
-        )
-    })?;
+    let opts = parse_mysql_opts(url)?;
     // Defense in depth: the service rejects multi-statement batches
     // first, and every operation below uses the binary prepared-statement
     // protocol (`exec_iter`), which the server refuses for multi

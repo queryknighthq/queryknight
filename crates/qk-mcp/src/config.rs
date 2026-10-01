@@ -103,6 +103,11 @@ impl McpConnection {
                 "invalid database URL: {error}"
             )))
         })?;
+        config.validate_supported_transport().map_err(|error| {
+            protocol_error(ErrorKind::Internal(format!(
+                "invalid database URL: {error}"
+            )))
+        })?;
         let connection_key = connection_key_from_url(url);
         Ok(Self {
             database_key: database_key_for(&connection_key),
@@ -144,5 +149,16 @@ mod tests {
         assert_eq!(conn.connection_key, "mysql://qk@127.0.0.1:3307/qk");
         assert_eq!(conn.config.dialect(), qk_sql::SqlDialect::MySql);
         assert!(!format!("{conn:?}").contains("pw"));
+    }
+
+    #[test]
+    fn unsupported_mysql_tls_returns_redacted_mcp_protocol_error() {
+        let error = McpConnection::from_url(
+            "mysql://qk:MYSQL_TLS_SECRET_12345@localhost/db?require_ssl=true",
+        )
+        .expect_err("unsupported TLS must fail while binding configuration");
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("MySQL TLS is not supported"));
+        assert!(!rendered.contains("MYSQL_TLS_SECRET_12345"));
     }
 }

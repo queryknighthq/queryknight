@@ -12,7 +12,20 @@ use crate::error::{DbError, DbErrorKind};
 /// behavior); the raw text is available only to adapter internals via
 /// [`SecretUrl::expose`].
 #[derive(Clone, PartialEq, Eq)]
-pub struct SecretUrl(String);
+pub struct SecretUrl {
+    raw: String,
+    // Cached from the driver's typed URL parser so authorization can
+    // reject unsupported modes without reparsing or inspecting URL text.
+    mysql_url_options: MysqlUrlOptions,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MysqlUrlOptions {
+    OtherEngine,
+    Plaintext,
+    Tls,
+    Invalid,
+}
 
 impl SecretUrl {
     /// Wrap a URL. Empty strings are rejected (fail fast on missing
@@ -22,19 +35,72 @@ impl SecretUrl {
         if url.trim().is_empty() {
             return Err(DbError::new(DbErrorKind::Connection, "empty database URL"));
         }
-        Ok(Self(url))
+        let mysql_url_options = if is_other_engine_url(&url) {
+            MysqlUrlOptions::OtherEngine
+        } else {
+            match mysql_async::Opts::from_url(&url) {
+                Ok(opts) if opts.ssl_opts().is_some() => MysqlUrlOptions::Tls,
+                Ok(_) => MysqlUrlOptions::Plaintext,
+                Err(_) => MysqlUrlOptions::Invalid,
+            }
+        };
+        Ok(Self {
+            raw: url,
+            mysql_url_options,
+        })
     }
 
     /// Raw URL for driver use only. Callers must never log, format
     /// into errors, or serialize the result.
     pub fn expose(&self) -> &str {
-        &self.0
+        &self.raw
     }
 
     /// Password-redacted form (`//user:***@host/...`).
     pub fn redacted(&self) -> String {
-        redact_password(&self.0)
+        redact_password(&self.raw)
     }
+
+    fn validate_mysql_options(&self) -> Result<(), DbError> {
+        match self.mysql_url_options {
+            MysqlUrlOptions::Tls => Err(unsupported_mysql_tls()),
+            MysqlUrlOptions::Invalid | MysqlUrlOptions::OtherEngine => Err(DbError::new(
+                DbErrorKind::Connection,
+                "invalid MySQL database URL",
+            )),
+            MysqlUrlOptions::Plaintext => Ok(()),
+        }
+    }
+}
+
+fn is_other_engine_url(url: &str) -> bool {
+    let url = url.trim_start();
+    ["sqlite:", "postgres:", "postgresql:"]
+        .iter()
+        .any(|scheme| {
+            url.get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        })
+}
+
+fn unsupported_mysql_tls() -> DbError {
+    DbError::new(
+        DbErrorKind::Unsupported,
+        "MySQL TLS is not supported by this QueryKnight build",
+    )
+}
+
+pub(crate) fn parse_mysql_opts(url: &SecretUrl) -> Result<mysql_async::Opts, DbError> {
+    let opts = mysql_async::Opts::from_url(url.expose()).map_err(|error| {
+        DbError::new(
+            DbErrorKind::Connection,
+            format!("invalid database URL: {error}"),
+        )
+    })?;
+    if opts.ssl_opts().is_some() {
+        return Err(unsupported_mysql_tls());
+    }
+    Ok(opts)
 }
 
 /// Strip a `user:password@` userinfo password, mirroring the frozen
@@ -99,6 +165,16 @@ impl DbConfig {
             Ok(Self::Postgres(secret))
         } else {
             Ok(Self::Mysql(secret))
+        }
+    }
+
+    /// Reject connection modes unsupported by the selected adapter.
+    /// This check is cheap after `SecretUrl` construction and runs before
+    /// authorization can create or consume an approval.
+    pub fn validate_supported_transport(&self) -> Result<(), DbError> {
+        match self {
+            Self::Mysql(url) => url.validate_mysql_options(),
+            Self::Postgres(_) | Self::Sqlite(_) => Ok(()),
         }
     }
 
@@ -195,6 +271,52 @@ mod tests {
             DbConfig::from_url("sqlite::memory:").expect("u").dialect(),
             qk_sql::SqlDialect::Sqlite
         );
+    }
+    #[test]
+    fn mysql_tls_validation_uses_driver_options_and_duplicate_order() {
+        let tls_urls = [
+            "mysql://u:p@localhost/db?require_ssl=true",
+            "mysql://u:p@localhost/db?require_ssl=true&verify_ca=false",
+            "mysql://u:p@localhost/db?require_ssl=true&verify_identity=false",
+            "mysql://u:p@localhost/db?require_ssl=true&built_in_roots=false",
+            "mysql://u:p@localhost/db?require_ssl=true&verify_ca=false&verify_identity=false&built_in_roots=false",
+            "mysql://u:p@localhost/db?require_ssl=false&require_ssl=true",
+        ];
+        for url in tls_urls {
+            let config = DbConfig::from_url(url).expect("URL config");
+            let error = config
+                .validate_supported_transport()
+                .expect_err("TLS must be rejected");
+            assert_eq!(error.kind(), &DbErrorKind::Unsupported, "{url}");
+        }
+
+        let plaintext_urls = [
+            "mysql://u:p@localhost/db",
+            "mysql://u:p@localhost/db?require_ssl=false",
+            "mysql://u:p@localhost/db?require_ssl=true&require_ssl=false",
+            "mysql://u:p@localhost/db?require_ssl=false&verify_ca=false&verify_identity=false&built_in_roots=false",
+            "mysql://u:p@localhost/db?verify_ca=true&verify_identity=true&built_in_roots=true",
+        ];
+        for url in plaintext_urls {
+            DbConfig::from_url(url)
+                .expect("URL config")
+                .validate_supported_transport()
+                .expect("plaintext TLS options are not enabled");
+        }
+    }
+
+    #[test]
+    fn mysql_tls_error_is_static_and_redacted() {
+        let url = "mysql://qk:MYSQL_TLS_SECRET_12345@localhost/db?require_ssl=true";
+        let config = DbConfig::from_url(url).expect("URL config");
+        let error = config
+            .validate_supported_transport()
+            .expect_err("TLS must be rejected");
+        assert_eq!(error.kind(), &DbErrorKind::Unsupported);
+        assert!(error.message().contains("MySQL TLS is not supported"));
+        assert!(!error.to_string().contains("MYSQL_TLS_SECRET_12345"));
+        assert!(!format!("{error:?}").contains("MYSQL_TLS_SECRET_12345"));
+        assert!(!format!("{config:?}").contains("MYSQL_TLS_SECRET_12345"));
     }
 
     #[test]

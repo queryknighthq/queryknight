@@ -323,6 +323,40 @@ fn denied_authorization_returns_blocked_not_a_permit() {
 }
 
 #[test]
+fn unsupported_mysql_tls_blocks_before_approval_resolution() {
+    let store = InMemoryApprovalStore::new();
+    let provider = TestProvider::new(vec![ProviderDecision::Approved]);
+    let config = DbConfig::Mysql(
+        SecretUrl::new("mysql://qk:MYSQL_TLS_SECRET_12345@localhost/db?require_ssl=true")
+            .expect("URL"),
+    );
+    let trusted = auth();
+    let policy = policy();
+    let outcome = authorize(
+        &store,
+        Some(&provider),
+        &config,
+        &trusted,
+        &policy,
+        &auth_request("UPDATE users SET display_name = 'x' WHERE id = 1"),
+    );
+
+    match outcome {
+        AuthorizationOutcome::Blocked(reason) => {
+            assert_eq!(reason.code, qk_core::ReasonCode::PolicyError.as_str());
+            assert!(reason.message.contains("MySQL TLS is not supported"));
+            assert!(!reason.message.contains("MYSQL_TLS_SECRET_12345"));
+        }
+        other => panic!("unsupported connection should block: {}", describe(&other)),
+    }
+    assert_eq!(
+        provider.calls(),
+        0,
+        "unsupported config must not contact approval"
+    );
+}
+
+#[test]
 fn strict_analysis_rejects_parse_and_unknown_approval_fallbacks() {
     let store = InMemoryApprovalStore::new();
     let config = sqlite_config();

@@ -57,6 +57,11 @@ and mismatched approval tokens all terminate before any adapter call.
   the URL (env-provided, as in TS) and are redacted everywhere
   (`SecretUrl`: password → `***`; Display/Debug/errors/logging
   pinned by tests).
+
+- `mysql_async` is built without a TLS feature. Driver-parsed MySQL
+  `SslOpts` are rejected as typed `Unsupported` before `Conn::new`;
+  guarded authorization rejects the same configuration before approval
+  resolution. Explicit `require_ssl=false` remains plaintext.
 - Lifecycle: connect → operate → close per service call (matches the
   reference shape of short-lived adapter use; no pool). Consequence
   (frozen): no cross-request transaction affinity — `BEGIN` in one
