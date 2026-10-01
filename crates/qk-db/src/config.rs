@@ -14,9 +14,10 @@ use crate::error::{DbError, DbErrorKind};
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretUrl {
     raw: String,
-    // Cached from the driver's typed URL parser so authorization can
+    // Cached from the drivers' typed URL parsers so authorization can
     // reject unsupported modes without reparsing or inspecting URL text.
     mysql_url_options: MysqlUrlOptions,
+    postgres_ssl_mode: PostgresSslMode,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,12 @@ enum MysqlUrlOptions {
     OtherEngine,
     Plaintext,
     Tls,
+    Invalid,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PostgresSslMode {
+    Parsed(tokio_postgres::config::SslMode),
     Invalid,
 }
 
@@ -44,9 +51,18 @@ impl SecretUrl {
                 Err(_) => MysqlUrlOptions::Invalid,
             }
         };
+        let postgres_ssl_mode = if is_postgres_config_form(&url) {
+            match url.parse::<tokio_postgres::Config>() {
+                Ok(config) => PostgresSslMode::Parsed(config.get_ssl_mode()),
+                Err(_) => PostgresSslMode::Invalid,
+            }
+        } else {
+            PostgresSslMode::Invalid
+        };
         Ok(Self {
             raw: url,
             mysql_url_options,
+            postgres_ssl_mode,
         })
     }
 
@@ -71,6 +87,14 @@ impl SecretUrl {
             MysqlUrlOptions::Plaintext => Ok(()),
         }
     }
+
+    fn validate_postgres_options(&self) -> Result<(), DbError> {
+        match self.postgres_ssl_mode {
+            PostgresSslMode::Parsed(tokio_postgres::config::SslMode::Disable) => Ok(()),
+            PostgresSslMode::Parsed(_) => Err(unsupported_postgres_tls()),
+            PostgresSslMode::Invalid => Err(invalid_postgres_url()),
+        }
+    }
 }
 
 fn is_other_engine_url(url: &str) -> bool {
@@ -83,11 +107,41 @@ fn is_other_engine_url(url: &str) -> bool {
         })
 }
 
+fn is_postgres_config_form(url: &str) -> bool {
+    let url = url.trim_start();
+    ["postgres:", "postgresql:"].iter().any(|scheme| {
+        url.get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+    }) || (!url.contains("://") && !is_other_engine_url(url))
+}
+
 fn unsupported_mysql_tls() -> DbError {
     DbError::new(
         DbErrorKind::Unsupported,
         "MySQL TLS is not supported by this QueryKnight build",
     )
+}
+
+fn unsupported_postgres_tls() -> DbError {
+    DbError::new(
+        DbErrorKind::Unsupported,
+        "PostgreSQL TLS is not supported by this QueryKnight build; use sslmode=disable only for explicitly trusted plaintext connections",
+    )
+}
+
+fn invalid_postgres_url() -> DbError {
+    DbError::new(DbErrorKind::Connection, "invalid PostgreSQL database URL")
+}
+
+pub(crate) fn parse_postgres_config(url: &SecretUrl) -> Result<tokio_postgres::Config, DbError> {
+    let config = url
+        .expose()
+        .parse::<tokio_postgres::Config>()
+        .map_err(|_| invalid_postgres_url())?;
+    if config.get_ssl_mode() != tokio_postgres::config::SslMode::Disable {
+        return Err(unsupported_postgres_tls());
+    }
+    Ok(config)
 }
 
 pub(crate) fn parse_mysql_opts(url: &SecretUrl) -> Result<mysql_async::Opts, DbError> {
@@ -172,6 +226,14 @@ impl DbConfig {
     /// This check is cheap after `SecretUrl` construction and runs before
     /// authorization can create or consume an approval.
     pub fn validate_supported_transport(&self) -> Result<(), DbError> {
+        match self {
+            Self::Mysql(url) => url.validate_mysql_options(),
+            Self::Postgres(url) => url.validate_postgres_options(),
+            Self::Sqlite(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn validate_mysql_transport(&self) -> Result<(), DbError> {
         match self {
             Self::Mysql(url) => url.validate_mysql_options(),
             Self::Postgres(_) | Self::Sqlite(_) => Ok(()),
@@ -317,6 +379,76 @@ mod tests {
         assert!(!error.to_string().contains("MYSQL_TLS_SECRET_12345"));
         assert!(!format!("{error:?}").contains("MYSQL_TLS_SECRET_12345"));
         assert!(!format!("{config:?}").contains("MYSQL_TLS_SECRET_12345"));
+    }
+
+    #[test]
+    fn postgres_ssl_modes_use_tokio_postgres_config_semantics() {
+        let unsupported_urls = [
+            "postgres://u:p@localhost/db",
+            "postgresql://u:p@localhost/db",
+            "postgres://u:p@localhost/db?sslmode=prefer",
+            "postgres://u:p@localhost/db?sslmode=require",
+            "postgres://u:p@localhost/db?sslmode=disable&sslmode=require",
+        ];
+        for url in unsupported_urls {
+            let error = DbConfig::from_url(url)
+                .expect("URL config")
+                .validate_supported_transport()
+                .expect_err("TLS modes must fail closed");
+            assert_eq!(error.kind(), &DbErrorKind::Unsupported, "{url}");
+        }
+        for connection_string in [
+            "host=localhost dbname=db",
+            "host=localhost dbname=db sslmode=prefer",
+            "host=localhost dbname=db sslmode=require",
+        ] {
+            let config = DbConfig::Postgres(SecretUrl::new(connection_string).expect("config"));
+            let error = config
+                .validate_supported_transport()
+                .expect_err("keyword config must use tokio-postgres defaults");
+            assert_eq!(error.kind(), &DbErrorKind::Unsupported);
+        }
+
+        let plaintext_urls = [
+            "postgres://u:p@localhost/db?sslmode=disable",
+            "postgresql://u:p@localhost/db?sslmode=disable",
+            "postgres://u:p@localhost/db?sslmode=require&sslmode=disable",
+            "postgres://u:p@localhost/db?sslmode=disable&sslnegotiation=direct",
+            "host=localhost dbname=db sslmode=disable",
+        ];
+        for url in plaintext_urls {
+            let config = DbConfig::Postgres(SecretUrl::new(url).expect("URL"));
+            config
+                .validate_supported_transport()
+                .expect("explicit disable is supported");
+        }
+
+        for url in [
+            "postgres://u:p@localhost/db?sslmode=verify-ca",
+            "postgres://u:p@localhost/db?sslmode=verify-full",
+            "postgres://u:p@localhost/db?sslmode=allow",
+        ] {
+            let error = DbConfig::from_url(url)
+                .expect("URL config")
+                .validate_supported_transport()
+                .expect_err("tokio-postgres rejects this sslmode");
+            assert_eq!(error.kind(), &DbErrorKind::Connection, "{url}");
+        }
+    }
+
+    #[test]
+    fn postgres_tls_error_is_typed_and_redacted() {
+        let config =
+            DbConfig::from_url("postgres://user:PG_TLS_SECRET_12345@localhost/db?sslmode=require")
+                .expect("URL config");
+        let error = config
+            .validate_supported_transport()
+            .expect_err("TLS is unsupported");
+        assert_eq!(error.kind(), &DbErrorKind::Unsupported);
+        assert!(error.message().contains("sslmode=disable"));
+        assert!(!error.to_string().contains("PG_TLS_SECRET_12345"));
+        assert!(!format!("{error:?}").contains("PG_TLS_SECRET_12345"));
+        assert!(!format!("{config:?}").contains("PG_TLS_SECRET_12345"));
     }
 
     #[test]

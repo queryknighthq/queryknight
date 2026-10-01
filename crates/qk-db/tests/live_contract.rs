@@ -6,7 +6,7 @@
 //! ```sh
 //! # PostgreSQL 16 on 127.0.0.1:5432, superuser postgres/postgres:
 //! docker run --rm -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
-//! PG_URL='postgres://postgres:postgres@127.0.0.1:5432/postgres' \
+//! PG_URL='postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable' \
 //!   cargo test -p qk-db --test live_contract -- --ignored
 //!
 //! # MySQL 8 on 127.0.0.1:3306, root/root, db qk:
@@ -24,8 +24,9 @@
 use qk_db::{DatabaseAdapter, DbConfig, DbValue, ExecutionOutcome, SecretUrl};
 
 fn pg_url() -> String {
-    std::env::var("PG_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/postgres".to_owned())
+    std::env::var("PG_URL").unwrap_or_else(|_| {
+        "postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable".to_owned()
+    })
 }
 
 fn mysql_url() -> String {

@@ -161,4 +161,14 @@ mod tests {
         assert!(rendered.contains("MySQL TLS is not supported"));
         assert!(!rendered.contains("MYSQL_TLS_SECRET_12345"));
     }
+
+    #[test]
+    fn postgres_default_sslmode_returns_redacted_mcp_protocol_error() {
+        let error = McpConnection::from_url("postgres://user:PG_TLS_SECRET_12345@localhost/db")
+            .expect_err("implicit sslmode=prefer must fail at config binding");
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("PostgreSQL TLS is not supported"));
+        assert!(rendered.contains("sslmode=disable"));
+        assert!(!rendered.contains("PG_TLS_SECRET_12345"));
+    }
 }

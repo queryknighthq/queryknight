@@ -7,7 +7,7 @@ use tokio_postgres::types::{FromSql, Type};
 use tokio_postgres::{Client, NoTls};
 
 use crate::adapter::{Capabilities, DatabaseAdapter, Param};
-use crate::config::SecretUrl;
+use crate::config::{parse_postgres_config, SecretUrl};
 use crate::error::{classify_driver_message, DbError, DbErrorKind};
 use crate::result::{
     ColumnInfo, ForeignKeyInfo, ImpactEstimate, IndexInfo, PingResult, RawResult, TableInfo,
@@ -43,9 +43,8 @@ fn query_error(error: tokio_postgres::Error) -> DbError {
 }
 
 async fn connect(url: &SecretUrl) -> Result<Client, DbError> {
-    let (client, connection) = tokio_postgres::connect(url.expose(), NoTls)
-        .await
-        .map_err(connect_error)?;
+    let config = parse_postgres_config(url)?;
+    let (client, connection) = config.connect(NoTls).await.map_err(connect_error)?;
     tokio::spawn(async move {
         let _ = connection.await;
     });

@@ -264,6 +264,42 @@ async fn guarded(
         .await
 }
 
+#[tokio::test]
+async fn unsupported_postgres_transport_blocks_before_approval_or_adapter() {
+    let service = ExecutionService::new();
+    let adapter = FakeAdapter::with_rows(vec![]);
+    let store = InMemoryApprovalStore::new();
+    let provider = TestProvider::new(vec![ProviderDecision::Approved]);
+    let auth = auth();
+    let approval = approval(&store, Some(&provider));
+    let policy = policy();
+
+    for ssl_options in ["", "?sslmode=prefer", "?sslmode=require"] {
+        let raw_url = format!("postgres://qk:PG_TLS_SECRET_12345@localhost/db{ssl_options}");
+        let config = DbConfig::from_url(&raw_url).expect("config");
+        let outcome = guarded(
+            &service,
+            &adapter,
+            &config,
+            &request("UPDATE users SET display_name = 'x' WHERE id = 1"),
+            &auth,
+            &approval,
+            &policy,
+        )
+        .await;
+        match outcome {
+            ExecutionOutcome::Blocked(reason) => {
+                assert_eq!(reason.code, qk_core::ReasonCode::PolicyError.as_str());
+                assert!(reason.message.contains("PostgreSQL TLS is not supported"));
+                assert!(!reason.message.contains("PG_TLS_SECRET_12345"));
+            }
+            other => panic!("unsupported transport must block: {other:?}"),
+        }
+        assert_eq!(provider.calls(), 0, "no approval request is permitted");
+        assert_eq!(adapter.calls(), 0, "no adapter operation is permitted");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Adapter is NEVER called without executable authorization.
 // ---------------------------------------------------------------------------
@@ -823,7 +859,8 @@ async fn dialect_comes_from_connection_not_request() {
     let service = ExecutionService::new();
     let store = InMemoryApprovalStore::new();
     let mysql = DbConfig::Mysql(SecretUrl::new("mysql://u@h/db").expect("url"));
-    let postgres = DbConfig::Postgres(SecretUrl::new("postgres://u@h/db").expect("url"));
+    let postgres =
+        DbConfig::Postgres(SecretUrl::new("postgres://u@h/db?sslmode=disable").expect("url"));
     let sql = "SELECT `a` FROM t";
     let adapter = FakeAdapter::with_rows(vec![vec![DbValue::Int(1)]]);
     let auth = auth();

@@ -62,6 +62,15 @@ and mismatched approval tokens all terminate before any adapter call.
   `SslOpts` are rejected as typed `Unsupported` before `Conn::new`;
   guarded authorization rejects the same configuration before approval
   resolution. Explicit `require_ssl=false` remains plaintext.
+
+- Direct qk-db PostgreSQL connections support only explicit
+  `sslmode=disable`. The parsed default (`prefer`), explicit `prefer`,
+  and `require` return typed `Unsupported` before connection, approval
+  resolution, or SQL; QueryKnight does not silently downgrade them.
+  `verify-ca`/`verify-full` are rejected by tokio-postgres's parser.
+  This intentionally breaks URLs that omit `sslmode`: add
+  `?sslmode=disable` only for an explicitly trusted plaintext path.
+  The PostgreSQL proxy has separate backend transport validation.
 - Lifecycle: connect → operate → close per service call (matches the
   reference shape of short-lived adapter use; no pool). Consequence
   (frozen): no cross-request transaction affinity — `BEGIN` in one

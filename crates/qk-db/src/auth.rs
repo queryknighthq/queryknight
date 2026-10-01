@@ -271,7 +271,7 @@ pub fn authorize_guarded(
     request: &AuthorizationRequest,
     mode: ResolveMode,
 ) -> AuthorizationOutcome {
-    if let Err(error) = call.config.validate_supported_transport() {
+    if let Err(error) = call.config.validate_mysql_transport() {
         return AuthorizationOutcome::Blocked(BlockedReason {
             decision: Decision::Deny,
             code: ReasonCode::PolicyError.as_str().to_owned(),

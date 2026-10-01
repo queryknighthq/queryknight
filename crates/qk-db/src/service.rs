@@ -193,6 +193,15 @@ pub struct ExecutionService {
     timeout: Duration,
 }
 
+fn unsupported_transport_outcome(error: DbError) -> ExecutionOutcome {
+    ExecutionOutcome::Blocked(BlockedReason {
+        decision: Decision::Deny,
+        code: ReasonCode::PolicyError.as_str().to_owned(),
+        message: error.to_string(),
+        matched_policy: None,
+    })
+}
+
 impl ExecutionService {
     /// Service with frozen defaults (50/64KiB/8000 budgets, 30s timeout).
     pub fn new() -> Self {
@@ -225,14 +234,17 @@ impl ExecutionService {
         }
     }
 
-    /// Guarded query execution: shared authorization first, then
-    /// permit-consuming execution. Direct execution and future
-    /// session-pinned adapters use the SAME authorization code.
+    /// Guarded query execution: validate direct transport, then run
+    /// shared authorization and permit-consuming execution. Direct
+    /// execution and session-pinned adapters share the auth code.
     pub async fn execute_guarded(
         &self,
         call: &GuardedCall<'_, '_>,
         request: &ExecuteRequest,
     ) -> ExecutionOutcome {
+        if let Err(error) = call.config.validate_supported_transport() {
+            return unsupported_transport_outcome(error);
+        }
         use crate::auth::{authorize_guarded, AuthorizationRequest, ResolveMode};
         let auth_request = match AuthorizationRequest::from_json(
             request.sql.clone(),
@@ -282,6 +294,9 @@ impl ExecutionService {
         config: &DbConfig,
         permit: crate::auth::ExecutionPermit,
     ) -> ExecutionOutcome {
+        if let Err(error) = config.validate_supported_transport() {
+            return unsupported_transport_outcome(error);
+        }
         if config.dialect() != permit.dialect {
             return ExecutionOutcome::Failed(DbError::new(
                 DbErrorKind::Query,
@@ -301,6 +316,9 @@ impl ExecutionService {
         sql: &str,
         params: &[serde_json::Value],
     ) -> ExecutionOutcome {
+        if let Err(error) = call.config.validate_supported_transport() {
+            return unsupported_transport_outcome(error);
+        }
         use crate::auth::{authorize_guarded, AuthorizationRequest, ResolveMode};
         let auth_request = match AuthorizationRequest::from_json(
             sql.to_owned(),
