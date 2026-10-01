@@ -2,6 +2,11 @@
 
 Goal: same fixtures -> TS oracle + Rust port -> identical `{decision, reason_code}`. No Rust code in this phase.
 
+**Status note:** This is the original implementation plan, not the current
+release/support inventory. Several planned crate names and stages changed;
+see [`README.md`](../README.md) and
+[`release-security.md`](release-security.md) for current status.
+
 ## Workspace / crate layout
 
 ```
@@ -43,16 +48,16 @@ Start with 3 crates (`qk-core` incl. `qk-sql`, `qk-compat`, `qk-cli inspect/poli
 | core/policy-file.ts + context.ts | qk-core::policy (serde deny_unknown_fields; same error `path: message` strings) |
 | core/analysis.ts + adapters/*/analyze.ts | qk-sql (dialect parse, statement detail, signals, fallbackScan) |
 | core/policy-engine.ts | qk-core::engine (precedence order + matchers, verbatim) |
-| core/evaluate.ts + approval-provider.ts | qk-core::evaluate (same envelope codes, observe downgrade, provider trait) |
+| core/evaluate.ts + approval-provider.ts | qk-core::evaluate (shared enforcement envelope/provider; legacy observe downgrade intentionally not ported) |
 | core/approvals.ts + safety.ts | qk-core::approvals (status machine, poll->expired, session allows) |
 | core/audit.ts + ocsf.ts + metrics.ts + health.ts | qk-core::audit/ocsf/metrics/health |
 | core/fingerprint.ts + redact.ts + cursors.ts + budget.ts + diff.ts + query.ts | qk-core::infra (byte-identical algorithms) |
 | core/history.ts + paths.ts + version.ts | qk-core::client/paths (Bearer, token file 0600) |
 | daemon/app.ts + store.ts + index.ts | qk-daemon (routes/auth/schema/SPA fallback) |
-| mcp/* | qk-mcp (7 tools + pending template + timeout race semantics) |
-| proxies/* | qk-proxy-mysql / qk-proxy-pg |
-| adapters/* | qk-adapters (trait; EXPLAIN-only impact; bounded introspection) |
-| integrations/openshell/* | qk-openshell (extract caps 8/200k, WaitingProvider, reason code fn) |
+| mcp/* | qk-mcp (8 tools + stdio server + daemon control-plane client) |
+| proxies/* | qk-proxy-mysql / qk-proxy-postgres |
+| adapters/* | qk-db (PostgreSQL/MySQL/SQLite adapters and guarded execution service) |
+| integrations/openshell/* | qk-openshell (authorization-only local gRPC adapter) |
 | cli/* | qk-cli (commands, exit codes 0/1/2/3, demoPolicy, redacted logs) |
 | apps/ui (Vue) | stays TypeScript (see below) |
 
@@ -74,7 +79,7 @@ Start with 3 crates (`qk-core` incl. `qk-sql`, `qk-compat`, `qk-cli inspect/poli
 - Glob semantics: trivial (`*`->`.*`, case-insensitive, escape rest) but must pin the 10 glob cases byte-identical, incl. regex-char escaping.
 - YAML: serde_yaml error strings differ; keep our own `path: message` validation layer so CLI output stays stable.
 - Fingerprint/cursor/id formats: sha256/16hex, `qk_cur_*`, `qkc_<12hex>`, `qka_*` must match or cross-version session allows break.
-- Observe-mode `OBSERVED_*` and OpenShell `queryknight_*` (56-char slice + prefix = 75 max) string ops must be char-exact (Unicode slicing!).
+- OpenShell `queryknight_*` reason-code operations must be char-exact (Unicode slicing). Legacy TypeScript `OBSERVED_*` strings are oracle-only and not a Rust port requirement.
 - Timeout/poll cadence (50ms) and expiry races are timing-sensitive; test with injected clocks.
 - SQLite schema: keep DDL column-for-column; rusqlite WAL behavior + tolerant migrations must open TS-created DBs.
 

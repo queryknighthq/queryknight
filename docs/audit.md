@@ -117,11 +117,17 @@ failure maps to Failure, while authorization-only `authorized` maps to Unknown.
 Existing execution `AuditEvent` facts are unchanged. The TypeScript converter
 still maps Allow to Success, but OpenShell never called that converter.
 
-## Observe mode (NOT implemented — stop-and-report finding)
+## Legacy TypeScript observe mode (not shipped in Rust v1)
 
-The reference `evaluate({mode: 'observe'})` turns non-allow
-decisions into `allow` with `OBSERVED_<code>` reasons and
-`enforced: false`. That is Deny→Allow security semantics, so per
-the integration contract it is NOT ported: `evaluate()` is
-untouched, `enforced` is always `true`, and the last deferred
-fixture remains deferred pending an explicit security decision.
+The TypeScript reference's `evaluate({mode: "observe"})` converts ordinary
+non-Allow outcomes into `Allow` with `OBSERVED_*` reasons and `enforced=false`.
+That includes Deny, RequireApproval before approval-provider resolution, and
+parser-fallback/unknown-statement outcomes. Empty/oversized SQL checks and
+caught policy-evaluation exceptions return Deny earlier. `evaluate()` does not
+execute SQL itself, but callers may treat its Allow as authority.
+
+No built-in TypeScript CLI/environment/MCP/proxy caller enables this option.
+Rust has no observe field or compatibility switch; strict OpenShell config
+rejects unknown `mode`. The v1 decision is **not to ship legacy Deny-to-Allow
+observe behavior**; rationale and a distinct future evaluation-only concept
+are recorded in [`adr/observe-mode.md`](adr/observe-mode.md).

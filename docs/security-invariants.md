@@ -2,14 +2,14 @@
 
 Normative for the Rust port. Each invariant cites the reference mechanism. Violating any invariant blocks the migration milestone that touches it. Corpus coverage noted per invariant.
 
-INV-001: Database execution requires an explicit ALLOW decision.
-  Only `evaluate() == allow` (direct or via APPROVAL_GRANTED) may precede `adapter.execute`/`runQuery`. `require_approval` without approval, `deny`, and legacy `confirm` without resolution never execute. (evaluate.ts, safety.ts runSafeQuery, mcp/tools.ts dbQueryWithPolicy.) Corpus: policy-evaluation, approvals-rowlimits.
+INV-001: QueryKnight-owned database execution requires a current positive `ExecutionPermit`.
+  `authorize_guarded` is the permit issuer for direct and wire-proxy SQL execution; adapters forward/execute only after consuming the request-bound capability. An evaluator `Allow` value alone is not execution authority. See INV-042..048 and INV-052..053.
 
 INV-002: Parser failure must not produce ALLOW.
   `parsed=false` routes to `defaults.on_parse_error` (deny|require_approval only — allow is unrepresentable). (policy-engine.ts §1, evaluate fail-closed comment.) Corpus: malformed-unsupported (garbage, data-modifying CTE, merge).
 
-INV-003: Unsupported SQL must not produce ALLOW in enforcement mode.
-  `operation unknown` or kinds include `unknown` routes to `defaults.on_unknown` (deny|require_approval). CALL/transaction/VACUUM/MERGE never allow when enforced. Observe mode may report `OBSERVED_*` allow but sets `enforced:false` and never executes. Corpus: malformed-unsupported.
+INV-003: Unsupported SQL must not produce executable ALLOW in Rust enforcement.
+  `operation unknown` or kinds include `unknown` routes to `defaults.on_unknown` (deny|require_approval). CALL/transaction/VACUUM/MERGE never allow when enforced. Legacy TypeScript observe may return `Allow` with `OBSERVED_*` and `enforced:false`; Rust does not expose that mode, and an Allow-shaped result must not be treated as proof of non-execution. Corpus: malformed-unsupported.
 
 INV-004: All statements in multi-statement SQL are evaluated.
   Details per statement; classification/operation/risk take the strictest; `multi_statement` signal added; unbounded check loops statements; execution layer refuses to run "the safe half" (legacy: max-risk gate; runQuery treats interior `;` as multi, no paging). Corpus: multistatement-nested.
@@ -86,8 +86,8 @@ INV-028: Approval persistence failures, conflicts, stale state, or invalid store
 INV-021: Ambiguous or duplicate policy configuration must fail closed and must never be resolved in favor of a more permissive authorization policy.
   YAML 1.1 legacy boolean words (yes/no/on/off, any case) are strings per oracle YAML 1.2 core typing and must never coerce in boolean fields; only true/false (+case variants) are booleans. Duplicate mapping keys at any depth are invalid policy (DuplicateKey), never first-wins or last-wins, so `decision: deny` can never be shadowed by a later `decision: allow`. Parser diagnostics stay QueryKnight-owned (position only, never third-party prose); unrecognized ambiguity shapes degrade to InvalidYaml, still invalid. Corpus: policy-hardening (10) + shared legacy-bool validation cases; unit pins for determinism and no-panic on hostile input. This extends INV-007/INV-009: those cover invalid values and unknown fields, but neither pins scalar-typing ambiguity nor key multiplicity, both of which select between two valid meanings rather than rejecting one invalid value.
 
-INV-029: The control plane listens on loopback by default and gates every non-health route on a bearer token compared in constant time.
-  Non-loopback bind is refused without explicit opt-in (asserted at serve time); Host must be loopback/localhost and Origin must be loopback/localhost/null/absent; only GET /status, /health, /ready are unauthenticated; auth accepts Bearer header, ?token=, or x-qk-token; failures are frozen 401/403 text; the token never appears in logs, Debug, or Display. Corpus: qk-daemon HTTP auth/host/origin/redaction tests.
+INV-029: The control plane listens on loopback by default and gates every protected route on a bearer token compared in constant time.
+  Non-loopback bind is refused by the managed runtime and requires low-level explicit opt-in; Host must be loopback/localhost and a present Origin must be loopback/localhost (`Origin: null` is rejected); only GET /status, /health, /ready are unauthenticated; auth accepts Bearer header, ?token=, or x-qk-token; failures are frozen 401/403 text; the token never appears in logs, Debug, or Display. Corpus: qk-daemon HTTP auth/host/origin/redaction tests.
 
 INV-030: The control-plane HTTP error surface is frozen and fail-closed: no internal, store, or parser text ever leaves the process.
   Unknown rows are text `not found` (404); unknown paths are JSON {"error": "not found"} (404); decide on unknown/decided/expired rows is the frozen 400 `Error: approval not waiting` text; malformed input is 400/422 (never a store-shaped 500); busy maps to 503, conflict to 409, corrupt rows to 400, everything else to 500 `internal error`; bodies over 1 MiB are 413 and requests over 30s are 408. Corpus: qk-daemon HTTP dispatch/error/mapping/limit tests.

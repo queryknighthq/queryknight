@@ -74,8 +74,10 @@ port, not a byte-for-byte reproduction of those unsafe paths.
 The PostgreSQL Rust ingress uses `proxy_pg` as trusted integration identity,
 one backend session per frontend, and a fresh `ExecutionPermit` before every
 executable Q/Execute. It is not a generic proxy framework. The MySQL Rust
-ingress is a separate classic-protocol COM_QUERY proxy; prepared execution is
-deferred to a later reviewed commit, and OpenShell remains deferred.
+ingress is a separate classic-protocol proxy for COM_QUERY and its audited
+prepared-statement subset. The Rust OpenShell adapter is implemented as
+authorization-only local gRPC middleware, not a database executor.
+
 ## MySQL proxy audit (source-verified)
 
 The TypeScript MySQL proxy's exact behavior, security gaps, and the hardened
@@ -183,7 +185,7 @@ OpenShell collapses to `allow|deny` (require_approval -> deny, or finding when `
 ## 7. All reason codes
 
 Policy engine: `DENY_PARSE_ERROR`, `DENY_UNKNOWN_STATEMENT`, `SENSITIVE_COLUMN`, `DENY_RULE`, `UNBOUNDED_UPDATE`, `UNBOUNDED_DELETE`, `LIMIT_REQUIRED`, `LIMIT_EXCEEDED`, `REQUIRE_APPROVAL`, `ALLOW_RULE`, `DEFAULT_ALLOW`, `DEFAULT_APPROVAL`, `DEFAULT_DENY`.
-`evaluate()` envelope: `EMPTY_QUERY`, `QUERY_TOO_LARGE`, `POLICY_ERROR` (eval threw), `APPROVAL_UNAVAILABLE` (require_approval, no provider), `APPROVAL_GRANTED`, `APPROVAL_DENIED`, `APPROVAL_ERROR` (provider threw), `OBSERVED_<CODE>` (observe mode; e.g. `OBSERVED_DENY_RULE`).
+`evaluate()` envelope (legacy TypeScript): `EMPTY_QUERY`, `QUERY_TOO_LARGE`, `POLICY_ERROR` (eval threw), `APPROVAL_UNAVAILABLE` (require_approval, no provider), `APPROVAL_GRANTED`, `APPROVAL_DENIED`, `APPROVAL_ERROR` (provider threw), and legacy observe-only `OBSERVED_<CODE>` (not shipped in Rust v1).
 Legacy safety errors: `QueryDeniedError(decision deny|expired)`, `ApprovalPendingError` (not a code; MCP renders pending text).
 OpenShell wire codes: `queryknight_<lowercased reason, non-[a-z0-9_] -> _, max 56 chars>` + `queryknight_bad_config`, findings types `queryknight_denial` / `queryknight_approval_required`.
 
@@ -305,10 +307,7 @@ No `describe.skip/it.skip/todo/xfail` literals. Gating is `test.skipIf(!LIVE)` w
 
 ## Re-audit notes (evaluator phase, 2026-09-28, verified against source)
 
-- Observe mode (`evaluate(..., {mode: 'observe'})` -> `OBSERVED_*` allow) has
-  no product caller: MCP, CLI `inspect`/`policy test`, daemon, proxies, and
-  OpenShell never set it. It is a library option exercised by one unit test
-  and one corpus fixture. Not a frozen product surface.
+- Legacy TypeScript `evaluate(..., {mode: 'observe'})` returns `OBSERVED_*` Allow with `enforced: false` for ordinary non-Allow outcomes. No built-in caller enables it. Rust has no observe field or compatibility switch; v1 explicitly does not ship this Deny-to-Allow behavior (see `docs/adr/observe-mode.md`).
 - Approval codes (`APPROVAL_UNAVAILABLE/GRANTED/DENIED/ERROR`) are produced
   only by the `evaluate()` envelope around approval providers, never by
   `evaluatePolicy()` itself, which stops at `require_approval`.
@@ -739,9 +738,7 @@ fingerprint.ts, redact.ts, evaluate.ts}`, OpenShell
   try/catch (sink failures swallowed — enforcement never breaks).
   Only OpenShell wires `auditSink` (array push) and
   `recordEvaluation`; MCP/daemon/proxies emit nothing.
-- Observe mode: `mode === 'observe'` turns non-allow into `allow`
-  with `OBSERVED_<code>` + `enforced: false` — Deny→Allow security
-  semantics, NOT ported (stop-and-report; fixture stays deferred).
+- The TypeScript oracle's `mode === 'observe'` turns ordinary non-Allow results into `allow` with `OBSERVED_<code>` and `enforced: false`. This legacy bypass is documented for the oracle only and is intentionally not ported to Rust v1; its fixture is not a Rust parity requirement.
 - OCSF 1.5.0, Application Activity / API Activity, class 6003:
   deny 7/Deny/High(4)/Failure(2); require_approval
   0/Unknown/Low(2)/Unknown(0); allow 6/Allow/Informational(1)/

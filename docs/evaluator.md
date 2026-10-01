@@ -71,10 +71,10 @@ then `*`, then defaults-only. Missing context fields match as `""`.
 - CTE-alias-named sensitive patterns do not match (CTE names are excluded
   from analysis tables; patterns for query-local aliases are not a
   supported use).
-- Observe mode is omitted: no product caller in the reference enables it
-  (library option + unit test only), so `OBSERVED_*` codes do not exist
-  here. Approval-resolution codes (`APPROVAL_*`) exist in the taxonomy
-  but are produced only by the future provider layer.
+- Legacy TypeScript observe mode is not ported to Rust: `OBSERVED_*` codes
+  are absent from the Rust result taxonomy and v1 explicitly defers the
+  Deny-to-Allow behavior. An evaluator `Allow` is not by itself a Rust
+  execution permit.
 
 ## Defensive scan role
 

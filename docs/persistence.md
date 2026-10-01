@@ -172,9 +172,10 @@ explicit reuse mode and source), and `waiting -> expired` (via
 decisions; transitioning *to* waiting is refused. Terminal states are
 terminal.
 
-## Filesystem state (deferred to the daemon commit)
+## Filesystem ownership
 
-Session tokens, `daemon.pid`, `daemon.log`, and DB file permissions: the
-reference owns token-file modes only; nothing here manages filesystem
-policy. SQLite files remain backup-compatible (single-file database, no
-external blobs).
+The `qk-store` crate does not manage session tokens, PID/lock files, daemon
+logs, or runtime directories; those belong to `qk-daemon::runtime` (see
+[`daemon-runtime.md`](daemon-runtime.md)). SQLite state remains a
+single-file, backup-compatible database with no external blobs. This crate
+does not add a separate filesystem permission policy for that database.

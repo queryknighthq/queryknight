@@ -13,25 +13,26 @@ Audited source: `packages/proxies/postgres/src/{proxy.ts,messages.ts,reader.ts,p
 Rust adds `queryknight proxy [--listen <port>]`, bound only to `127.0.0.1`
 (default `5434`). `MYSQL_URL` takes precedence over `DATABASE_URL`, and the
 selected URL must be PostgreSQL. Backend selection is fixed at startup and
-supports one TCP host. The configured user/database are trusted startup
-identity; frontend startup must match both. Set `sslmode=disable` explicitly:
-the proxy does not implement backend TLS and rejects every TLS-enabled or
-default-`prefer` configuration rather than downgrading. Frontend TLS/GSS
-requests receive `N`; traffic after that is plaintext, including authentication
-responses. Keep the listener loopback-only.
+supports one TCP host. Explicit `sslmode=disable` is required: backend TLS is
+not implemented and TLS-enabled or default-`prefer` configurations are rejected
+rather than downgraded. Frontend SSL/GSS requests receive `N`; following
+protocol and authentication traffic is plaintext. Keep the listener loopback-
+only.
 
 Each frontend owns one backend TCP session, a prepared-statement map, a portal
 map, and extended error state. The proxy relays supported PostgreSQL
 authentication (AuthenticationOk, cleartext, MD5, and SCRAM messages) without
 logging passwords/proofs. The backend URL password is not substituted for the
-frontend credential. Startup permits only the configured user/database plus
-`application_name`, UTF8 `client_encoding`, empty options and empty
-replication values; other startup parameters and nonempty options/replication
-are rejected.
+frontend credential. Configured backend user/database are trusted identity;
+the frontend user must match, and an omitted frontend database defaults to
+that user. An omitted backend URL database defaults to the configured user.
+Only `application_name`, `client_encoding=UTF8`, and empty `options`/`replication`
+values are permitted; other startup parameters and non-empty values are
+rejected.
 
 | Frontend message/state | Proxy behavior | Backend behavior |
 |---|---|---|
-| SSLRequest / GSSENCRequest | Reply `N`, continue startup | None |
+| SSLRequest / GSSENCRequest | Reply `N` to at most two requests, then close | None |
 | CancelRequest | Close without forwarding | None |
 | StartupMessage | Validate identity and allowed parameters | Forward validated startup unchanged to fixed target |
 | Authentication | Relay supported bounded auth frames | Same backend session |
@@ -126,7 +127,8 @@ collect live evidence.
 ## Scope boundary
 
 Supported: PostgreSQL Simple Query plus guarded Extended Query prepared
-statements and portals. Still unsupported: COPY streaming, FunctionCall,
+statements and portals. Unsupported/fail-closed: COPY streaming, FunctionCall,
 replication startup, CancelRequest forwarding, frontend TLS, and backend TLS.
-This feature does not change MySQL, OpenShell, `observe`, or
-`../queryknight-ts`.
+This feature does not change MySQL or OpenShell. Legacy observe remains
+unimplemented and is not shipped in Rust; `../queryknight-ts` remains the
+read-only reference oracle.

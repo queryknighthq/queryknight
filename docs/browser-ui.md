@@ -15,15 +15,17 @@ audit"); this document is the Rust contract.
 - Node/Vite are build-time only. The daemon never runs npm/vite at
   startup; missing assets are a build/packaging error.
 - Strategy: **embedded** (`include_bytes!` over a vendored
-  `crates/qk-daemon/ui/` copy of `dist/`). One-binary deployment, no
-  asset-path discovery, no version skew, no traversal class, no extra
-  dependency. Rebuild procedure: `vite build --outDir <tmp>` in
-  `apps/ui` (works offline from checked-in `node_modules`), then
-  byte-compare against the vendored copy; CI fails on mismatch so Rust
-  tests can never pass against a stale/broken bundle.
-- Version match: UI package version equals daemon version
-  (`0.1.0-beta.0`); the bundle IS the version — no network version
-  check. No source maps ship (vite default off; none in dist).
+  `crates/qk-daemon/ui/` copy of `dist/`). Runtime asset delivery has no
+  path discovery or traversal surface and needs no external asset directory.
+  The embedded bytes can still become stale relative to the TypeScript source:
+  rebuild with `vite build --outDir <tmp>` in `apps/ui` and byte-compare the
+  output against the vendored copy before release. This Rust repository has no
+  CI workflow to enforce that check yet.
+- The UI package and daemon package metadata are currently versioned
+  `0.1.0-beta.0`; the embedded bundle does not self-identify its version and
+  there is no runtime network version check. Re-synchronize package versions
+  and verify bundle freshness as part of release preparation. No source maps
+  ship (Vite default off; none in `dist/`).
 
 ## Route precedence
 

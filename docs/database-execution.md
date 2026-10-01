@@ -204,7 +204,7 @@ never a policy parse error (syntax-vs-semantic boundary pinned by
 test: `SELECT ... TYPO` allowed by policy executes and fails at the
 DB).
 
-## MCP mapping (no MCP in this commit)
+## MCP mapping (`qk-mcp`)
 
 | Tool | Execution-service operation |
 |---|---|
@@ -434,7 +434,8 @@ identity. COPY, SQL SET, and FunctionCall remain blocked.
 The protocol-neutral Exact V2 encoder is shared across ingress adapters;
 text and binary bytes are hashed exactly as represented, and no proxy-local
 digest is permitted. MySQL COM_QUERY has no bind parameters and uses SQL-only
-Exact V1; MySQL prepared messages remain unsupported in the first proxy commit.
+Exact V1; prepared messages use the MySQL-specific guarded path in
+[`proxy-mysql.md`](proxy-mysql.md).
 
 ## Shared daemon approval path
 
