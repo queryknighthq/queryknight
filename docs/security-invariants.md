@@ -161,3 +161,6 @@ INV-054: OpenShell observability records QueryKnight's authorization decision on
 
 INV-055: OpenShell gRPC listeners are unauthenticated local endpoints until remote authentication is implemented.
   `OpenShellServer` binds Unix sockets with owner-only permissions or loopback TCP and refuses non-loopback TCP. Unix socket access relies on filesystem permissions; loopback TCP has no peer authentication and is permitted only in a trusted local process environment. Remote HTTPS/JWT deployment is unsupported and is never silently downgraded to insecure transport. Corpus: OpenShell listener tests and `docs/openshell.md` deployment limitation.
+
+INV-056: Explicitly supplied security-sensitive configuration values must be validly typed; documented defaults apply only when optional fields are absent.
+  OpenShell rejects explicit null/wrong-typed policy-scope, dialect, approval-action, and size fields before replacing validated state; malformed replacements cannot select a fallback context or authorize SQL. Corpus: generated-client field type matrix, prior-config preservation, and HTTP/WebSocket fail-closed tests.

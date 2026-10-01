@@ -38,6 +38,42 @@ fn string_value(value: &str) -> prost_types::Value {
     }
 }
 
+fn typed_invalid_values() -> Vec<(&'static str, prost_types::Value)> {
+    use prost_types::value::Kind;
+    vec![
+        (
+            "number",
+            prost_types::Value {
+                kind: Some(Kind::NumberValue(7.0)),
+            },
+        ),
+        (
+            "boolean",
+            prost_types::Value {
+                kind: Some(Kind::BoolValue(true)),
+            },
+        ),
+        (
+            "array",
+            prost_types::Value {
+                kind: Some(Kind::ListValue(prost_types::ListValue::default())),
+            },
+        ),
+        (
+            "object",
+            prost_types::Value {
+                kind: Some(Kind::StructValue(prost_types::Struct::default())),
+            },
+        ),
+        (
+            "null",
+            prost_types::Value {
+                kind: Some(Kind::NullValue(0)),
+            },
+        ),
+    ]
+}
+
 fn request(body: Vec<u8>, input: prost_types::Struct, sandbox_id: &str) -> HttpRequestEvaluation {
     HttpRequestEvaluation {
         phase: SupervisorMiddlewarePhase::PreCredentials as i32,
@@ -90,6 +126,22 @@ async fn openshell_client(
         .await
         .expect("connect generated gRPC client");
     (client, server)
+}
+
+async fn validate_config_rpc(
+    client: &mut SupervisorMiddlewareClient<tonic::transport::Channel>,
+    name: &str,
+    config: prost_types::Struct,
+) -> bool {
+    client
+        .validate_config(ValidateConfigRequest {
+            config: Some(config),
+            middleware_name: name.to_owned(),
+        })
+        .await
+        .expect("ValidateConfig")
+        .into_inner()
+        .valid
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -431,6 +483,320 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
     server.stop().await.expect("graceful server shutdown");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn validate_config_distinguishes_missing_and_malformed_typed_fields() {
+    let db = DbConfig::from_url("postgresql://localhost/app").expect("db config");
+    let service = OpenShellService::new(OpenShellServiceConfig::new(db));
+    let (mut client, server) = openshell_client(service).await;
+    let valid = config(qk_core::DEMO_POLICY);
+
+    assert!(validate_config_rpc(&mut client, "typed", valid.clone()).await);
+    let mut malformed_database = valid.clone();
+    malformed_database.fields.insert(
+        "database".to_owned(),
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::NumberValue(123.0)),
+        },
+    );
+    let error = client
+        .validate_config(ValidateConfigRequest {
+            config: Some(malformed_database),
+            middleware_name: "typed".to_owned(),
+        })
+        .await
+        .expect("malformed database type")
+        .into_inner();
+    assert!(!error.valid);
+    assert_eq!(error.reason, "database must be a string");
+
+    for field in [
+        "policy_yaml",
+        "dialect",
+        "database",
+        "environment",
+        "approval_action",
+    ] {
+        for (kind, value) in typed_invalid_values() {
+            let mut candidate = valid.clone();
+            candidate.fields.insert(field.to_owned(), value);
+            assert!(
+                !validate_config_rpc(&mut client, "typed", candidate).await,
+                "{field} with {kind} must be rejected"
+            );
+        }
+    }
+
+    for (field, value) in [
+        ("policy_yaml", ""),
+        ("dialect", ""),
+        ("database", ""),
+        ("environment", ""),
+        ("approval_action", ""),
+    ] {
+        let mut candidate = valid.clone();
+        candidate
+            .fields
+            .insert(field.to_owned(), string_value(value));
+        assert!(
+            !validate_config_rpc(&mut client, "typed", candidate).await,
+            "empty {field} must retain its existing invalid semantics"
+        );
+    }
+
+    for field in ["policy_yaml", "dialect", "environment", "approval_action"] {
+        let mut candidate = valid.clone();
+        candidate.fields.insert(field.to_owned(), string_value(" "));
+        assert!(
+            !validate_config_rpc(&mut client, "typed", candidate).await,
+            "whitespace {field} must retain exact existing behavior"
+        );
+    }
+
+    let mut unknown_dialect = valid.clone();
+    unknown_dialect
+        .fields
+        .insert("dialect".to_owned(), string_value("unknown-dialect"));
+    assert!(!validate_config_rpc(&mut client, "typed", unknown_dialect).await);
+
+    let mut unknown_field = valid.clone();
+    unknown_field
+        .fields
+        .insert("mode".to_owned(), string_value("observe"));
+    assert!(!validate_config_rpc(&mut client, "typed", unknown_field).await);
+
+    for field in [
+        "database",
+        "environment",
+        "dialect",
+        "approval_action",
+        "maxSqlBytes",
+    ] {
+        let mut absent = valid.clone();
+        absent.fields.remove(field);
+        assert!(
+            validate_config_rpc(&mut client, "defaults", absent).await,
+            "documented default should apply only when {field} is absent"
+        );
+    }
+
+    let mut missing_policy = valid.clone();
+    missing_policy.fields.remove("policy_yaml");
+    assert!(!validate_config_rpc(&mut client, "defaults", missing_policy).await);
+
+    let mut whitespace_database = valid.clone();
+    whitespace_database
+        .fields
+        .insert("database".to_owned(), string_value(" "));
+    assert!(
+        validate_config_rpc(&mut client, "whitespace", whitespace_database).await,
+        "database whitespace is preserved rather than silently normalized"
+    );
+
+    for (kind, value) in typed_invalid_values()
+        .into_iter()
+        .filter(|(kind, _)| *kind != "number")
+        .chain([("string", string_value("1024"))])
+    {
+        let mut malformed_max = valid.clone();
+        malformed_max.fields.insert("maxSqlBytes".to_owned(), value);
+        assert!(
+            !validate_config_rpc(&mut client, "max", malformed_max).await,
+            "maxSqlBytes with {kind} must be rejected"
+        );
+    }
+    let mut malformed_limit = valid.clone();
+    malformed_limit
+        .fields
+        .insert("maxSqlBytes".to_owned(), string_value("1024"));
+    let error = client
+        .validate_config(ValidateConfigRequest {
+            config: Some(malformed_limit),
+            middleware_name: "max".to_owned(),
+        })
+        .await
+        .expect("malformed maxSqlBytes type")
+        .into_inner();
+    assert!(!error.valid);
+    assert_eq!(error.reason, "maxSqlBytes must be a number");
+    let mut invalid_limit = valid.clone();
+    invalid_limit.fields.insert(
+        "maxSqlBytes".to_owned(),
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::NumberValue(0.0)),
+        },
+    );
+    assert!(!validate_config_rpc(&mut client, "max", invalid_limit).await);
+    let mut valid_limit = valid.clone();
+    valid_limit.fields.insert(
+        "maxSqlBytes".to_owned(),
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::NumberValue(1024.0)),
+        },
+    );
+    assert!(validate_config_rpc(&mut client, "max", valid_limit).await);
+    let mut valid_action = valid.clone();
+    valid_action
+        .fields
+        .insert("approval_action".to_owned(), string_value("deny"));
+    assert!(validate_config_rpc(&mut client, "valid-action", valid_action).await);
+
+    let mut alternate_scope = valid.clone();
+    alternate_scope
+        .fields
+        .insert("database".to_owned(), string_value("target"));
+    alternate_scope
+        .fields
+        .insert("environment".to_owned(), string_value("staging"));
+    assert!(validate_config_rpc(&mut client, "alternate-scope", alternate_scope).await);
+
+    server.stop().await.expect("graceful server shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_context_replacement_preserves_prior_config_and_fails_closed() {
+    let policy = r#"
+version: 1
+defaults:
+  decision: deny
+  on_parse_error: deny
+  on_unknown: deny
+environments:
+  production:
+    databases:
+      main:
+        allow:
+          - operations: [select]
+"#;
+    let db = DbConfig::from_url("postgresql://localhost/app").expect("db config");
+    let sink = Arc::new(MemorySink::new());
+    let service = OpenShellService::new(
+        OpenShellServiceConfig::new(db).with_observer(Observer::new(vec![sink.clone()])),
+    );
+    let (mut client, server) = openshell_client(service).await;
+    let valid = config(policy);
+    assert!(validate_config_rpc(&mut client, "scope", valid.clone()).await);
+
+    let sql =
+        br#"{"method":"tools/call","params":{"name":"db_query","arguments":{"query":"SELECT 1"}}}"#;
+    let mut trusted_request = request(sql.to_vec(), valid.clone(), "sandbox");
+    trusted_request.middleware_name = "scope".to_owned();
+    let allowed = client
+        .evaluate_http_request(trusted_request.clone())
+        .await
+        .expect("baseline authorization")
+        .into_inner();
+    assert_eq!(allowed.decision, Decision::Allow as i32);
+    assert_eq!(sink.len(), 1);
+    let mut expected_event_count = 1;
+
+    for (field, bad_value) in [
+        (
+            "database",
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::NumberValue(123.0)),
+            },
+        ),
+        (
+            "environment",
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::NullValue(0)),
+            },
+        ),
+        (
+            "dialect",
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::BoolValue(true)),
+            },
+        ),
+    ] {
+        let mut malformed = valid.clone();
+        malformed.fields.insert(field.to_owned(), bad_value);
+        assert!(
+            !validate_config_rpc(&mut client, "scope", malformed.clone()).await,
+            "{field} must be rejected before replacing stored config"
+        );
+
+        let mut malformed_request = request(sql.to_vec(), malformed, "sandbox");
+        malformed_request.middleware_name = "scope".to_owned();
+        let denied = client
+            .evaluate_http_request(malformed_request)
+            .await
+            .expect("malformed config evaluation")
+            .into_inner();
+        assert_eq!(denied.decision, Decision::Deny as i32, "{field}");
+        assert_eq!(
+            sink.len(),
+            expected_event_count,
+            "malformed config must not become an authorization event"
+        );
+
+        let still_allowed = client
+            .evaluate_http_request(trusted_request.clone())
+            .await
+            .expect("previous valid config remains active")
+            .into_inner();
+        assert_eq!(still_allowed.decision, Decision::Allow as i32);
+        expected_event_count += 1;
+        assert_eq!(sink.len(), expected_event_count);
+    }
+
+    let mut malformed_dialect = valid;
+    malformed_dialect.fields.insert(
+        "dialect".to_owned(),
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::NumberValue(1.0)),
+        },
+    );
+    let websocket_preflight = WebSocketSessionEvent {
+        event: Some(web_socket_session_event::Event::Preflight(
+            WebSocketPreflight {
+                session_id: "bad-config-session".to_owned(),
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                context: Some(RequestContext {
+                    request_id: "bad-config-request".to_owned(),
+                    sandbox_id: "sandbox".to_owned(),
+                    originating_process: None,
+                    sandbox: String::new(),
+                    workspace: String::new(),
+                }),
+                target: Some(HttpRequestTarget {
+                    scheme: "wss".to_owned(),
+                    host: "db-gateway.local".to_owned(),
+                    port: 443,
+                    method: "GET".to_owned(),
+                    path: "/ws".to_owned(),
+                    query: String::new(),
+                }),
+                requested_subprotocols: Vec::new(),
+                middleware_name: "scope".to_owned(),
+                config: Some(malformed_dialect),
+            },
+        )),
+    };
+    let mut websocket = client
+        .evaluate_web_socket_session(tokio_stream::iter([websocket_preflight]))
+        .await
+        .expect("WebSocket config preflight")
+        .into_inner();
+    let preflight = websocket
+        .message()
+        .await
+        .expect("preflight response")
+        .expect("preflight decision");
+    match preflight.result.expect("preflight result") {
+        proto::web_socket_session_event_result::Result::PreflightDecision(result) => {
+            assert_eq!(result.action, proto::WebSocketPreflightAction::Deny as i32);
+        }
+        _ => panic!("malformed configuration must deny WebSocket preflight"),
+    }
+    assert!(websocket
+        .message()
+        .await
+        .expect("closed invalid stream")
+        .is_none());
+    assert_eq!(sink.len(), expected_event_count);
+    server.stop().await.expect("graceful server shutdown");
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn raw_sql_logging_requires_explicit_full_sql_level_and_never_logs_params() {
     let db = DbConfig::from_url("postgresql://localhost/app").expect("db config");

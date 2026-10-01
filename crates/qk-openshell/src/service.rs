@@ -152,56 +152,56 @@ impl OpenShellService {
                 return Err("unknown_config_field");
             }
         }
-        let policy_yaml = match fields.get("policy_yaml").and_then(value_string) {
-            Some(text) if !text.trim().is_empty() => text,
-            _ => return Err("policy_yaml_required"),
-        };
-        let policy = parse_policy(&policy_yaml).map_err(|_| "invalid_policy")?;
-        let dialect = fields
-            .get("dialect")
-            .and_then(value_string)
-            .unwrap_or_else(|| "postgres".to_owned());
+        let policy_yaml = optional_string(fields.get("policy_yaml"), "policy_yaml_must_be_string")?
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("policy_yaml_required")?;
+        let policy = parse_policy(policy_yaml).map_err(|_| "invalid_policy")?;
+        let dialect =
+            optional_string(fields.get("dialect"), "dialect_must_be_string")?.unwrap_or("postgres");
         let parsed_dialect = dialect
             .parse::<qk_sql::SqlDialect>()
             .map_err(|_| "invalid_dialect")?;
         if parsed_dialect != self.state.db_config.dialect() {
             return Err("dialect_mismatch");
         }
-        let database = fields
-            .get("database")
-            .and_then(value_string)
-            .unwrap_or_else(|| "main".to_owned());
+        let database =
+            optional_string(fields.get("database"), "database_must_be_string")?.unwrap_or("main");
         if database.is_empty() || database.len() > 128 {
             return Err("invalid_database");
         }
-        let environment = fields
-            .get("environment")
-            .and_then(value_string)
-            .unwrap_or_else(|| "production".to_owned());
+        let database = database.to_owned();
+        let environment = optional_string(fields.get("environment"), "environment_must_be_string")?
+            .unwrap_or("production");
         if !matches!(
-            environment.as_str(),
+            environment,
             "development" | "staging" | "production" | "unknown"
         ) {
             return Err("invalid_environment");
         }
-        if let Some(action) = fields.get("approval_action") {
-            match value_string(action).as_deref() {
-                Some("deny") => {}
-                Some("allow_with_findings") => return Err("unsafe_approval_action"),
+        let environment = environment.to_owned();
+        if let Some(action) = optional_string(
+            fields.get("approval_action"),
+            "approval_action_must_be_string",
+        )? {
+            match action {
+                "deny" => {}
+                "allow_with_findings" => return Err("unsafe_approval_action"),
                 _ => return Err("invalid_approval_action"),
             }
         }
         let max_sql_bytes = match fields.get("maxSqlBytes") {
             None => MAX_SQL_BYTES,
             Some(value) => {
-                let Some(bytes) = value_number(value).filter(|number| {
-                    number.is_finite()
-                        && *number >= 1.0
-                        && *number <= MAX_SQL_BYTES as f64
-                        && number.fract() == 0.0
-                }) else {
-                    return Err("invalid_max_sql_bytes");
+                let Some(bytes) = value_number(value) else {
+                    return Err("max_sql_bytes_must_be_number");
                 };
+                if !bytes.is_finite()
+                    || bytes < 1.0
+                    || bytes > MAX_SQL_BYTES as f64
+                    || bytes.fract() != 0.0
+                {
+                    return Err("invalid_max_sql_bytes");
+                }
                 bytes as usize
             }
         };
@@ -484,17 +484,16 @@ impl SupervisorMiddleware for OpenShellService {
         request: Request<ValidateConfigRequest>,
     ) -> Result<Response<ValidateConfigResponse>, Status> {
         let request = request.into_inner();
-        let valid = request.config.is_some_and(|config| {
-            self.validate_and_store(&request.middleware_name, config)
-                .is_ok()
-        });
+        let (valid, reason) = match request.config {
+            Some(config) => match self.validate_and_store(&request.middleware_name, config) {
+                Ok(()) => (true, ""),
+                Err(reason) => (false, config_validation_reason(reason)),
+            },
+            None => (false, "invalid_or_unsupported_queryknight_configuration"),
+        };
         Ok(Response::new(ValidateConfigResponse {
             valid,
-            reason: if valid {
-                String::new()
-            } else {
-                "invalid_or_unsupported_queryknight_configuration".to_owned()
-            },
+            reason: reason.to_owned(),
         }))
     }
 
@@ -765,10 +764,28 @@ fn extract_error_code(error: ExtractError) -> &'static str {
     }
 }
 
-fn value_string(value: &prost_types::Value) -> Option<String> {
-    match value.kind.as_ref()? {
-        prost_types::value::Kind::StringValue(value) => Some(value.clone()),
-        _ => None,
+fn optional_string<'a>(
+    value: Option<&'a prost_types::Value>,
+    invalid_type: &'static str,
+) -> Result<Option<&'a str>, &'static str> {
+    match value {
+        None => Ok(None),
+        Some(value) => match value.kind.as_ref() {
+            Some(prost_types::value::Kind::StringValue(value)) => Ok(Some(value.as_str())),
+            _ => Err(invalid_type),
+        },
+    }
+}
+
+fn config_validation_reason(reason: &str) -> &'static str {
+    match reason {
+        "policy_yaml_must_be_string" => "policy_yaml must be a string",
+        "dialect_must_be_string" => "dialect must be a string",
+        "database_must_be_string" => "database must be a string",
+        "environment_must_be_string" => "environment must be a string",
+        "approval_action_must_be_string" => "approval_action must be a string",
+        "max_sql_bytes_must_be_number" => "maxSqlBytes must be a number",
+        _ => "invalid_or_unsupported_queryknight_configuration",
     }
 }
 

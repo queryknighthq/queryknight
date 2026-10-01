@@ -90,7 +90,17 @@ For every SQL candidate Rust calls `authorize_guarded`, observes the typed outco
 
 - `qk-openshell` generates Tonic/Prost types from both vendored NVIDIA schemas. `Describe` accepts protocol major version 1, emits peer metadata version 1.2 and advertises HTTP request plus WebSocket message bindings at `PRE_CREDENTIALS`, each capped at 1 MiB. `expected_audience` remains empty: the service does not verify JWTs.
 - `OpenShellServiceConfig::new(DbConfig)` receives a trusted connection URL only to select dialect and derive the password-redacted approval connection key. It never opens a DB connection. Validated registration config supplies policy database/environment; its dialect must match the trusted `DbConfig`.
-- `ValidateConfig` strictly accepts `policy_yaml`, `dialect`, `database`, `environment`, `approval_action`, and `maxSqlBytes`; malformed values, unknown fields and `allow_with_findings` are rejected. A bounded in-process registry requires each evaluation config to match the exact validated registration.
+- `ValidateConfig` strictly accepts `policy_yaml`, `dialect`, `database`,
+  `environment`, `approval_action`, and `maxSqlBytes`; malformed values,
+  unknown fields and `allow_with_findings` are rejected. Rust defaults for
+  optional fields apply only when absent: explicitly supplied null or
+  wrong-typed values do not select a fallback. Validation completes before
+  the bounded registry is updated, so invalid replacement leaves the prior
+  validated config intact. A bounded in-process registry requires each
+  evaluation config to match the exact validated registration.
+  Wrong-typed known fields receive a bounded field/type reason without echoing
+  the supplied config. This intentionally hardens TypeScript's non-string
+  `database`/`dialect` fallback; Rust does not reproduce that fallback.
 - `OpenShellServer` binds only a Unix socket or loopback TCP. Unix sockets are owner-only (`0600`) and require an existing trusted parent directory. Loopback TCP has no peer authentication and is suitable only when local processes are trusted. The returned handle supports graceful shutdown. Non-loopback TCP is refused; remote HTTPS/JWT deployments remain unsupported until their gateway audience and verification keys are configured.
 - Every recognized SQL candidate uses `authorize_guarded` and `DaemonApprovalProvider::with_exact_lookup_retry` when a daemon client is supplied. The connection key is password-redacted. `RequestContext.sandbox_id` is the only session identity; missing IDs remain absent, and the separate WebSocket stream ID, process fields, headers and target are not trusted policy identity. Without a daemon client, approval-required requests fail closed.
 - The body extractor accepts the audited JSON/raw-SQL shapes, strictly requires UTF-8 for HTTP bodies, preserves adjacent JSON `params` arrays as ordered `ExecutionParam`s (ExactV2), rejects unsupported parameter encodings, and uses the shared `qk-sql` AST to reject placeholders without explicit values. Candidate/body limits fail closed instead of truncating an authorized prefix. No parameter interpolation occurs; non-SQL/unrecognized traffic remains pass-through as in TypeScript.
