@@ -32,7 +32,7 @@ Build from source. Do not expect downloadable artifacts yet.
 ## Build from source
 
 ```sh
-git clone <repository-url> queryknight
+git clone https://github.com/queryknighthq/queryknight.git
 cd queryknight
 cargo build --release --locked
 ./target/release/queryknight --version    # QueryKnight 0.1.0
