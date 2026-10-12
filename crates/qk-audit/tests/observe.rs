@@ -194,7 +194,7 @@ fn parse_failure_observes_unknown_operation() {
 // ---------------------------------------------------------------------------
 
 fn ocsf_json(event: &AuditEvent) -> serde_json::Value {
-    serde_json::to_value(to_ocsf(event, "0.1.0-beta.0")).expect("ocsf json")
+    serde_json::to_value(to_ocsf(event, "0.1.0")).expect("ocsf json")
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn ocsf_allow_golden() {
     assert_eq!(ocsf["status"], "Success");
     assert_eq!(ocsf["ocsf_version"], "1.5.0");
     assert_eq!(ocsf["metadata"]["product"]["name"], "QueryKnight");
-    assert_eq!(ocsf["metadata"]["product"]["version"], "0.1.0-beta.0");
+    assert_eq!(ocsf["metadata"]["product"]["version"], "0.1.0");
     assert_eq!(ocsf["api"]["operation"], "mcp:select");
     assert_eq!(ocsf["actor"]["user"]["name"], "agent-1");
     assert_eq!(ocsf["unmapped"]["qk_reason_code"], "ALLOW_RULE");
@@ -433,7 +433,7 @@ fn surfaces(level: SqlLogLevel) -> Vec<String> {
     let outcome = executed(SECRET_SQL);
     let obs = observation(&outcome, SECRET_SQL);
     let event = obs.audit_event(level);
-    let ocsf = serde_json::to_string(&to_ocsf(&event, "0.1.0-beta.0")).expect("ocsf");
+    let ocsf = serde_json::to_string(&to_ocsf(&event, "0.1.0")).expect("ocsf");
     vec![
         serde_json::to_string(&event).expect("event json"),
         ocsf,

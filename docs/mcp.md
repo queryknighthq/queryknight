@@ -10,7 +10,7 @@ bug. Audited TS behavior is in `docs/reference-implementation.md`
 ## Identity and transport
 
 - Server name `queryknight`, version from package metadata
-  (`0.1.0-beta.0`), frozen instructions text (interpolated with the
+  (`0.1.0`), frozen instructions text (interpolated with the
   bound connection key).
 - stdio transport (rmcp); **stdout is protocol-only** — no banners,
   no `println!`, no tracing-to-stdout (INV-038). Diagnostics go to

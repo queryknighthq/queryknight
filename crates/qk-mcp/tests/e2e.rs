@@ -407,7 +407,7 @@ async fn param_secret_absent_from_observability() {
     let event = &memory.events()[0];
     let event_json = serde_json::to_string(event).expect("event");
     assert!(!event_json.contains("PARAM_SECRET"), "audit leaked");
-    let ocsf = serde_json::to_string(&qk_audit::to_ocsf(event, "0.1.0-beta.0")).expect("ocsf");
+    let ocsf = serde_json::to_string(&qk_audit::to_ocsf(event, "0.1.0")).expect("ocsf");
     assert!(!ocsf.contains("PARAM_SECRET"), "OCSF leaked");
     let metrics = server.state().observer().metrics().render();
     assert!(!metrics.contains("PARAM_SECRET"), "metrics leaked");

@@ -131,7 +131,7 @@ fn stdio_initialize_list_call_shutdown() {
         }),
     );
     assert_eq!(init["result"]["serverInfo"]["name"], "queryknight");
-    assert_eq!(init["result"]["serverInfo"]["version"], "0.1.0-beta.0");
+    assert_eq!(init["result"]["serverInfo"]["version"], "0.1.0");
     session.notify("notifications/initialized");
     // tools/list → the frozen eight.
     let list = session.send("tools/list", serde_json::json!({}));

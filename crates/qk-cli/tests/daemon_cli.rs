@@ -157,5 +157,5 @@ fn existing_commands_unchanged() {
         .arg("version")
         .assert()
         .success()
-        .stdout(predicates::str::contains("QueryKnight 0.1.0-beta.0"));
+        .stdout(predicates::str::contains("QueryKnight 0.1.0"));
 }

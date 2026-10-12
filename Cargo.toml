@@ -17,3 +17,9 @@ members = [
     "crates/qk-proxy-mysql",
     "crates/qk-openshell",
 ]
+
+[workspace.package]
+# One product version for every QueryKnight crate. Protocol and format
+# versions (policy schema, approval digest, OCSF, OpenShell extension) are
+# separate and deliberately not derived from this.
+version = "0.1.0"

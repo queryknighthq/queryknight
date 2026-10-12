@@ -2069,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "qk-cli"
-version = "0.1.0-beta.0"
+version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -2103,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "qk-control-plane"
-version = "0.1.0-beta.0"
+version = "0.1.0"
 dependencies = [
  "qk-approval",
  "qk-core",
@@ -2126,7 +2126,7 @@ dependencies = [
 
 [[package]]
 name = "qk-daemon"
-version = "0.1.0-beta.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "qk-mcp"
-version = "0.1.0-beta.0"
+version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "base64 0.22.1",
@@ -2196,7 +2196,7 @@ version = "0.1.0"
 
 [[package]]
 name = "qk-openshell"
-version = "0.1.0-beta.0"
+version = "0.1.0"
 dependencies = [
  "async-stream",
  "base64 0.22.1",
@@ -2231,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "qk-proxy-mysql"
-version = "0.1.0-beta.0"
+version = "0.1.0"
 dependencies = [
  "mysql_async",
  "qk-approval",
@@ -2249,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "qk-proxy-postgres"
-version = "0.1.0-beta.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "qk-approval",

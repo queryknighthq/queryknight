@@ -24,7 +24,7 @@ mod proxy_cmd;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 
 /// Single source for the reported product version (matches the frozen
-/// `0.1.0-beta.0` surface).
+/// `0.1.0` surface).
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser, Debug)]

@@ -92,7 +92,7 @@ async fn health_and_status_unauthenticated() {
             .expect("request"),
     )
     .await;
-    assert_eq!(json(&body)["version"], "0.1.0-beta.0");
+    assert_eq!(json(&body)["version"], "0.1.0");
 }
 
 #[tokio::test]

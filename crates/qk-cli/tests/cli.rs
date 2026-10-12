@@ -58,7 +58,7 @@ fn version_forms() {
             .args(&args)
             .assert()
             .code(0)
-            .stdout(predicate::str::contains("QueryKnight 0.1.0-beta.0"));
+            .stdout(predicate::str::contains("QueryKnight 0.1.0"));
     }
 }
 

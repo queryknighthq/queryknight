@@ -227,7 +227,7 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
     assert!(authorization.sql.is_none());
     assert!(authorization.normalized_sql.is_none());
     assert_eq!(authorization.session_id.as_deref(), Some("sandbox-one"));
-    let ocsf = qk_audit::to_ocsf(authorization, "0.1.0-beta.0");
+    let ocsf = qk_audit::to_ocsf(authorization, "0.1.0");
     assert_eq!(ocsf.status, "Unknown");
 
     let deny = client
@@ -247,10 +247,7 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
     assert_eq!(events[1].outcome, AttemptOutcome::Blocked);
     assert_eq!(events[1].reason_code, "DENY_RULE");
     assert!(events[1].rows_affected.is_none());
-    assert_eq!(
-        qk_audit::to_ocsf(&events[1], "0.1.0-beta.0").status,
-        "Failure"
-    );
+    assert_eq!(qk_audit::to_ocsf(&events[1], "0.1.0").status, "Failure");
     let mut allow_client = client.clone();
     let mut deny_client = client.clone();
     let (concurrent_allow, concurrent_deny) = tokio::join!(
@@ -852,7 +849,7 @@ async fn raw_sql_logging_requires_explicit_full_sql_level_and_never_logs_params(
         .metrics()
         .render()
         .contains("OPENSHELL_PARAM_SECRET_67890"));
-    let ocsf = qk_audit::to_ocsf(event, "0.1.0-beta.0");
+    let ocsf = qk_audit::to_ocsf(event, "0.1.0");
     assert_eq!(ocsf.status, "Unknown");
     assert!(!serde_json::to_string(&ocsf)
         .expect("OCSF event")
@@ -1273,10 +1270,7 @@ async fn session_approval_is_scoped_and_audited_as_authorization_only() {
     assert!(events[1].rows_affected.is_none());
     assert_eq!(events[2].decision, AuditDecision::RequireApproval);
     assert_eq!(events[2].outcome, AttemptOutcome::Pending);
-    assert_eq!(
-        qk_audit::to_ocsf(&events[1], "0.1.0-beta.0").status,
-        "Unknown"
-    );
+    assert_eq!(qk_audit::to_ocsf(&events[1], "0.1.0").status, "Unknown");
 
     server.stop().await.expect("graceful server shutdown");
     daemon.stop().await;

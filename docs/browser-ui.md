@@ -22,7 +22,7 @@ audit"); this document is the Rust contract.
   output against the vendored copy before release. This Rust repository has no
   CI workflow to enforce that check yet.
 - The UI package and daemon package metadata are currently versioned
-  `0.1.0-beta.0`; the embedded bundle does not self-identify its version and
+  `0.1.0`; the embedded bundle does not self-identify its version and
   there is no runtime network version check. Re-synchronize package versions
   and verify bundle freshness as part of release preparation. No source maps
   ship (Vite default off; none in `dist/`).
