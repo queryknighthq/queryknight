@@ -130,12 +130,12 @@ fn workspace_root() -> PathBuf {
 fn typescript_reference_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("QUERYKNIGHT_TS_DIR")
         .map_or_else(|| workspace_root().join("../queryknight-ts"), PathBuf::from);
-    dir.join("packages")
+    let entry = dir
+        .join("packages")
         .join("core")
         .join("src")
-        .join("index.ts")
-        .is_file()
-        .then(|| dir)
+        .join("index.ts");
+    entry.is_file().then_some(dir)
 }
 
 fn read_json(file: &str) -> Vec<serde_json::Value> {
