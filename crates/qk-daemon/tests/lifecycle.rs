@@ -225,6 +225,32 @@ async fn shutdown_cleans_pid_and_preserves_pending() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+// Regression: the daemon must keep serving past SHUTDOWN_GRACE. A
+// misapplied `timeout(SHUTDOWN_GRACE, server)` previously stopped the
+// daemon after exactly SHUTDOWN_GRACE regardless of the shutdown signal,
+// which made every long-lived `queryknight start` unusable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_survives_past_shutdown_grace() {
+    let home = temp_home("serve-grace");
+    let daemon = runtime(home.clone());
+    let (handle, shutdown_tx, addr) = spawn_daemon(daemon).await;
+    let target = target_for(&addr);
+    let daemon = runtime(home.clone());
+    let token = probe_api::read_token(&daemon.resolved.paths).expect("token contract");
+
+    // Outlive the grace bound; the daemon must still answer.
+    tokio::time::sleep(qk_daemon::server::SHUTDOWN_GRACE + Duration::from_secs(1)).await;
+    let (code, body) = probe_api::get_json(&target, "/status", &token)
+        .await
+        .expect("daemon still serves after SHUTDOWN_GRACE");
+    assert_eq!(code, 200);
+    assert_eq!(body["ok"], serde_json::json!(true));
+
+    let _ = shutdown_tx.send(());
+    handle.await.expect("join").expect("clean shutdown");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_reuses_token_and_keeps_history() {
     let home = temp_home("restart");

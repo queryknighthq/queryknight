@@ -4,6 +4,7 @@
 //! Unauthenticated surface: `/status`, `/health`, `/ready` plus CORS
 //! preflights. Everything else requires the daemon token.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -227,12 +228,27 @@ pub async fn bind_listener(config: &DaemonConfig) -> Result<tokio::net::TcpListe
 pub async fn serve_listener(
     listener: tokio::net::TcpListener,
     app: axum::Router,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), DaemonError> {
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown);
-    match tokio::time::timeout(SHUTDOWN_GRACE, server).await {
-        Ok(result) => result.map_err(|e| DaemonError::Internal(format!("serve failed: {e}"))),
-        Err(_) => Ok(()),
+    // The grace bound applies to the post-shutdown drain, not to the serve
+    // lifetime. Wrapping the whole server future in `timeout(SHUTDOWN_GRACE, ..)`
+    // would stop the daemon after SHUTDOWN_GRACE regardless of `shutdown`, so
+    // the timer is armed only once `shutdown` has resolved.
+    let (shutdown_begun_tx, shutdown_begun_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown.await;
+        let _ = shutdown_begun_tx.send(());
+    });
+    let drain_deadline = async move {
+        if shutdown_begun_rx.await.is_err() {
+            // Sender dropped without a shutdown signal; never bound the serve.
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
+    };
+    tokio::select! {
+        result = server => result.map_err(|e| DaemonError::Internal(format!("serve failed: {e}"))),
+        () = drain_deadline => Ok(()),
     }
 }
 
@@ -261,7 +277,7 @@ pub async fn serve(
 pub async fn serve_with_shutdown(
     config: &DaemonConfig,
     state: DaemonState,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<std::net::SocketAddr, DaemonError> {
     let listener = bind_listener(config).await?;
     let addr: SocketAddr = listener
