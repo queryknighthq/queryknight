@@ -1769,7 +1769,31 @@ async fn relay_authentication(
                 .await;
                 return Err(());
             }
-            client.write_all(&message.raw).await.map_err(|_| ())?;
+            if method == protocol::AUTHENTICATION_SASL {
+                // The inspected frontend hop is plaintext, so it has no channel
+                // binding. A backend reached over verified TLS advertises
+                // SCRAM-SHA-256-PLUS, which libpq refuses over a non-SSL
+                // connection; offer the frontend only usable mechanisms.
+                let Some(mechanisms) =
+                    protocol::sasl_mechanisms_for_plaintext_frontend(&payload[4..])
+                else {
+                    let _ = write_error(
+                        client,
+                        "FATAL",
+                        "0A000",
+                        "backend offers no authentication mechanism usable over a plaintext frontend",
+                    )
+                    .await;
+                    return Err(());
+                };
+                let mut rewritten = Vec::with_capacity(4 + mechanisms.len());
+                rewritten.extend_from_slice(&method.to_be_bytes());
+                rewritten.extend_from_slice(&mechanisms);
+                let frame = protocol::encode_message(b'R', &rewritten).map_err(|_| ())?;
+                client.write_all(&frame).await.map_err(|_| ())?;
+            } else {
+                client.write_all(&message.raw).await.map_err(|_| ())?;
+            }
             if matches!(method, 3 | 5 | 10 | 11) {
                 let response = tokio::select! {
                     _ = wait_shutdown(shutdown) => return Err(()),

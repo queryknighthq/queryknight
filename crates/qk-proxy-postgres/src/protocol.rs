@@ -638,6 +638,52 @@ fn push_error_field(payload: &mut Vec<u8>, tag: u8, value: &str) {
     payload.push(0);
 }
 
+/// Authentication method code for `AuthenticationSASL` in a backend `R` message.
+pub const AUTHENTICATION_SASL: u32 = 10;
+
+/// SASL mechanism that requires TLS channel binding.
+pub const SCRAM_SHA_256_PLUS: &[u8] = b"SCRAM-SHA-256-PLUS";
+
+/// Rewrite an `AuthenticationSASL` mechanism list for the inspected frontend.
+///
+/// The proxy always answers `N` to a frontend `SSLRequest`, so the frontend hop
+/// carries no TLS and cannot perform channel binding. A PostgreSQL backend
+/// reached over verified TLS advertises `SCRAM-SHA-256-PLUS` first, and libpq
+/// aborts with "server offered SCRAM-SHA-256-PLUS authentication over a non-SSL
+/// connection" instead of falling back to the plain mechanism. Offer the
+/// frontend only the mechanisms it can actually complete.
+///
+/// `list` is the mechanism sequence that follows the 4-byte method code: names
+/// terminated by a zero byte, with a zero byte closing the list. Returns the
+/// rewritten sequence, or `None` when the input is malformed or nothing usable
+/// remains (fail closed).
+///
+/// If frontend TLS is ever implemented, this filter must become conditional on
+/// the frontend hop's channel-binding capability rather than unconditional.
+#[must_use]
+pub fn sasl_mechanisms_for_plaintext_frontend(list: &[u8]) -> Option<Vec<u8>> {
+    let mut filtered = Vec::new();
+    let mut remaining = list;
+    loop {
+        let index = remaining.iter().position(|byte| *byte == 0)?;
+        let name = &remaining[..index];
+        remaining = &remaining[index + 1..];
+        if name.is_empty() {
+            break;
+        }
+        if name == SCRAM_SHA_256_PLUS {
+            continue;
+        }
+        filtered.extend_from_slice(name);
+        filtered.push(0);
+    }
+    if filtered.is_empty() {
+        return None;
+    }
+    filtered.push(0);
+    Some(filtered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,5 +1066,37 @@ mod tests {
         );
         assert_eq!(validate_empty_message(&[]), Ok(()));
         assert_eq!(validate_empty_message(b"x"), Err(FrameError::Invalid));
+    }
+
+    #[test]
+    fn sasl_mechanisms_drop_channel_binding_for_a_plaintext_frontend() {
+        // A backend reached over TLS advertises SCRAM-SHA-256-PLUS first; the
+        // plaintext frontend must never be offered it.
+        assert_eq!(
+            sasl_mechanisms_for_plaintext_frontend(b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0"),
+            Some(b"SCRAM-SHA-256\0\0".to_vec())
+        );
+        // A plain list is forwarded unchanged.
+        assert_eq!(
+            sasl_mechanisms_for_plaintext_frontend(b"SCRAM-SHA-256\0\0"),
+            Some(b"SCRAM-SHA-256\0\0".to_vec())
+        );
+        // Extra mechanisms survive; only the channel-bound one is removed.
+        assert_eq!(
+            sasl_mechanisms_for_plaintext_frontend(b"SCRAM-SHA-256-PLUS\0PLAIN\0SCRAM-SHA-256\0\0"),
+            Some(b"PLAIN\0SCRAM-SHA-256\0\0".to_vec())
+        );
+        // Nothing usable left: fail closed rather than offer an empty list.
+        assert_eq!(
+            sasl_mechanisms_for_plaintext_frontend(b"SCRAM-SHA-256-PLUS\0\0"),
+            None
+        );
+        // Malformed and empty inputs fail closed.
+        assert_eq!(
+            sasl_mechanisms_for_plaintext_frontend(b"SCRAM-SHA-256"),
+            None
+        );
+        assert_eq!(sasl_mechanisms_for_plaintext_frontend(b""), None);
+        assert_eq!(sasl_mechanisms_for_plaintext_frontend(b"\0"), None);
     }
 }
