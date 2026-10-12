@@ -29,27 +29,29 @@ transport limits are documented in [`docs/release-security.md`](docs/release-sec
 
 ## OpenShell + PostgreSQL
 
-OpenShell controls where the agent can connect. QueryKnight controls what SQL it
-can execute inside PostgreSQL.
+A database safety layer for AI agents: OpenShell controls destination access,
+and QueryKnight adds deterministic SQL-level enforcement and exact approvals.
 
 ```
-OpenShell sandbox ──X── direct PostgreSQL          (denied by OpenShell)
+OpenShell sandbox ──X── direct PostgreSQL      (denied by OpenShell)
         │
-        │ PostgreSQL protocol
+        │ PostgreSQL protocol (plaintext frontend hop)
         ▼
 QueryKnight PostgreSQL proxy
         │
-        │ verified TLS
+        │ verified TLS (sslmode=require, pinned CA)
         ▼
 PostgreSQL 17
 ```
 
-`scripts/test-openshell-postgres-v0.1.2.sh` runs this composition end to end on
-real components — a real OpenShell v0.1.2 sandbox, the real PostgreSQL proxy,
-and PostgreSQL 17 over verified TLS — and exits `0` only when every assertion
-passes. OpenShell enforces the network destination and never sees SQL;
-QueryKnight enforces SQL authorization and does not decide reachability. See
-[the demo](docs/openshell-postgres-demo.md).
+Live verified against OpenShell v0.1.2: the sandbox is denied the database and
+admitted to the proxy; `SELECT` is allowed, an unbounded `DELETE` is denied with
+SQLSTATE 42501, and a bound `DELETE` needs an ExactV2 `once` approval that a
+changed value cannot reuse. OpenShell never parses PostgreSQL SQL, and the
+QueryKnight → PostgreSQL hop is verified TLS. Run it with
+`scripts/test-openshell-postgres-v0.1.2.sh`; see
+[the demo](docs/openshell-postgres-demo.md) and
+[the compatibility matrix](docs/openshell-compatibility.md).
 
 See [release security and deployment scope](docs/release-security.md) for the complete matrix and trust assumptions.
 

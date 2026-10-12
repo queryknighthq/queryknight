@@ -10,9 +10,24 @@ OpenShell product releases and the extension protocol version are separate. This
 
 `COMPATIBLE / NOT LIVE-VERIFIED` means the tagged descriptor inputs and the protocol metadata/auth contract inspected from that release are compatible, but QueryKnight has not run a live gateway/sandbox test against that product tag. It is not a support claim based on semver. `v0.1.2` is the required implementation and E2E target for this milestone.
 
+## Two OpenShell integration modes
+
+QueryKnight integrates with OpenShell in two complementary ways. They use
+different mechanisms and must not be conflated:
+
+- **HTTP/WebSocket middleware (mode A)** — OpenShell's supervisor calls
+  QueryKnight over authenticated HTTPS + extension JWT, and QueryKnight
+  authorizes SQL-bearing HTTP/WebSocket requests. Evidence:
+  `scripts/test-openshell-v0.1.2.sh`.
+- **Native PostgreSQL (mode B)** — OpenShell `network_policies` decide which
+  destinations the sandbox may reach; only the QueryKnight proxy is reachable,
+  and QueryKnight enforces PostgreSQL SQL on that connection. Native PostgreSQL
+  traffic does **not** pass through the HTTP middleware API. Evidence:
+  `scripts/test-openshell-postgres-v0.1.2.sh`.
+
 ## Live verification record (v0.1.2)
 
-`scripts/test-openshell-v0.1.2.sh` runs the real path end to end and exits `0`:
+`scripts/test-openshell-v0.1.2.sh` runs mode A end to end and exits `0`:
 
 | Area | Status |
 |---|---|
@@ -27,6 +42,18 @@ OpenShell product releases and the extension protocol version are separate. This
 | changed-request rejection | LIVE VERIFIED |
 | PostgreSQL network gating | LIVE VERIFIED |
 | WebSocket | generated-client verified; not live sandbox verified |
+
+Status of the OpenShell-facing surfaces, stated separately so a
+partially-implemented surface is not read as covered:
+
+| Surface | Status |
+|---|---|
+| OpenShell HTTP middleware | LIVE VERIFIED |
+| OpenShell + QueryKnight PostgreSQL deployment | LIVE VERIFIED |
+| WebSocket over a real sandbox | NOT LIVE VERIFIED (generated-client only) |
+| `HTTP_RESPONSE/PRE_RETURN` | UNSUPPORTED (absent from the manifest) |
+| PostgreSQL frontend TLS | NOT IMPLEMENTED |
+| MySQL TLS | NOT IMPLEMENTED |
 
 Evidence from the passing run:
 
@@ -112,6 +139,23 @@ and OpenShell denies any connection that no rule allows.
 
 The imported files remain byte-for-byte equal to the official `NVIDIA/OpenShell` `v0.1.2` protocol inputs at commit `6648bd0c290efbc41ba131ee9831ee45cd431f94`. Their SHA-256 values and deterministic regeneration instructions are recorded in [`third_party/openshell/README.md`](../third_party/openshell/README.md). The generated descriptor-set golden test catches changes to the complete compiled contract.
 
+## Resolved QueryKnight bug found through real OpenShell traffic
+
+The native PostgreSQL E2E (mode B) was the first path to reach PostgreSQL over
+verified TLS with a real libpq client, and it immediately exposed a QueryKnight
+defect that no fake protocol fixture had reached: the proxy relayed the
+backend's `AuthenticationSASL` mechanism list verbatim, so a backend reached
+over TLS advertised `SCRAM-SHA-256-PLUS` first and libpq aborted with *"server
+offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection"*. Backend
+TLS plus any real PostgreSQL client was unusable.
+
+Fixed in QueryKnight (`087e7dd`): the mechanism list is rewritten for the
+plaintext frontend hop, dropping mechanisms that require TLS channel binding,
+and a list that leaves nothing usable fails closed. This is an internal
+QueryKnight bug rather than an OpenShell compatibility issue; it is recorded
+here because the composed E2E is what found it. See
+[`openshell-outreach-facts.md`](openshell-outreach-facts.md#scram-sha-256-plus).
+
 ## Resolved compatibility bug (qkes-d-001, qk-openshell)
 
 A real OpenShell v0.1.2 sandbox middleware E2E was run from inside a custom
@@ -176,6 +220,19 @@ serve future in `timeout(SHUTDOWN_GRACE, server)`, so the daemon stopped after
 exactly 5 seconds regardless of the shutdown signal. The grace bound now
 applies only to the post-shutdown drain (commit `8abb17d`), with a regression
 test that outlives `SHUTDOWN_GRACE`.
+
+## Current-main forward look
+
+Audited `NVIDIA/OpenShell` `main` against `v0.1.2`: 147 commits ahead, 300 files
+changed, and **no material integration change** in the areas QueryKnight
+depends on — `proto/` (extension and sandbox contracts),
+`crates/openshell-supervisor-network/` (egress enforcement), and the middleware
+crates are untouched. `crates/openshell-driver-docker/` and
+`crates/openshell-policy*` have moved and must be re-verified at the next
+tagged release.
+
+`v0.1.2` is the currently live-verified target. Newer OpenShell releases will be
+added to this matrix after release; no speculative compatibility claim is made.
 
 ## Current-main audit (future-only)
 
