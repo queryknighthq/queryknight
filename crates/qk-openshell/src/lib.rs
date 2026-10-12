@@ -3,11 +3,13 @@
 //! This crate evaluates SQL carried in HTTP/WebSocket payloads through
 //! `qk_db::authorize_guarded`. It does not execute SQL or bind an OpenShell
 //! verdict to a later external execution; the gateway/executor boundary is a
-//! documented trust limitation. Listeners are restricted to local transports.
+//! documented trust limitation. Network listeners require authenticated HTTPS;
+//! Unix sockets and loopback-only plaintext are explicit local modes.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod auth;
 mod extract;
 mod server;
 mod service;
@@ -33,11 +35,15 @@ pub mod openshell {
     }
 }
 
+pub use auth::{OpenShellAuthConfigError, OpenShellJwtConfig};
 /// Generated NVIDIA OpenShell peer metadata messages.
 pub use openshell::extension::v1 as extension_proto;
 /// Generated NVIDIA OpenShell supervisor middleware messages and clients.
 pub use openshell::middleware::v1 as proto;
-pub use server::{OpenShellServer, OpenShellServerError, OpenShellServerHandle};
+pub use server::{
+    OpenShellServer, OpenShellServerConfig, OpenShellServerDiagnostics, OpenShellServerError,
+    OpenShellServerHandle,
+};
 pub use service::{OpenShellService, OpenShellServiceConfig};
 
 /// Advertised and enforced OpenShell payload limit (1 MiB).

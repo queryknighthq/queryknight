@@ -151,3 +151,98 @@ fn peer_metadata_schema_is_present_and_compatible() {
         ]
     );
 }
+
+#[test]
+fn tagged_v0_1_2_descriptor_set_is_pinned() {
+    use sha2::{Digest, Sha256};
+
+    assert_eq!(
+        format!("{:x}", Sha256::digest(FILE_DESCRIPTOR_SET)),
+        "180fc997b62f8162432f0206232b935f86dcb557e5f42c7980ff9caad39877a3"
+    );
+
+    let set = descriptor();
+    let middleware = file(&set, "supervisor_middleware.proto");
+    let supervisor = middleware
+        .service
+        .iter()
+        .find(|service| service.name.as_deref() == Some("SupervisorMiddleware"))
+        .expect("SupervisorMiddleware service");
+    let method_shapes: Vec<_> = supervisor
+        .method
+        .iter()
+        .map(|method| {
+            (
+                method.name.as_deref().expect("method name"),
+                method.input_type.as_deref().expect("request type"),
+                method.output_type.as_deref().expect("response type"),
+                method.client_streaming.unwrap_or(false),
+                method.server_streaming.unwrap_or(false),
+            )
+        })
+        .collect();
+    assert_eq!(
+        method_shapes,
+        [
+            (
+                "Describe",
+                ".openshell.middleware.v1.MiddlewareDescribeRequest",
+                ".openshell.middleware.v1.MiddlewareManifest",
+                false,
+                false,
+            ),
+            (
+                "ValidateConfig",
+                ".openshell.middleware.v1.ValidateConfigRequest",
+                ".openshell.middleware.v1.ValidateConfigResponse",
+                false,
+                false,
+            ),
+            (
+                "EvaluateHttpRequest",
+                ".openshell.middleware.v1.HttpRequestEvaluation",
+                ".openshell.middleware.v1.HttpRequestResult",
+                false,
+                false,
+            ),
+            (
+                "EvaluateWebSocketSession",
+                ".openshell.middleware.v1.WebSocketSessionEvent",
+                ".openshell.middleware.v1.WebSocketSessionEventResult",
+                true,
+                true,
+            ),
+        ]
+    );
+    assert_eq!(
+        enum_values(enum_type(middleware, "SupervisorMiddlewareOperation")),
+        [
+            ("SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED", 0),
+            ("SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST", 1),
+            ("SUPERVISOR_MIDDLEWARE_OPERATION_WEBSOCKET_MESSAGE", 2),
+            ("SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE", 3),
+        ]
+    );
+    assert_eq!(
+        enum_values(enum_type(middleware, "SupervisorMiddlewarePhase")),
+        [
+            ("SUPERVISOR_MIDDLEWARE_PHASE_UNSPECIFIED", 0),
+            ("SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS", 1),
+            ("SUPERVISOR_MIDDLEWARE_PHASE_PRE_RETURN", 2),
+        ]
+    );
+    assert_eq!(
+        field_numbers(message(middleware, "MiddlewareDescribeRequest")),
+        [("gateway", 1)]
+    );
+    assert_eq!(
+        field_numbers(message(middleware, "RequestContext")),
+        [
+            ("request_id", 1),
+            ("sandbox_id", 2),
+            ("originating_process", 3),
+            ("sandbox", 4),
+            ("workspace", 5),
+        ]
+    );
+}

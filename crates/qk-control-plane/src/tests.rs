@@ -111,6 +111,8 @@ fn url_and_debug_fail_closed_without_exposing_token() {
     let client = ControlPlaneClient {
         addr: SocketAddr::from(([127, 0, 0, 1], 1)),
         token: qk_daemon::AuthToken::new("DAEMON_CONTROL_SECRET_12345".to_owned()),
+        request_deadline: None,
+        cancelled: None,
     };
     assert!(!format!("{client:?}").contains("DAEMON_CONTROL_SECRET_12345"));
     let provider = DaemonApprovalProvider::new(client, None, "connection".to_owned(), None);
@@ -393,6 +395,8 @@ fn fake_http_response(
         ControlPlaneClient {
             addr,
             token: qk_daemon::AuthToken::new("DAEMON_CONTROL_SECRET_12345".to_owned()),
+            request_deadline: None,
+            cancelled: None,
         },
         task,
     )
@@ -528,4 +532,62 @@ async fn waiting_provider_rechecks_daemon_and_verifies_exact_request() {
     let response = task.await.expect("provider task").unwrap();
     assert_eq!(response.decision, ProviderDecision::Approved);
     daemon.stop().await;
+}
+
+#[test]
+fn control_plane_socket_io_honors_absolute_deadline_and_cancellation() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    fn delayed_response(delay: Duration) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind delayed daemon");
+        let address = listener.local_addr().expect("delayed daemon address");
+        let task = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept delayed request");
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).expect("read request headers");
+            std::thread::sleep(delay);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]");
+        });
+        (address, task)
+    }
+
+    let (address, server) = delayed_response(Duration::from_millis(300));
+    let client = ControlPlaneClient {
+        addr: address,
+        token: qk_daemon::AuthToken::new("CONTROL_TOKEN_SENTINEL".to_owned()),
+        request_deadline: Some(Instant::now() + Duration::from_millis(50)),
+        cancelled: None,
+    };
+    let started = Instant::now();
+    assert_eq!(
+        client.get("/approvals").unwrap_err(),
+        ControlPlaneError::Timeout
+    );
+    assert!(started.elapsed() < Duration::from_millis(250));
+    server.join().expect("deadline server");
+
+    let (address, server) = delayed_response(Duration::from_millis(300));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_after = Arc::clone(&cancelled);
+    let cancellation_task = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        cancel_after.store(true, Ordering::Release);
+    });
+    let client = ControlPlaneClient {
+        addr: address,
+        token: qk_daemon::AuthToken::new("CONTROL_TOKEN_SENTINEL".to_owned()),
+        request_deadline: Some(Instant::now() + Duration::from_secs(5)),
+        cancelled: Some(cancelled),
+    };
+    let started = Instant::now();
+    assert_eq!(
+        client.get("/approvals").unwrap_err(),
+        ControlPlaneError::Timeout
+    );
+    assert!(started.elapsed() < Duration::from_millis(200));
+    cancellation_task.join().expect("cancellation task");
+    server.join().expect("cancellation server");
 }

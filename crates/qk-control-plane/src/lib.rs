@@ -9,6 +9,8 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use qk_approval::{
@@ -18,7 +20,7 @@ use qk_approval::{
 use qk_core::{ExactDigest, QueryShapeFingerprint};
 use serde::{Deserialize, Serialize};
 
-/// Per-operation connect/read/write bound preserved from the MCP client.
+/// Per-operation total connect/write/read bound preserved from the MCP client.
 pub const CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum HTTP response bytes read from the daemon (new extraction hardening).
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -350,6 +352,8 @@ struct DecideResponse {
 pub struct ControlPlaneClient {
     addr: SocketAddr,
     token: qk_daemon::AuthToken,
+    request_deadline: Option<Instant>,
+    cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl Debug for ControlPlaneClient {
@@ -357,6 +361,8 @@ impl Debug for ControlPlaneClient {
         f.debug_struct("ControlPlaneClient")
             .field("addr", &self.addr)
             .field("token", &"<redacted>")
+            .field("deadline_bounded", &self.request_deadline.is_some())
+            .field("cancellation_aware", &self.cancelled.is_some())
             .finish()
     }
 }
@@ -395,11 +401,34 @@ impl ControlPlaneClient {
         Ok(Self {
             addr: SocketAddr::from(([127, 0, 0, 1], port)),
             token,
+            request_deadline: None,
+            cancelled: None,
         })
     }
 
+    /// Apply one absolute request deadline and cancellation flag to every
+    /// daemon operation issued through this client clone. The default client
+    /// keeps the existing five-second operation timeout.
+    #[must_use]
+    pub fn with_request_budget(mut self, deadline: Instant, cancelled: Arc<AtomicBool>) -> Self {
+        self.request_deadline = Some(deadline);
+        self.cancelled = Some(cancelled);
+        self
+    }
+    fn check_budget(&self) -> Result<(), ControlPlaneError> {
+        check_request_budget(self.request_deadline, self.cancelled.as_deref())
+    }
+
     fn get(&self, path: &str) -> Result<(u16, Vec<u8>), ControlPlaneError> {
-        roundtrip(&self.addr, self.token.as_secret(), "GET", path, None)
+        roundtrip(
+            &self.addr,
+            self.token.as_secret(),
+            "GET",
+            path,
+            None,
+            self.request_deadline,
+            self.cancelled.as_deref(),
+        )
     }
 
     fn post<T: Serialize>(
@@ -414,6 +443,8 @@ impl ControlPlaneClient {
             "POST",
             path,
             Some(&body),
+            self.request_deadline,
+            self.cancelled.as_deref(),
         )
     }
 
@@ -422,11 +453,15 @@ impl ControlPlaneClient {
         path: &str,
         body: &T,
     ) -> Result<R, ControlPlaneError> {
+        self.check_budget()?;
         let (status, raw) = self.post(path, body)?;
         if !(200..300).contains(&status) {
             return Err(http_status_error(status));
         }
-        serde_json::from_slice(&raw).map_err(|_| ControlPlaneError::InvalidResponse)
+        let decoded =
+            serde_json::from_slice(&raw).map_err(|_| ControlPlaneError::InvalidResponse)?;
+        self.check_budget()?;
+        Ok(decoded)
     }
 
     /// Create a daemon session with the caller's trusted source identity.
@@ -692,14 +727,18 @@ fn roundtrip(
     method: &str,
     path: &str,
     body: Option<&[u8]>,
+    request_deadline: Option<Instant>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(u16, Vec<u8>), ControlPlaneError> {
-    let mut stream = TcpStream::connect_timeout(addr, CONTROL_PLANE_TIMEOUT).map_err(map_io)?;
-    stream
-        .set_read_timeout(Some(CONTROL_PLANE_TIMEOUT))
-        .map_err(map_io)?;
-    stream
-        .set_write_timeout(Some(CONTROL_PLANE_TIMEOUT))
-        .map_err(map_io)?;
+    let operation_deadline = Instant::now()
+        .checked_add(CONTROL_PLANE_TIMEOUT)
+        .ok_or(ControlPlaneError::Timeout)?;
+    let deadline =
+        request_deadline.map_or(operation_deadline, |limit| limit.min(operation_deadline));
+    let remaining = remaining_time(deadline, cancelled)?;
+    let connect_timeout = socket_timeout(remaining, cancelled);
+    let mut stream = TcpStream::connect_timeout(addr, connect_timeout).map_err(map_io)?;
+
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n"
     );
@@ -710,24 +749,89 @@ fn roundtrip(
         ));
     }
     request.push_str("\r\n");
-    stream.write_all(request.as_bytes()).map_err(map_io)?;
+    write_all_until(&mut stream, request.as_bytes(), deadline, cancelled)?;
     if let Some(body) = body {
-        stream.write_all(body).map_err(map_io)?;
+        write_all_until(&mut stream, body, deadline, cancelled)?;
     }
-    // Bound total read even when Content-Length is missing or the peer drips
-    // data indefinitely. A small extra allowance admits the response headers.
-    let read_limit = (MAX_RESPONSE_BYTES + MAX_HEADER_BYTES + 1) as u64;
+
+    let read_limit = MAX_RESPONSE_BYTES + MAX_HEADER_BYTES + 1;
     let mut raw = Vec::with_capacity(4096);
-    stream
-        .take(read_limit)
-        .read_to_end(&mut raw)
-        .map_err(map_io)?;
-    if raw.len() as u64 >= read_limit {
-        return Err(ControlPlaneError::ResponseTooLarge);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let remaining = remaining_time(deadline, cancelled)?;
+        stream
+            .set_read_timeout(Some(socket_timeout(remaining, cancelled)))
+            .map_err(map_io)?;
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                if raw.len().saturating_add(read) >= read_limit {
+                    return Err(ControlPlaneError::ResponseTooLarge);
+                }
+                raw.extend_from_slice(&chunk[..read]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(map_io(error)),
+        }
     }
+    check_request_budget(Some(deadline), cancelled)?;
     parse_response(&raw)
 }
 
+fn write_all_until(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), ControlPlaneError> {
+    while !bytes.is_empty() {
+        let remaining = remaining_time(deadline, cancelled)?;
+        stream
+            .set_write_timeout(Some(socket_timeout(remaining, cancelled)))
+            .map_err(map_io)?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(ControlPlaneError::Connection),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(map_io(error)),
+        }
+    }
+    Ok(())
+}
+
+fn remaining_time(
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Duration, ControlPlaneError> {
+    check_request_budget(Some(deadline), cancelled)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(ControlPlaneError::Timeout)
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn socket_timeout(remaining: Duration, cancelled: Option<&AtomicBool>) -> Duration {
+    if cancelled.is_some() {
+        remaining.min(Duration::from_millis(10))
+    } else {
+        remaining
+    }
+}
+
+fn check_request_budget(
+    deadline: Option<Instant>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), ControlPlaneError> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire))
+        || deadline.is_some_and(|limit| Instant::now() >= limit)
+    {
+        Err(ControlPlaneError::Timeout)
+    } else {
+        Ok(())
+    }
+}
 fn map_io(error: std::io::Error) -> ControlPlaneError {
     if error.kind() == std::io::ErrorKind::TimedOut
         || error.kind() == std::io::ErrorKind::WouldBlock
@@ -826,6 +930,13 @@ impl DaemonApprovalProvider {
     /// cached in process.
     pub fn with_exact_lookup_retry(mut self) -> Self {
         self.implicit_exact_retry = true;
+        self
+    }
+    /// Bound all daemon operations in this approval resolution to one absolute
+    /// deadline and caller cancellation flag.
+    #[must_use]
+    pub fn with_request_budget(mut self, deadline: Instant, cancelled: Arc<AtomicBool>) -> Self {
+        self.client = self.client.with_request_budget(deadline, cancelled);
         self
     }
 

@@ -17,6 +17,7 @@
 mod daemon_cmd;
 mod inspect;
 mod mcp_cmd;
+mod openshell_cmd;
 mod policy;
 mod proxy_cmd;
 
@@ -130,6 +131,12 @@ enum TopCommand {
         #[arg(long)]
         listen: Option<u16>,
     },
+    /// OpenShell supervisor middleware commands.
+    #[command(name = "openshell")]
+    OpenShell {
+        #[command(subcommand)]
+        action: openshell_cmd::OpenShellAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -231,6 +238,10 @@ fn run(cli: Cli) -> i32 {
         Some(TopCommand::Status { home, port }) => daemon_cmd::status(home, port),
         Some(TopCommand::Mcp { policy, home }) => mcp_cmd::run(policy, home),
         Some(TopCommand::Proxy { listen }) => proxy_cmd::run(listen),
+        Some(TopCommand::OpenShell { action }) => match action {
+            openshell_cmd::OpenShellAction::Serve(args) => openshell_cmd::serve(args),
+            openshell_cmd::OpenShellAction::Doctor(args) => openshell_cmd::doctor(args),
+        },
     }
 }
 

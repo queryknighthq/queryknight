@@ -16,6 +16,7 @@ qk-proxy-postgres = { path = "../qk-proxy-postgres" }
 qk-proxy-mysql = { path = "../qk-proxy-mysql" }
 qk-db = { path = "../qk-db" }
 qk-control-plane = { path = "../qk-control-plane" }
+qk-openshell = { path = "../qk-openshell" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

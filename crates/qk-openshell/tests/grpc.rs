@@ -156,26 +156,34 @@ async fn generated_client_describes_validates_and_evaluates_http_and_websocket()
     let manifest = client
         .describe(MiddlewareDescribeRequest {
             gateway: Some(extension_proto::PeerMetadata {
-                protocol_version: Some(extension_proto::ProtocolVersion { major: 1, minor: 2 }),
+                protocol_version: Some(extension_proto::ProtocolVersion { major: 1, minor: 0 }),
                 implementation_name: "openshell-test".to_owned(),
                 implementation_version: "test".to_owned(),
-                supported_capabilities: Vec::new(),
-                required_capabilities: Vec::new(),
+                supported_capabilities: vec!["openshell.supervisor-middleware.contract".to_owned()],
+                required_capabilities: vec!["openshell.supervisor-middleware.contract".to_owned()],
             }),
         })
         .await
         .expect("Describe")
         .into_inner();
     assert_eq!(manifest.bindings.len(), 2);
+    assert!(manifest.bindings.iter().all(|binding| {
+        binding
+            .request_timeout
+            .as_ref()
+            .is_some_and(|timeout| timeout.seconds == 0 && timeout.nanos == 400_000_000)
+    }));
     assert_eq!(manifest.expected_audience, "");
+    let extension = manifest.extension.expect("peer metadata");
+    let version = extension.protocol_version.expect("protocol version");
+    assert_eq!((version.major, version.minor), (1, 0));
     assert_eq!(
-        manifest
-            .extension
-            .expect("peer metadata")
-            .protocol_version
-            .unwrap()
-            .major,
-        1
+        extension.supported_capabilities,
+        ["openshell.supervisor-middleware.contract"]
+    );
+    assert_eq!(
+        extension.required_capabilities,
+        ["openshell.supervisor-middleware.contract"]
     );
 
     let policy = qk_core::DEMO_POLICY;
@@ -1066,7 +1074,7 @@ async fn approvals_are_daemon_backed_and_exact_v2_binds_json_parameters() {
     daemon.stop().await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unavailable_control_plane_denies_approval_required_sql() {
+async fn unavailable_control_plane_is_a_grpc_failure() {
     let mut daemon = TestDaemon::start().await;
     let control = daemon.client();
     daemon.stop().await;
@@ -1092,17 +1100,16 @@ async fn unavailable_control_plane_denies_approval_required_sql() {
         .into_inner();
     assert!(validation.valid, "{}", validation.reason);
 
-    let result = client
+    let status = client
         .evaluate_http_request(request(
             b"DELETE FROM users WHERE id = 42".to_vec(),
             input,
             "",
         ))
         .await
-        .expect("approval transport failure is a verdict")
-        .into_inner();
-    assert_eq!(result.decision, Decision::Deny as i32);
-    assert_eq!(result.reason_code, "queryknight_approval_error");
+        .expect_err("approval transport failure is a middleware error");
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert_eq!(status.message(), "OpenShell approval resolution failed");
     let events = sink.events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].decision, AuditDecision::Deny);
@@ -1273,4 +1280,94 @@ async fn session_approval_is_scoped_and_audited_as_authorization_only() {
 
     server.stop().await.expect("graceful server shutdown");
     daemon.stop().await;
+}
+
+#[tokio::test]
+async fn describe_uses_v1_major_capability_negotiation() {
+    let db = DbConfig::from_url("postgresql://user:secret@127.0.0.1/app").expect("db config");
+    let service = OpenShellService::new(OpenShellServiceConfig::new(db));
+    let (mut client, server) = openshell_client(service).await;
+    let contract = "openshell.supervisor-middleware.contract".to_owned();
+
+    let mut compatible = extension_proto::PeerMetadata {
+        protocol_version: Some(extension_proto::ProtocolVersion {
+            major: 1,
+            minor: 99,
+        }),
+        implementation_name: "openshell/gateway".to_owned(),
+        implementation_version: "test".to_owned(),
+        supported_capabilities: vec![contract.clone(), "openshell.middleware.future".to_owned()],
+        required_capabilities: vec![contract.clone()],
+    };
+    let manifest = client
+        .describe(MiddlewareDescribeRequest {
+            gateway: Some(compatible.clone()),
+        })
+        .await
+        .expect("compatible minor and unknown optional capability")
+        .into_inner();
+    assert_eq!(
+        manifest.extension.unwrap().protocol_version.unwrap().minor,
+        0
+    );
+
+    compatible.protocol_version = Some(extension_proto::ProtocolVersion { major: 2, minor: 0 });
+    assert_eq!(
+        client
+            .describe(MiddlewareDescribeRequest {
+                gateway: Some(compatible.clone()),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+
+    compatible.protocol_version = None;
+    assert_eq!(
+        client
+            .describe(MiddlewareDescribeRequest {
+                gateway: Some(compatible.clone()),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+
+    compatible.protocol_version = Some(extension_proto::ProtocolVersion { major: 1, minor: 0 });
+    compatible.supported_capabilities.clear();
+    assert_eq!(
+        client
+            .describe(MiddlewareDescribeRequest {
+                gateway: Some(compatible.clone()),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+
+    compatible.supported_capabilities.push(contract);
+    compatible.required_capabilities = vec!["openshell.middleware.future.required".to_owned()];
+    assert_eq!(
+        client
+            .describe(MiddlewareDescribeRequest {
+                gateway: Some(compatible),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+
+    assert_eq!(
+        client
+            .describe(MiddlewareDescribeRequest { gateway: None })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    server.stop().await.expect("graceful server shutdown");
 }

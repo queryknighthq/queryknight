@@ -391,3 +391,98 @@ fn policy_test_no_policy() {
         .code(2)
         .stderr(predicate::str::contains("usage: queryknight policy test"));
 }
+
+#[test]
+fn openshell_help_exposes_secure_serve_and_doctor_commands() {
+    binary()
+        .args(["openshell", "--help"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("serve"))
+        .stdout(predicate::str::contains("doctor"));
+    binary()
+        .args(["openshell", "serve", "--help"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("--tls-cert"))
+        .stdout(predicate::str::contains("--tls-key"))
+        .stdout(predicate::str::contains("--gateway-id"))
+        .stdout(predicate::str::contains("--audience"))
+        .stdout(predicate::str::contains("--jwks-file"))
+        .stdout(predicate::str::contains("--insecure-local"));
+}
+
+#[test]
+fn openshell_serve_requires_authenticated_configuration_by_default() {
+    let home = std::env::temp_dir().join(format!("qk-openshell-cli-{}", unique()));
+    binary()
+        .args([
+            "openshell",
+            "serve",
+            "--listen",
+            "127.0.0.1:0",
+            "--home",
+            &home.display().to_string(),
+        ])
+        .env_remove("DATABASE_URL")
+        .env_remove("MYSQL_URL")
+        .env_remove("QUERYKNIGHT_DAEMON_URL")
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "authenticated OpenShell mode requires --tls-cert",
+        ));
+}
+
+#[test]
+fn openshell_doctor_is_local_and_does_not_echo_database_credentials() {
+    let home = std::env::temp_dir().join(format!("qk-openshell-doctor-{}", unique()));
+    let output = binary()
+        .args([
+            "openshell",
+            "doctor",
+            "--insecure-local",
+            "--home",
+            &home.display().to_string(),
+        ])
+        .env_remove("MYSQL_URL")
+        .env_remove("QUERYKNIGHT_DAEMON_URL")
+        .env(
+            "DATABASE_URL",
+            "postgresql://user:DB_URL_SECRET_SENTINEL@127.0.0.1/not-used",
+        )
+        .output()
+        .expect("run OpenShell doctor");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("doctor stdout");
+    let stderr = String::from_utf8(output.stderr).expect("doctor stderr");
+    assert!(stdout.contains("OpenShell protocol"));
+    assert!(stdout.contains("OpenShellInsecureLocal"));
+    assert!(stdout.contains("Ready for local development only"));
+    assert!(stdout.contains("not checked (OpenShell ValidateConfig is authoritative)"));
+    assert!(format!("{stdout}{stderr}").contains("DEVELOPMENT / TRUSTED TRANSPORT ONLY"));
+    assert!(!format!("{stdout}{stderr}").contains("DB_URL_SECRET_SENTINEL"));
+}
+
+#[test]
+fn openshell_insecure_development_mode_rejects_non_loopback() {
+    let home = std::env::temp_dir().join(format!("qk-openshell-nonloopback-{}", unique()));
+    binary()
+        .args([
+            "openshell",
+            "doctor",
+            "--insecure-local",
+            "--listen",
+            "0.0.0.0:50051",
+            "--home",
+            &home.display().to_string(),
+        ])
+        .env("DATABASE_URL", "postgresql://user:pass@127.0.0.1/not-used")
+        .env_remove("MYSQL_URL")
+        .env_remove("QUERYKNIGHT_DAEMON_URL")
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "OpenShellInsecureLocal requires a loopback",
+        ));
+}
