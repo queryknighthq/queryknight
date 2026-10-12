@@ -121,6 +121,23 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// The historical TypeScript implementation, when it is checked out.
+///
+/// The differential comparison is an owner/developer check: it needs the
+/// separately maintained reference implementation, which is not part of this
+/// repository. It is skipped, not failed, when that checkout is unavailable, so
+/// `cargo test` works from a standalone public checkout.
+fn typescript_reference_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("QUERYKNIGHT_TS_DIR")
+        .map_or_else(|| workspace_root().join("../queryknight-ts"), PathBuf::from);
+    dir.join("packages")
+        .join("core")
+        .join("src")
+        .join("index.ts")
+        .is_file()
+        .then(|| dir)
+}
+
 fn read_json(file: &str) -> Vec<serde_json::Value> {
     let text =
         fs::read_to_string(compat_dir().join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"));
@@ -320,6 +337,15 @@ fn evaluator_parity_with_frozen_fixtures() {
 
 #[test]
 fn differential_against_typescript_oracle() {
+    // Owner/developer check: needs the separately maintained reference
+    // implementation, which is not part of this repository.
+    let Some(reference) = typescript_reference_dir() else {
+        println!(
+            "queryknight-ts checkout unavailable; differential skipped \
+             (set QUERYKNIGHT_TS_DIR to run it; the parity test still guards the fixtures)"
+        );
+        return;
+    };
     if Command::new("bun").arg("--version").output().is_err() {
         println!("bun unavailable; differential skipped (parity test still guards fixtures)");
         return;
@@ -328,6 +354,7 @@ fn differential_against_typescript_oracle() {
         .arg("tools/reference-runner/run.ts")
         .arg("--dump")
         .current_dir(workspace_root())
+        .env("QUERYKNIGHT_TS_DIR", &reference)
         .output()
         .expect("run reference dump");
     assert!(output.status.success(), "reference dump failed");

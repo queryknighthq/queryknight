@@ -2,6 +2,13 @@
 
 Executes `tests/compatibility/*.cases.json` against `../queryknight-ts` without modifying it (Bun imports core directly).
 
+**Optional and developer-only.** The reference implementation is a separately
+maintained checkout and is not part of this repository, so `cargo build`,
+`cargo test`, and public CI never need it. Set `QUERYKNIGHT_TS_DIR` to point at
+a checkout elsewhere. `cargo test -p qk-compat` skips its differential
+comparison with a printed reason when the checkout is unavailable; the parity
+test against the committed fixtures always runs.
+
 ```sh
 bun tools/reference-runner/run.ts
 bun tools/reference-runner/run.ts --file unbounded --json

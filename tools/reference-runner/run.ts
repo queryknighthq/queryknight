@@ -14,7 +14,9 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..', '..');
-const REF = join(ROOT, '..', 'queryknight-ts');
+// The reference implementation is a separately maintained checkout, not part of
+// this repository. Override its location with QUERYKNIGHT_TS_DIR.
+const REF = process.env.QUERYKNIGHT_TS_DIR ?? join(ROOT, '..', 'queryknight-ts');
 const COMPAT = join(ROOT, 'tests', 'compatibility');
 
 const core = await import(join(REF, 'packages', 'core', 'src', 'index.ts'));
