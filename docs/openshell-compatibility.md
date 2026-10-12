@@ -25,6 +25,7 @@ OpenShell product releases and the extension protocol version are separate. This
 | Deny enforcement | LIVE VERIFIED |
 | Exact approval retry | LIVE VERIFIED |
 | changed-request rejection | LIVE VERIFIED |
+| PostgreSQL network gating | LIVE VERIFIED |
 | WebSocket | generated-client verified; not live sandbox verified |
 
 Evidence from the passing run:
@@ -48,6 +49,44 @@ Evidence from the passing run:
 The custom workload image exists only to give the sandbox a `curl` binary; the
 upstream sandbox runtime image is distroless. It is not a QueryKnight product
 image and not required for real deployments.
+
+## PostgreSQL network-gated deployment (v0.1.2) — LIVE VERIFIED
+
+`scripts/test-openshell-postgres-v0.1.2.sh` composes the OpenShell sandbox with
+the QueryKnight PostgreSQL wire proxy and PostgreSQL 17, and exits `0`.
+
+This is a **different integration mechanism** from the HTTP middleware above,
+and the two must not be conflated:
+
+| | HTTP middleware | Native PostgreSQL |
+|---|---|---|
+| OpenShell role | Runs QueryKnight as an in-sandbox middleware for admitted egress; `Describe`/`ValidateConfig`/`EvaluateHttpRequest` over HTTPS + JWT | Enforces the network destination only. No middleware is registered and OpenShell never sees SQL |
+| QueryKnight role | Returns an authorization decision to the supervisor | Terminates the PostgreSQL wire protocol, authorizes the statement, and forwards on the same backend session |
+| Where SQL is inspected | Supervisor → middleware RPC | Inside the proxy, not OpenShell |
+| Credential/approval binding | Supervisor-issued token bound to the signed sandbox id | QueryKnight proxy session scope; ExactV2 over SQL plus bound wire parameters |
+
+Verified in the passing run:
+
+- OpenShell denied the sandbox's direct connection to the PostgreSQL backend
+  port: `NET:OPEN [MED] DENIED /usr/lib/postgresql/15/bin/psql(0) ->
+  198.18.0.2:<backend port> [reason:transparent_tcp_mapping_denied]`, while the
+  same address, port, and credentials were proven reachable from a plain
+  container context;
+- the same `psql` binary reached the QueryKnight proxy, which OpenShell admitted
+  with `NET:OPEN [INFO] ALLOWED … -> host.docker.internal:<proxy port>
+  [policy:queryknight-postgres engine:opa]`;
+- the QueryKnight → PostgreSQL hop was TLS: the proxied session reported
+  `pg_stat_ssl.ssl = t` with `TLSv1.3`;
+- an untrusted CA made the same sandbox path fail closed at the proxy with no
+  SQL executed;
+- `SELECT` allowed, unbounded `DELETE` denied with SQLSTATE `42501`, bound
+  `DELETE` pending as `exact_v2`, exact retry executed once, and a changed bound
+  value did not reuse the `once` grant.
+
+OpenShell's policy here is a `network_policies` rule for
+`host.docker.internal:<proxy port>` with `protocol: tcp` and the kernel-resolved
+`psql`/`python3` binary paths; the PostgreSQL backend port is deliberately absent,
+and OpenShell denies any connection that no rule allows.
 
 ## Contract implemented
 
