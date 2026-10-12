@@ -1,0 +1,60 @@
+# Public repository quality gates.
+#
+# Fast and deterministic only: this workflow must not require Docker, a live
+# database, or the multi-minute OpenShell build. Those are validated locally
+# and documented in CONTRIBUTING.md, because the live suites are currently
+# verified on macOS/Apple Silicon and this workflow runs Linux x86_64.
+#
+# Least privilege: read-only, no secrets, no pull_request_target.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same version as rust-toolchain.toml; components are needed for the
+      # rustfmt and clippy steps below.
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      # --all-features is required: workspace feature unification differs from a
+      # single-crate build, which is how the rustls CryptoProvider conflict
+      # escaped a narrower run.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Build (all features)
+        run: cargo build --workspace --all-features --locked
+
+      # Regression gate for the rustls provider conflict: exactly one provider
+      # (ring) may be active, checked against the all-features graph.
+      - name: rustls provider
+        run: scripts/check-rustls-provider.sh

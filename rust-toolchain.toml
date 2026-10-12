@@ -1,0 +1,5 @@
+[toolchain]
+# The version this workspace is developed and validated against. CI installs
+# the same one. Bump deliberately, together with a full local gate run.
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

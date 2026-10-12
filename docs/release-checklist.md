@@ -1,8 +1,8 @@
 # Release checklist
 
 This is a future release gate, not a claim that packaging or CI already exists.
-The current workspace has no Rust CI workflow, Docker image, or published release
-artifacts. Run the checklist against the exact release commit and record the
+The source repository now has a CI workflow (`.github/workflows/ci.yml`). It
+still has no Docker image and no published release artifacts. Run the checklist against the exact release commit and record the
 commands, environment, and results.
 
 ## Source and security gates
@@ -112,8 +112,11 @@ tunnels.
 
 - [ ] Add and pass a CI matrix for supported operating systems/toolchains and
       workspace quality gates before publishing.
-- [ ] Synchronize versions across workspace manifests, `Cargo.lock`, CLI,
-      daemon health, MCP server info, and the embedded UI package/assets.
+- [ ] Confirm every product version surface still reports the single
+      `[workspace.package] version`: CLI `--version`, daemon `/health`, MCP
+      `serverInfo`, and the OpenShell `Describe` implementation metadata. (These
+      are asserted by existing tests; protocol and format versions are separate
+      and must not move with it.)
 - [ ] Build release-profile artifacts for each supported target and verify a
       clean install from those artifacts, not just a developer checkout.
 - [ ] Verify embedded UI freshness by rebuilding and byte-comparing the bundle
