@@ -40,8 +40,10 @@ Environment:
   OPENSHELL_QUERYKNIGHT_HOST   Non-loopback IP reachable from the sandbox.
   OPENSHELL_COMPUTE_DRIVER     docker (default) or podman.
   OPENSHELL_V012_SOURCE        Optional existing OpenShell checkout (commit is verified).
-  OPENSHELL_PERSISTENT_TARGET  Optional cargo target dir for OpenShell gateway+CLI
-                               (defaults to \$HOME/.cache/qk-openshell-build/openshell-target).
+  OPENSHELL_PERSISTENT_TARGET  Optional cargo target dir for OpenShell gateway+CLI,
+                               reused between runs. Unset by default: artifacts
+                               stay in this run's temporary directory and are
+                               removed on exit.
 EOF
 }
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -176,7 +178,10 @@ phase 2 "Build OpenShell v0.1.2 gateway + CLI from pinned source"
 # bollard's "hyper legacy client" inside a Linux container cannot speak to;
 # running the gateway as a local macOS process connects to the real Docker
 # daemon via the host's standard unix socket.
-OPENSHELL_PERSISTENT_TARGET="${OPENSHELL_PERSISTENT_TARGET:-$HOME/.cache/qk-openshell-build/openshell-target}"
+# Opt-in only: set OPENSHELL_PERSISTENT_TARGET to reuse a build directory
+# between runs. The default keeps artifacts in this run's temporary directory
+# so no multi-GB persistent target cache is left behind.
+OPENSHELL_PERSISTENT_TARGET="${OPENSHELL_PERSISTENT_TARGET:-$SMOKE_TMP/openshell-target}"
 mkdir -p "$OPENSHELL_PERSISTENT_TARGET"
 OPEN_TARGET="$OPENSHELL_PERSISTENT_TARGET"
 
