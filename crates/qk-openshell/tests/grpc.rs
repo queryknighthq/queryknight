@@ -1301,6 +1301,10 @@ async fn describe_uses_v1_major_capability_negotiation() {
         .expect("compatible minor and unknown optional capability")
         .into_inner();
     assert_eq!(
+        manifest.service_version, "0.1.0",
+        "Describe must report the product version"
+    );
+    assert_eq!(
         manifest.extension.unwrap().protocol_version.unwrap().minor,
         0
     );
