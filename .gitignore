@@ -1,1 +1,33 @@
+# Rust build output
 /target
+
+# Machine and IDE files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local runtime state. The daemon home lives outside the repository by default;
+# these patterns catch ad-hoc runs pointed at the checkout, and must never ship
+# a session token, PID file, approval store, or daemon log.
+session.token
+daemon.pid
+*.pid
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# Locally generated PKI and scratch material. No certificate or key is tracked.
+*.pem
+*.key
+*.crt
+*.csr
+*.srl
+/tmp-pki/
+
+# Frontend toolchain, if a UI source checkout is placed beside the bundle
+node_modules/
