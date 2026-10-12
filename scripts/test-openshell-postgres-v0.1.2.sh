@@ -45,6 +45,9 @@
 #                               Unset by default: artifacts stay in this run's
 #                               temporary directory and are removed on exit.
 #   QK_PG_IMAGE                 PostgreSQL image (default postgres:17).
+#   QK_DEMO                     1 for a compact phase-by-phase walkthrough with
+#                               the same assertions and the same log files.
+#                               Unset for full diagnostics.
 
 set -euo pipefail
 
@@ -56,7 +59,7 @@ PG_IMAGE="${QK_PG_IMAGE:-postgres:17}"
 WORKLOAD_IMAGE="queryknight-openshell-e2e:${TAG}"
 
 usage() {
-  sed -n '2,47p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,51p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -66,7 +69,21 @@ fi
 [[ $# -eq 0 ]] || { usage >&2; exit 2; }
 
 PHASE_TOTAL=14
-phase() { printf '\n[%d/%d] %s\n' "$1" "$PHASE_TOTAL" "$2"; }
+PHASE_INDEX=""
+CURRENT_PHASE=""
+phase() {
+  PHASE_INDEX="$1"
+  CURRENT_PHASE="$2"
+  printf '\n[%d/%d] %s\n' "$1" "$PHASE_TOTAL" "$2"
+}
+
+# Presentation mode for a public walkthrough or screen recording. It changes
+# verbosity only: every assertion still runs, and every diagnostic still lands
+# in the run's log directory. `detail` lines are the verbose diagnostics;
+# `result` lines are the one-line conclusion of each phase.
+DEMO="${QK_DEMO:-0}"
+detail() { [[ "$DEMO" == "1" ]] || printf '%s\n' "$*"; }
+result() { printf '  %s\n' "$*"; }
 
 for command in cargo git jq openssl curl python3 nc "$DRIVER"; do
   command -v "$command" >/dev/null 2>&1 || {
@@ -125,18 +142,26 @@ cleanup() {
     rm -rf "$SMOKE_TMP"
   else
     echo "OpenShell + PostgreSQL E2E failed; logs retained at $LOG_DIR" >&2
-    for file in "$LOG_DIR"/*; do
-      [[ -f "$file" ]] || continue
-      printf '\n--- %s ---\n' "$file" >&2
-      tail -40 "$file" >&2
-    done
+    if grep -rF "$PG_PASSWORD" "$LOG_DIR" >/dev/null 2>&1; then
+      echo "refusing to dump logs: the test credential sentinel appears in them" >&2
+    elif [[ "$DEMO" == "1" ]]; then
+      echo "(QK_DEMO=1 suppresses the log dump; read the files under $LOG_DIR)" >&2
+    else
+      for file in "$LOG_DIR"/*; do
+        [[ -f "$file" ]] || continue
+        printf '\n--- %s ---\n' "$file" >&2
+        tail -40 "$file" >&2
+      done
+    fi
   fi
   exit "$status"
 }
 trap cleanup EXIT
 
 fail() {
-  echo "ASSERTION FAILED: $*" >&2
+  printf '\nE2E FAILED at phase [%s/%s] %s\n' "$PHASE_INDEX" "$PHASE_TOTAL" "$CURRENT_PHASE" >&2
+  printf '  assertion: %s\n' "$*" >&2
+  printf '  logs:      %s\n' "$LOG_DIR" >&2
   exit 1
 }
 
@@ -234,7 +259,8 @@ OPEN_GATEWAY="$OPEN_TARGET/debug/openshell-gateway"
 CLI_BIN="$OPEN_TARGET/debug/openshell"
 OPEN_VERSION="$("$CLI_BIN" --version 2>/dev/null || true)"
 [[ -n "$OPEN_VERSION" ]] || { echo "OpenShell CLI produced no version output" >&2; exit 1; }
-printf 'OpenShell %s commit=%s\n' "$OPEN_VERSION" "$ACTUAL_COMMIT"
+detail "OpenShell $OPEN_VERSION commit=$ACTUAL_COMMIT"
+result "OpenShell v0.1.2 pinned commit verified"
 
 "$DRIVER" build --platform "$SUPERVISOR_PLATFORM" \
   -t "$WORKLOAD_IMAGE" \
@@ -340,7 +366,8 @@ if ! "$DRIVER" run --rm -e PGPASSWORD="$PG_PASSWORD" "$PG_IMAGE" \
   fail "backend is not reachable from a container context; direct-denial proof would be meaningless"
 fi
 grep -qx 1 "$LOG_DIR/backend-reachability.log" || fail "backend reachability probe returned no result"
-printf 'PostgreSQL 17 ssl=on port=%s; backend reachable from container context\n' "$PG_PORT"
+detail "PostgreSQL 17 ssl=on port=$PG_PORT; backend reachable from a container context"
+result "PostgreSQL 17 (ssl=on) reachable from a container context with the test credentials"
 
 # ---------------------------------------------------------------------------
 phase 3 "QueryKnight daemon + proxy"
@@ -408,8 +435,8 @@ NEG_RELAY_PID="$(start_relay "$NEG_RELAY_PORT" "$NEG_PROXY_PORT" "$LOG_DIR/neg-r
 wait_port "$SERVICE_HOST" "$NEG_RELAY_PORT" "$NEG_RELAY_PID" "negative-case relay"
 NEG_PROXY_PID="$(start_proxy "$NEG_PROXY_PORT" "$PKI/unknown-ca.crt" "$LOG_DIR/queryknight-proxy-neg.log")"
 wait_port 127.0.0.1 "$NEG_PROXY_PORT" "$NEG_PROXY_PID" "negative-case QueryKnight proxy"
-printf 'QueryKnight proxies 127.0.0.1:%s (verified TLS) and 127.0.0.1:%s (untrusted CA)\n' \
-  "$PROXY_PORT" "$NEG_PROXY_PORT"
+detail "QueryKnight proxies 127.0.0.1:$PROXY_PORT (verified TLS) and 127.0.0.1:$NEG_PROXY_PORT (untrusted CA)"
+result "QueryKnight daemon, verified-TLS proxy, and untrusted-CA proxy are up"
 
 # ---------------------------------------------------------------------------
 phase 4 "OpenShell sandbox"
@@ -502,7 +529,8 @@ SANDBOX_CREATED=1
 SANDBOX_ID="$(grep -F "sandbox_name=$SANDBOX_NAME" "$LOG_DIR/gateway.log" | tail -1 \
   | sed -nE 's/.*sandbox_id=([0-9a-f-]+).*/\1/p')"
 [[ -n "$SANDBOX_ID" ]] || fail "could not extract sandbox id from the gateway log"
-printf 'Sandbox name=%s id=%s workload=%s\n' "$SANDBOX_NAME" "$SANDBOX_ID" "$WORKLOAD_IMAGE"
+detail "Sandbox name=$SANDBOX_NAME id=$SANDBOX_ID workload=$WORKLOAD_IMAGE"
+result "Sandbox created from the workload image with the egress policy"
 
 # Deliver the test password out of band: the .pgpass body is piped on stdin, so
 # the sentinel never appears in argv or in any captured command line.
@@ -567,7 +595,9 @@ DENY_LINE="$(grep -iE 'denied|not allowed' "$LOG_DIR/sandbox-supervisor.log" "$L
   tail -10 "$LOG_DIR/sandbox-log.txt" >&2 || true
   fail "no OpenShell denial record naming port $PG_PORT was found"
 }
-printf 'Direct sandbox -> PostgreSQL DENIED by OpenShell:\n  %s\n' "$DENY_LINE"
+detail "Direct sandbox -> PostgreSQL DENIED by OpenShell:"
+detail "  $DENY_LINE"
+result "sandbox -> PostgreSQL backend: DENIED by OpenShell network policy"
 
 # ---------------------------------------------------------------------------
 phase 6 "QueryKnight proxy access must succeed"
@@ -582,7 +612,7 @@ grep -qx 1 "$LOG_DIR/proxy-reach.log" || {
   cat "$LOG_DIR/proxy-reach.log" >&2
   fail "QueryKnight proxy reachability probe returned no result"
 }
-printf 'Sandbox -> QueryKnight proxy (%s:%s) allowed, psql returned 1\n' "$SERVICE_HOST" "$RELAY_PORT"
+result "sandbox -> QueryKnight proxy: ALLOWED, psql returned 1"
 
 # ---------------------------------------------------------------------------
 phase 7 "SELECT allowed"
@@ -602,9 +632,9 @@ sandbox_psql "$RELAY_PORT" 'SELECT ssl, version, cipher FROM pg_stat_ssl WHERE p
   fail "backend TLS probe through QueryKnight failed"
 }
 TLS_ROW="$(cat "$LOG_DIR/select-tls.log")"
-printf 'Backend TLS for the proxied session: %s\n' "$TLS_ROW"
+detail "Backend TLS for the proxied session: $TLS_ROW"
 [[ "$TLS_ROW" == t\|* ]] || fail "QueryKnight -> PostgreSQL hop is not TLS (pg_stat_ssl.ssl='${TLS_ROW%%|*}')"
-printf 'SELECT allowed; QueryKnight -> PostgreSQL transport is TLS\n'
+result "SELECT allowed; QueryKnight -> PostgreSQL transport is verified TLS"
 
 # ---------------------------------------------------------------------------
 phase 8 "DELETE denied"
@@ -619,8 +649,7 @@ grep -q '42501' "$LOG_DIR/deny.log" || {
 }
 [[ "$(pg_state 'SELECT count(*) FROM accounts')" == "2" ]] \
   || fail "denied DELETE changed backend state"
-printf 'DELETE FROM accounts blocked (SQLSTATE 42501); backend rows=%s\n' \
-  "$(pg_state 'SELECT count(*) FROM accounts')"
+result "unbounded DELETE denied (SQLSTATE 42501); backend rows unchanged ($(pg_state 'SELECT count(*) FROM accounts'))"
 
 # ---------------------------------------------------------------------------
 phase 9 "approval required"
@@ -672,8 +701,7 @@ APPROVAL_ID="$(printf '%s' "$APPROVALS" | jq -er '[.[] | select(.status == "wait
 APPROVAL_KIND="$(printf '%s' "$APPROVALS" | jq -er --arg id "$APPROVAL_ID" \
   '.[] | select(.id == $id) | .bindingKind')"
 [[ "$APPROVAL_KIND" == exact_v2 ]] || fail "approval is not ExactV2 (got '$APPROVAL_KIND')"
-printf 'Pending (ExactV2, bound id=42): id=%s kind=%s; backend row 42 intact\n' \
-  "$APPROVAL_ID" "$APPROVAL_KIND"
+result "bound DELETE pending as $APPROVAL_KIND; backend row 42 intact"
 
 # ---------------------------------------------------------------------------
 phase 10 "exact approval granted"
@@ -685,7 +713,8 @@ curl --config "$CONTROL_CURL_CONFIG" --fail --silent --show-error \
   >"$LOG_DIR/approval-decision.json"
 jq -e '.status == "approved" and .scope == "once"' "$LOG_DIR/approval-decision.json" >/dev/null \
   || fail "approval decision did not record approved/once"
-printf 'Approved %s with scope=once through the daemon control plane\n' "$APPROVAL_ID"
+detail "Approved $APPROVAL_ID with scope=once through the daemon control plane"
+result "approval granted through the daemon control plane with scope=once"
 
 # ---------------------------------------------------------------------------
 phase 11 "exact retry succeeds"
@@ -705,8 +734,7 @@ grep -q '^ATTEMPT2 DELETED 1$' "$FLOW_OUTPUT" || {
   || fail "approved retry did not delete exactly the approved row"
 [[ "$(pg_state 'SELECT count(*) FROM accounts')" == "1" ]] \
   || fail "approved retry did not execute exactly once"
-printf 'Exact retry executed once on the same connection; remaining rows=%s\n' \
-  "$(pg_state 'SELECT count(*) FROM accounts')"
+result "exact retry executed once on the same connection; remaining rows=$(pg_state 'SELECT count(*) FROM accounts')"
 
 # ---------------------------------------------------------------------------
 phase 12 "changed request blocked"
@@ -727,8 +755,7 @@ APPROVED_COUNT="$(printf '%s' "$CHANGED_APPROVALS" | jq -er '[.[] | select(.stat
 WAITING_COUNT="$(printf '%s' "$CHANGED_APPROVALS" | jq -er '[.[] | select(.status == "waiting")] | length')"
 [[ "$APPROVED_COUNT" == "1" ]] || fail "expected exactly one approved grant, got $APPROVED_COUNT"
 [[ "$WAITING_COUNT" -ge 1 ]] || fail "changed request did not raise a new pending approval"
-printf 'Changed bound value (id=43) blocked; approvals approved=%s waiting=%s\n' \
-  "$APPROVED_COUNT" "$WAITING_COUNT"
+result "changed bound value (id=43) blocked; the once grant did not apply"
 
 # ---------------------------------------------------------------------------
 phase 13 "backend TLS verification negative case"
@@ -743,7 +770,7 @@ grep -qE 'TLS handshake failed|TLS is misconfigured' "$LOG_DIR/neg.log" || {
 }
 [[ "$(pg_state 'SELECT count(*) FROM accounts')" == "1" ]] \
   || fail "negative TLS case changed backend state"
-printf 'Untrusted CA: sandbox reached QueryKnight, backend TLS failed closed, no SQL executed\n'
+result "untrusted backend CA: sandbox reached QueryKnight, TLS failed closed, no SQL executed"
 
 # ---------------------------------------------------------------------------
 phase 14 "audit and cleanup"
@@ -767,8 +794,7 @@ DENIED_COUNT="$(history_count 'DELETE FROM accounts')"
 [[ "$DELETE_COUNT" == "1" ]] \
   || fail "expected exactly one executed parameterized DELETE, got $DELETE_COUNT"
 [[ "$DENIED_COUNT" == "0" ]] || fail "denied unbounded DELETE reached the execution history"
-printf 'History: SELECT 1 x%s, parameterized DELETE x%s, denied DELETE x%s\n' \
-  "$SELECT_COUNT" "$DELETE_COUNT" "$DENIED_COUNT"
+result "history contains only executed statements (SELECT 1 x$SELECT_COUNT, parameterized DELETE x$DELETE_COUNT, denied DELETE x$DENIED_COUNT)"
 
 "${CLI[@]}" sandbox delete "$SANDBOX_NAME" >"$LOG_DIR/sandbox-delete.log" 2>&1 || true
 SANDBOX_CREATED=0
@@ -776,20 +802,32 @@ SANDBOX_CREATED=0
 if grep -rF "$PG_PASSWORD" "$LOG_DIR" "$SMOKE_TMP" >/dev/null 2>&1; then
   fail "the test database sentinel password leaked into captured logs or artifacts"
 fi
-printf 'No sentinel credential found in logs or artifacts\n'
+result "no credential sentinel in logs or artifacts"
 
 printf '\nOpenShell + QueryKnight + PostgreSQL E2E: PASS\n'
-printf '  openshell version     %s\n' "$OPEN_VERSION"
-printf '  openshell commit      %s\n' "$ACTUAL_COMMIT"
-printf '  supervisor digest     %s\n' "$SUPERVISOR_DIGEST"
-printf '  sandbox runtime       %s\n' "$SANDBOX_DIGEST"
-printf '  workload image        %s (%s)\n' "$WORKLOAD_IMAGE" "$WORKLOAD_IMAGE_ID"
-printf '  sandbox id            %s\n' "$SANDBOX_ID"
-printf '  postgres              %s (ssl=on) port=%s\n' "$PG_IMAGE" "$PG_PORT"
-printf '  backend hostname      localhost (SAN DNS:localhost)\n'
-printf '  queryknight proxy     %s:%s -> 127.0.0.1:%s (verified TLS)\n' \
-  "$SERVICE_HOST" "$RELAY_PORT" "$PROXY_PORT"
-printf '  sandbox direct target host.docker.internal:%s DENIED\n' "$PG_PORT"
-printf '  sandbox proxy target  host.docker.internal:%s ALLOWED\n' "$RELAY_PORT"
-printf '  backend TLS (proxied) %s\n' "$TLS_ROW"
-printf '  approvals             approved=%s waiting=%s\n' "$APPROVED_COUNT" "$WAITING_COUNT"
+printf '  \u2713 OpenShell denied direct PostgreSQL access\n'
+printf '  \u2713 QueryKnight proxy was reachable through the policy\n'
+printf '  \u2713 PostgreSQL backend TLS verified (%s)\n' "$TLS_ROW"
+printf '  \u2713 SELECT allowed and executed\n'
+printf '  \u2713 dangerous DELETE denied (SQLSTATE 42501), backend unchanged\n'
+printf '  \u2713 bound DELETE required an approval (exact_v2, scope=once)\n'
+printf '  \u2713 exact approval executed once\n'
+printf '  \u2713 changed request did not reuse the approval\n'
+printf '  \u2713 untrusted backend CA failed closed with no SQL executed\n'
+printf '  \u2713 no credential in logs or artifacts\n'
+
+detail ""
+detail "Run detail:"
+detail "  openshell version     $OPEN_VERSION"
+detail "  openshell commit      $ACTUAL_COMMIT"
+detail "  supervisor digest     $SUPERVISOR_DIGEST"
+detail "  sandbox runtime       $SANDBOX_DIGEST"
+detail "  workload image        $WORKLOAD_IMAGE ($WORKLOAD_IMAGE_ID)"
+detail "  sandbox id            $SANDBOX_ID"
+detail "  postgres              $PG_IMAGE (ssl=on) port=$PG_PORT"
+detail "  backend hostname      localhost (SAN DNS:localhost)"
+detail "  queryknight proxy     $SERVICE_HOST:$RELAY_PORT -> 127.0.0.1:$PROXY_PORT (verified TLS)"
+detail "  sandbox direct target host.docker.internal:$PG_PORT DENIED"
+detail "  sandbox proxy target  host.docker.internal:$RELAY_PORT ALLOWED"
+detail "  backend TLS (proxied) $TLS_ROW"
+detail "  approvals             approved=$APPROVED_COUNT waiting=$WAITING_COUNT"
