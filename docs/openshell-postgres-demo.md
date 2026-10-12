@@ -148,8 +148,8 @@ bindingKind: exact_v2      scope: once
 - **ExactV2 needs a parameterized client**: `psql` 15 cannot bind parameters and
   psycopg 2 interpolates client-side, so the demo uses psycopg 3.
 - **MySQL TLS is not implemented.**
-- **Public distribution is blocked** pending the repository license decision. Run
-  from source; do not promote binary installs.
+- **Source repository only.** QueryKnight is licensed under Apache-2.0, and no
+  binary, container, or package release has been published. Run from source.
 
 ## 8. How this complements OpenShell
 

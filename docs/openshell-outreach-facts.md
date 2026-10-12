@@ -17,8 +17,9 @@ database execution. It ships a policy engine, SQL analysis, approvals, direct
 database adapters, PostgreSQL and MySQL wire proxies, an MCP server, a daemon
 control plane, and an OpenShell integration.
 
-Status: early technical preview. Public distribution is blocked pending the
-repository license decision; run from source only.
+Status: early technical preview, licensed under Apache-2.0. The source
+repository is public-ready; no binary, container, or package release exists, so
+run from source only.
 
 ## Problem addressed
 

@@ -23,3 +23,4 @@ members = [
 # versions (policy schema, approval digest, OCSF, OpenShell extension) are
 # separate and deliberately not derived from this.
 version = "0.1.0"
+license = "Apache-2.0"
