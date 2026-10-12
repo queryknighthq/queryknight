@@ -57,7 +57,7 @@ Start with 3 crates (`qk-core` incl. `qk-sql`, `qk-compat`, `qk-cli inspect/poli
 | mcp/* | qk-mcp (8 tools + stdio server + daemon control-plane client) |
 | proxies/* | qk-proxy-mysql / qk-proxy-postgres |
 | adapters/* | qk-db (PostgreSQL/MySQL/SQLite adapters and guarded execution service) |
-| integrations/openshell/* | qk-openshell (authorization-only local gRPC adapter) |
+| integrations/openshell/* | qk-openshell (authenticated HTTPS middleware; explicit unauthenticated mode is local-only) |
 | cli/* | qk-cli (commands, exit codes 0/1/2/3, demoPolicy, redacted logs) |
 | apps/ui (Vue) | stays TypeScript (see below) |
 

@@ -2,9 +2,11 @@
 
 ## Scope and maturity
 
-The recommended first release is a **0.1.0 technical preview** for a **local /
-trusted-host** deployment. It is not production-ready, enterprise-ready,
-zero-trust-ready, a fully transparent proxy, or a drop-in secure gateway.
+The existing direct database and proxy paths remain a **local / trusted-host**
+technical preview. Separately, OpenShell v0.1.2 supervisor middleware is
+supported over authenticated HTTPS with strict OpenShell extension JWT checks.
+That integration does not add native PostgreSQL/MySQL TLS or make the database
+paths production-ready.
 
 The current workspace is not yet release-ready: Cargo package versions are split
 between `0.1.0` and `0.1.0-beta.0`; there is no Rust CI workflow, Dockerfile,
@@ -50,7 +52,7 @@ or succeeded.
 | PostgreSQL wire proxy | Plaintext PostgreSQL wire protocol on loopback only. SSL/GSS encryption requests receive `N` (up to two refusals, then close); no frontend TLS termination. | One raw TCP backend session per frontend; backend config must explicitly use `sslmode=disable`. Other TLS modes fail configuration; no fallback. | SQL remains visible to the proxy for authorization. COPY, FunctionCall, replication startup, and CancelRequest forwarding fail closed. |
 | MySQL wire proxy | Plaintext classic protocol on loopback only. `CLIENT_SSL` is filtered/rejected; compression/zstd and `CLIENT_LOCAL_FILES` are disabled. | One raw TCP backend session per frontend; TLS/socket/compression modes are rejected during proxy config validation. | Inspected COM_QUERY and supported prepared execution are authorized before forwarding. Unsupported commands are rejected rather than default-forwarded. |
 | MCP | stdio only; local process integration; no HTTP/SSE/network listener | Uses the configured qk-db adapter. A PostgreSQL URL must explicitly specify `sslmode=disable`; MySQL TLS requests fail during connection binding. | Tool arguments cannot choose the trusted dialect or connection. Protocol errors use the existing MCP error mapping. |
-| OpenShell | Unix socket (`0600`) or loopback TCP. TCP has no peer authentication and is for trusted local processes only. Non-loopback TCP is refused. | No database connection or SQL execution by QueryKnight. Native HTTPS/TLS/JWT listener support is absent. | Authorization-only gRPC middleware; the external gateway/executor owns execution and its transport. |
+| OpenShell | Authenticated HTTPS + OpenShell extension JWT for v0.1.2 network middleware. Explicit `OpenShellInsecureLocal` stays loopback-only; Unix sockets are owner-only local test/integration paths. | No database connection or SQL execution by QueryKnight. Native DB TLS is unchanged. | Authorization-only middleware; OpenShell's `on_error` policy controls transport failure behavior. |
 | Daemon/control plane | Loopback HTTP with a bearer token on protected routes; runtime token file is `session.token`. | No database protocol connection; it stores/resolves approvals and history. | Managed runtime binds loopback. The shared client rejects non-loopback daemon URLs and HTTPS. This is not a public remote API. |
 
 OpenShell `ValidateConfig` has a strict allowlist. Defaults for optional
@@ -128,14 +130,14 @@ Classification meanings:
 | PostgreSQL Extended Query | Parse/Bind are setup; every Execute is authorized against current portal SQL/parameters with a fresh permit. | Prepared identifiers cannot bypass per-Execute authorization. | V1 BLOCKER | Yes |
 | MySQL COM_QUERY | Strict complete payload analysis and one permit-gated backend write. | Unsupported/oversized SQL is not default-forwarded. | V1 BLOCKER | Yes |
 | MySQL prepared statements | Supported audited PREPARE/EXECUTE/SEND_LONG_DATA/RESET/CLOSE subset with ExactV2 and per-frontend state. | Prepared values and buffered long data cannot reach MySQL before a permit. | V1 BLOCKER | Yes |
-| OpenShell | Local authorization-only gRPC; permit is dropped, no DB call is made. | Allow is not evidence of downstream execution or success. | PRODUCTION-MATURITY BLOCKER | Yes, before any claim of end-to-end external execution security |
+| OpenShell | Authenticated HTTPS middleware for v0.1.2; local insecure mode is loopback-only. | Authorization Allow is not evidence of downstream execution or success. | PRODUCTION-MATURITY BLOCKER | Yes, before any claim of end-to-end external execution security |
 | Direct PostgreSQL native TLS | Not implemented. Only explicit `sslmode=disable` is accepted; omitted/prefer/require fail before network; parser-invalid modes remain errors. | No silent Prefer-to-plaintext downgrade; trusted plaintext is explicit. | PRODUCTION-MATURITY BLOCKER | Yes |
 | Direct MySQL native TLS | Not implemented. Parsed `SslOpts` fail with typed Unsupported before `Conn::new`; `require_ssl=false` is plaintext. Malformed/unknown URL options remain parser errors. | No TLS-to-plaintext downgrade. | PRODUCTION-MATURITY BLOCKER | Yes |
 | PostgreSQL proxy frontend TLS | SSL/GSS requests receive `N`; no termination. | Clients must use plaintext on the local proxy leg. | PRODUCTION-MATURITY BLOCKER | Before recommending remotely exposed proxy listeners |
 | PostgreSQL proxy backend TLS | Raw TCP backend; config requires explicit `sslmode=disable`. | Backend encryption must be supplied outside QueryKnight if required. | PRODUCTION-MATURITY BLOCKER | Yes |
 | MySQL proxy frontend TLS | `CLIENT_SSL` is filtered/rejected; no termination. | Frontend leg is plaintext and intended only for loopback. | PRODUCTION-MATURITY BLOCKER | Before recommending remotely exposed proxy listeners |
 | MySQL proxy backend TLS | Native TLS is unsupported; TLS-required URL options fail proxy config. | No silent backend downgrade. | PRODUCTION-MATURITY BLOCKER | Yes |
-| Remote OpenShell auth/TLS | Remote TCP, HTTPS, and JWT are unsupported; only Unix/loopback listeners exist. | Loopback TCP has no peer authentication and is not remotely safe. | PRODUCTION-MATURITY BLOCKER | Yes, if remote OpenShell becomes a product goal |
+| Remote OpenShell middleware | Authenticated HTTPS, strict EdDSA extension JWT, exact audience/issuer/caller/sandbox binding, local trusted JWKS, and fail-closed version negotiation are implemented for OpenShell v0.1.2. Unauthenticated remote, plaintext non-loopback, and unsupported mTLS remain rejected. | No token enters SQL/audit/control-plane state; the returned Allow is not proof of downstream execution. | Supported for v0.1.2; exact live-E2E evidence is recorded in the OpenShell compatibility matrix. | Yes, before any claim of end-to-end external execution security |
 | Daemon remote exposure | Managed runtime is loopback HTTP with bearer token; shared client rejects non-loopback/HTTPS. A low-level explicit `allow_remote` option is not a recommended public mode. | No encrypted remote control-plane contract exists. | PRODUCTION-MATURITY BLOCKER | Yes, if remote daemon use is claimed |
 | Legacy observe mode | Not present in Rust; legacy TypeScript Deny-to-Allow behavior is not shipped for security. | No compatibility bypass weakens permit enforcement. | V1 BLOCKER | Yes; keep it absent |
 | PostgreSQL COPY | Unsupported and not forwarded. | Streaming data never bypasses SQL authorization. | POST-V1 FEATURE | No, while explicitly excluded |
@@ -218,21 +220,23 @@ MySQL evidence was unavailable in this environment (`PG_URL`/`MYSQL_URL` were
 not configured).
 
 **Production-maturity blockers:** native encrypted backend DB transport for
-network deployments; authenticated encrypted remote OpenShell/daemon design if
-remote use is desired; durable audit/metrics operational integration; broader
-protocol/deployment validation; and MariaDB live validation before claiming
-MariaDB compatibility.
+network deployments; authenticated encrypted remote daemon/control-plane
+design if remote daemon use is desired; durable audit/metrics operational
+integration; broader protocol/deployment validation; and MariaDB live
+validation before claiming MariaDB compatibility. OpenShell remote middleware
+support is limited to the verified v0.1.2 extension contract and does not
+remove the separate database TLS blocker.
 
 **Post-v1 features:** the explicitly rejected COPY/replication/FunctionCall/
 CancelRequest, MySQL LOCAL INFILE/cursors/query attributes/compression, and other
 unmodeled protocol commands may remain excluded unless broader compatibility is
 claimed.
 
-**TLS is four separate projects:** (1) qk-db PostgreSQL backend TLS; (2) qk-db
-and/or MySQL proxy backend TLS; (3) optional PostgreSQL/MySQL proxy frontend TLS
-termination; (4) authenticated encrypted remote OpenShell transport. Recommended
-order: PostgreSQL backend, MySQL backend, remote OpenShell only if it becomes a
-product goal, then frontend termination according to deployment demand.
+**TLS remains three separate projects:** (1) qk-db PostgreSQL backend TLS;
+(2) qk-db and/or MySQL proxy backend TLS; (3) optional PostgreSQL/MySQL proxy
+frontend TLS termination. OpenShell's authenticated HTTPS transport is a
+separate middleware boundary already implemented; it does not provide native
+database TLS.
 
 **Next engineering phase: RELEASE PACKAGING NEXT.** For the explicitly local /
 trusted-host preview, transport limitations are documented and fail closed;

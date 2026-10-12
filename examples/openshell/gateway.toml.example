@@ -1,0 +1,19 @@
+[openshell]
+version = 2
+
+# OpenShell v0.1.2 extension JWT signer. Provision these three files from the
+# gateway operator's Ed25519 key bundle; never copy the private key to QueryKnight.
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/etc/openshell/jwt/signing.pem"
+public_key_path = "/etc/openshell/jwt/public.pem"
+kid_path = "/etc/openshell/jwt/kid"
+gateway_id = "queryknight-demo"
+ttl_secs = 900
+
+[[openshell.supervisor.middleware]]
+name = "queryknight"
+grpc_endpoint = "https://192.0.2.10:50051" # Replace with the shared QueryKnight host address.
+tls_ca_cert_path = "/etc/queryknight/tls/demo-ca.pem"
+audience = "urn:openshell:extension:middleware:queryknight"
+max_payload_bytes = 1048576
+timeout = "500ms"

@@ -1,0 +1,13 @@
+version: 1
+defaults:
+  decision: deny
+environments:
+  production:
+    databases:
+      main:
+        mutations:
+          deny_without_where: [delete]
+        approval_required:
+          - operations: [delete]
+        allow:
+          - operations: [select]

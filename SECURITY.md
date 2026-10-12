@@ -1,9 +1,11 @@
 # Security policy
 
-QueryKnight is a **0.x technical preview** intended for local or trusted-host
-deployments. Review [`docs/release-security.md`](docs/release-security.md) before
-using it; that document lists supported transports, fail-closed exclusions, and
-current deployment assumptions.
+QueryKnight's direct database/proxy and daemon surfaces are intended for local
+or trusted-host deployments. OpenShell v0.1.2 external supervisor middleware
+has a separate supported remote boundary: authenticated HTTPS with strict
+OpenShell extension JWT verification. Review
+[`docs/release-security.md`](docs/release-security.md) for supported transports,
+fail-closed exclusions, and deployment assumptions.
 
 ## What to report
 
@@ -25,8 +27,9 @@ reporting channel before inviting detailed vulnerability submissions.
 
 ## Deployment assumptions
 
-The current technical-preview profile is local/trusted-host. Native PostgreSQL
-and MySQL TLS, remotely authenticated OpenShell, and public proxy deployment
-are not provided. Do not expose unauthenticated loopback-oriented listeners as
-remote services or assume that an operator-managed tunnel is provisioned or
-validated by QueryKnight.
+Native PostgreSQL/MySQL TLS and public proxy deployment are not provided.
+OpenShell v0.1.2 external supervisor middleware is supported only over HTTPS
+with strict OpenShell extension JWT verification; non-loopback listeners
+require valid TLS and trusted gateway keys. Unauthenticated remote OpenShell,
+plaintext non-loopback, and mTLS are unsupported. Do not assume an
+operator-managed tunnel is provisioned or validated by QueryKnight.

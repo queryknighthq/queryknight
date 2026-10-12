@@ -1,8 +1,8 @@
 # OpenShell integration audit and Rust contract
 
-This document records the completed source audit and the Rust integration contract. The source of truth for the current QueryKnight adapter is `../queryknight-ts/packages/integrations/openshell/`; the OpenShell wire contract is vendored in `crates/qk-openshell/proto/supervisor_middleware.proto` (NVIDIA Apache-2.0). That file imports `extension.proto`, which was absent from the TypeScript vendor directory; the matching upstream schema is vendored unchanged at `crates/qk-openshell/proto/extension.proto`. Rust generation uses both complete schemas and does not reconstruct field numbers from this summary.
+This document records the historical TypeScript adapter audit and the current Rust integration contract. OpenShell v0.1.2 at commit `6648bd0c290efbc41ba131ee9831ee45cd431f94` is the protocol and runtime compatibility source of truth; its imported `extension.proto` and `supervisor_middleware.proto` are byte-for-byte retained under `crates/qk-openshell/proto/` with provenance and SHA-256 values in [`third_party/openshell/README.md`](../third_party/openshell/README.md). The sibling TypeScript adapter remains a historical source audit only; it is not the authenticated Rust server contract.
 
-The current TypeScript package uses `@grpc/grpc-js` and `@grpc/proto-loader` as peer dependencies. `service.ts` accepts a caller-supplied proto-loader/runtime; it does not load or vendor generated stubs. The adapter is authorization middleware for traffic executed by OpenShell or another upstream service. It does **not** open a database driver or execute SQL itself. A returned `Allow` is therefore a synchronous decision to a trusted external gateway, not a serializable QueryKnight `ExecutionPermit` and not a cryptographic guarantee that a later external executor will run identical bytes. The Rust port retains that trust boundary rather than claiming QK owns the external side effect.
+The historical TypeScript package uses `@grpc/grpc-js` and `@grpc/proto-loader` as peer dependencies. `service.ts` accepts a caller-supplied proto-loader/runtime; it does not load or vendor generated stubs. The adapter is authorization middleware for traffic executed by OpenShell or another upstream service. It does **not** open a database driver or execute SQL itself. A returned `Allow` is therefore a synchronous decision to a trusted external gateway, not a serializable QueryKnight `ExecutionPermit` and not a cryptographic guarantee that a later external executor will run identical bytes. The Rust port retains that trust boundary rather than claiming QK owns the external side effect.
 
 ## Fifty-point TypeScript audit
 
@@ -45,7 +45,7 @@ The current TypeScript package uses `@grpc/grpc-js` and `@grpc/proto-loader` as 
 | 35 | No authenticated agent ID is assigned. `RequestContext.originating_process` is ignored. | `baseContext`; `RequestContext` |
 | 36 | No tool identity is assigned by `baseContext`; extraction source labels are audit-only strings. | `baseContext`; extractor |
 | 37 | Environment and database policy identity come from service config, not the request’s destination host. | `baseContext`; `parseInspectorConfig` |
-| 38 | Caller identity/authentication is not verified by the TypeScript server: `serveGrpc` uses insecure credentials; peer metadata is ignored. The checked-in example uses a Unix socket. Rust restricts TCP to loopback and sets Unix socket permissions to `0600`; it does not verify JWTs or authenticate local gRPC peers. Unix sockets rely on filesystem permissions; loopback TCP is safe only in a trusted local process environment. Remote HTTPS/JWT service deployment is unsupported. | `serveGrpc`; TOML; Rust `OpenShellServer`; [OpenShell middleware auth contract](https://docs.nvidia.com/openshell/extensibility/supervisor-middleware) |
+| 38 | Caller identity/authentication is not verified by the historical TypeScript server: `serveGrpc` uses insecure credentials and ignores peer metadata. Its checked-in example uses a Unix socket. The Rust server now supports authenticated HTTPS/JWT network mode and keeps explicit local Unix/loopback development modes; see the Rust implementation below. | `serveGrpc`; `supervisor-middleware.toml`; `OpenShellServer`; `docs/openshell-compatibility.md` |
 | 39 | The OpenShell package does not record QueryKnight daemon query history or call `qk-control-plane`. | Imports and package dependencies |
 | 40 | `inspectCandidates` supplies `auditSink` to each core `evaluate`; the callback appends to `InspectionResult.audit`, and core `evaluate` swallows sink exceptions. The gRPC handler returns only decision/reason/findings, so this collected audit array is discarded and there is no configured sink. | `src/inspector.ts:143-150`; `packages/core/src/evaluate.ts:53-65`; `src/service.ts:240-258` |
 | 41 | Core exposes an `AuditEvent → OcsfEvent` converter, but OpenShell neither imports/calls it nor gives the in-memory audit array to an external sink. | `packages/core/src/ocsf.ts`; OpenShell imports and response mapping |
@@ -78,58 +78,71 @@ The current TypeScript package uses `@grpc/grpc-js` and `@grpc/proto-loader` as 
 
 | RPC | Type | Classification | Current TS status / Rust disposition |
 |---|---|---|---|
-| `SupervisorMiddleware.Describe` | Unary | Control-plane | Implement manifest and bindings. Complete peer metadata for the vendored extension contract; no caller-supplied identity. |
+| `SupervisorMiddleware.Describe` | Unary | Control-plane | Authenticated gateway caller; validate `MiddlewareDescribeRequest.gateway` protocol/capabilities and return v0.1.2 metadata, HTTP/WebSocket bindings, and exact configured audience. |
 | `SupervisorMiddleware.ValidateConfig` | Unary | Control-plane | Validate the gateway registration config; invalid config is reported through `valid=false`. |
 | `SupervisorMiddleware.EvaluateHttpRequest` | Unary | Authorization-only | Evaluate extracted SQL, return frozen allow/deny result; do not execute through a DB driver. |
-| `SupervisorMiddleware.EvaluateWebSocketSession` | Bidirectional stream | Authorization-only | Declared but missing from TS `buildGrpcImplementation`; Rust processes preflight, one session start and strictly increasing text messages. Binary payloads fail closed; stream IDs are not trusted sandbox identities. |
-| `HttpResponsePreReturn.Evaluate` | Bidirectional stream | Pass-through / not registered | Proto-only, not advertised by Describe or bound by the TS service. Deliberately not exposed: response denial cannot undo a completed DB operation. |
+| `SupervisorMiddleware.EvaluateWebSocketSession` | Bidirectional stream | Authorization-only | Declared but missing from TS `buildGrpcImplementation`; Rust binds one authenticated supervisor token to the stream, binds the sandbox on preflight, accepts strictly increasing sequence numbers with gaps, inspects text only, and denies binary messages. |
+| `HttpResponsePreReturn.Evaluate` | Bidirectional stream | Pass-through / not registered | Defined by the tagged proto but not implemented, advertised, or bound by QueryKnight Rust. Response denial cannot undo a completed database operation. |
 
 For every SQL candidate Rust calls `authorize_guarded`, observes the typed outcome, then drops any permitted process-local capability before returning a decision. `authorized_external` means QueryKnight authorized a request; it does not mean the external executor ran or succeeded. This is **not** a QueryKnight-owned execution guarantee.
 
 ## Rust implementation
 
-- `qk-openshell` generates Tonic/Prost types from both vendored NVIDIA schemas. `Describe` accepts protocol major version 1, emits peer metadata version 1.2 and advertises HTTP request plus WebSocket message bindings at `PRE_CREDENTIALS`, each capped at 1 MiB. `expected_audience` remains empty: the service does not verify JWTs.
-- `OpenShellServiceConfig::new(DbConfig)` receives a trusted connection URL only to select dialect and derive the password-redacted approval connection key. It never opens a DB connection. Validated registration config supplies policy database/environment; its dialect must match the trusted `DbConfig`.
-- `ValidateConfig` strictly accepts `policy_yaml`, `dialect`, `database`,
-  `environment`, `approval_action`, and `maxSqlBytes`; malformed values,
-  unknown fields and `allow_with_findings` are rejected. Rust defaults for
-  optional fields apply only when absent: explicitly supplied null or
-  wrong-typed values do not select a fallback. Validation completes before
-  the bounded registry is updated, so invalid replacement leaves the prior
-  validated config intact. A bounded in-process registry requires each
-  evaluation config to match the exact validated registration.
-  Wrong-typed known fields receive a bounded field/type reason without echoing
-  the supplied config. This intentionally hardens TypeScript's non-string
-  `database`/`dialect` fallback; Rust does not reproduce that fallback.
-- `OpenShellServer` binds only a Unix socket or loopback TCP. Unix sockets are owner-only (`0600`) and require an existing trusted parent directory. Loopback TCP has no peer authentication and is suitable only when local processes are trusted. The returned handle supports graceful shutdown. Non-loopback TCP is refused; remote HTTPS/JWT deployments remain unsupported until their gateway audience and verification keys are configured.
-- Every recognized SQL candidate uses `authorize_guarded` and `DaemonApprovalProvider::with_exact_lookup_retry` when a daemon client is supplied. The connection key is password-redacted. `RequestContext.sandbox_id` is the only session identity; missing IDs remain absent, and the separate WebSocket stream ID, process fields, headers and target are not trusted policy identity. Without a daemon client, approval-required requests fail closed.
-- The body extractor accepts the audited JSON/raw-SQL shapes, strictly requires UTF-8 for HTTP bodies, preserves adjacent JSON `params` arrays as ordered `ExecutionParam`s (ExactV2), rejects unsupported parameter encodings, and uses the shared `qk-sql` AST to reject placeholders without explicit values. Candidate/body limits fail closed instead of truncating an authorized prefix. No parameter interpolation occurs; non-SQL/unrecognized traffic remains pass-through as in TypeScript.
-- Deny results use bounded `queryknight_*` reason codes and an empty free-form reason; successful results contain no reason code, body/header mutations, serialized permit, or approval ID. A pending approval is represented as DENY because the proto has no pending response field; exact daemon retry re-evaluates the current request.
-- WebSocket is implemented for ordered text messages: preflight is required, session start precedes messages, sequence numbers must strictly increase, and each text message is evaluated independently. Binary messages fail closed; no replacement is returned. The proto-only HTTP response service remains unregistered.
-- The TypeScript gRPC handler drops its in-memory audit array, records no history, and does not call OCSF conversion. Rust emits one shared `qk-audit::Observation` per recognized SQL candidate after authorization; `AttemptOutcome::Authorized` means permitted by QueryKnight but not executed by it. Deny and pending remain blocked/pending, and `Describe`, `ValidateConfig`, malformed bodies rejected before SQL extraction, and non-SQL traffic create no SQL activity event.
-- Typed mapping preserves the authorization phase: `Permitted` records Allow/Authorized (and shared approval facts when present), `Blocked` records Deny/Blocked, `PendingApproval` records RequireApproval/Pending, and daemon unavailable/error remains a fail-closed Deny. None is converted to `ExecutionOutcome::Executed`.
-- The service calls the shared `Observer` once per recognized SQL candidate. Its default has no configured audit sink and includes the shared metrics registry; an embedding can inject `NoopSink`, `MemorySink`/test, or a configured sink and retrieve metrics through `OpenShellService::observer()`. Fingerprint logging is default; another `SqlLogLevel` (including `full_sql`) requires an explicit builder choice. Sink errors are best-effort diagnostics and never change decisions or retry authorization.
-- Shared metrics count authorization requests/decisions, denials, approvals, parse errors, and measured `authorize_guarded` duration only. They never claim DB success, rows, or downstream duration. The canonical `AuditEvent → OcsfEvent` mapping gives authorization-only Allow status Unknown, executed Allow Success, and DB-failed Allow Failure; no OpenShell OCSF exporter or query-history call is added. Bound parameters and ExactV2 digests are not included in observations.
-- No CLI, environment-variable contract, autostart, direct daemon HTTP client, TLS, retry wrapper, or custom timeout is added. Tonic honors client deadlines, but the adapter does not enforce the proto binding timeout; an already-running blocking authorization/approval call is not interrupted by RPC cancellation.
+- The protocol inputs are the official NVIDIA/OpenShell v0.1.2 `extension.proto` and `supervisor_middleware.proto`; SHA-256 and deterministic generation instructions are recorded in `third_party/openshell/README.md`. The v0.1.2 descriptor uses package `openshell.middleware.v1`, `MiddlewareDescribeRequest` for Describe, protocol major/minor `1.0`, and the `openshell.supervisor-middleware.contract` capability. QueryKnight advertises only HTTP request and WebSocket message at `PRE_CREDENTIALS`; the v0.1.2 `HTTP_RESPONSE/PRE_RETURN` service is present in the descriptor but is not bound or advertised.
+- Authenticated deployment is `OpenShellServerConfig::authenticated`: HTTPS server certificate/key, operator-provisioned gateway ID, exact audience, and a bounded local Ed25519 JWKS. Tonic validates the PEM identity and certificate/key pairing before binding. TLS hostname/SAN verification remains the OpenShell client's responsibility; `tls_ca_cert_path` belongs to the OpenShell registration. A configured `--advertised-host` is checked by doctor/startup. No certificate reload is performed; restart QueryKnight after rotation.
+- The authenticated listener may bind a non-loopback address only with successful TLS and JWT configuration. `OpenShellInsecureLocal` is explicit plaintext loopback-only development mode with an obvious warning. Unix sockets remain owner-only local testing/integration; v0.1.2 supervisor middleware must be reachable from both gateway and sandboxes, so Unix socket mode is not the normal authenticated registration path.
+- The Tower request layer authenticates before Tonic decodes protobuf bodies. `Describe` accepts `caller_kind=gateway` (gateway startup) or `caller_kind=supervisor` (supervisor middleware bootstrap); `ValidateConfig` requires `caller_kind=gateway`; `EvaluateHttpRequest` and the complete `EvaluateWebSocketSession` RPC require `caller_kind=supervisor`. A missing/bad token returns gRPC `UNAUTHENTICATED`; a valid token used for the wrong RPC returns `PERMISSION_DENIED`. Authentication failures never become SQL Deny responses.
+- JWT validation pins `alg=EdDSA`, requires `typ=openshell-ext+jwt`, verifies Ed25519 signature using the configured local JWKS `kid`, and checks exact `iss=openshell-gateway:<gateway_id>`, exact string `aud`, `sub`, `iat`, `exp`, `jti`, and caller kind. `sandbox_id` is required for supervisor calls and the SPIFFE-shaped `sub` must agree. Expiry is checked with five seconds of skew and a maximum one-hour lifetime; `nbf` is not issued by v0.1.2 but is validated if present. Repeated `jti` is accepted. Unknown `kid`, duplicate key IDs, non-OKP/Ed25519/signature keys, unsupported `alg`, or malformed JWKS fail closed. No token-driven refresh or discovery fetch occurs.
+- The returned `expected_audience` is the configured audience, not a value learned from Describe. Config/manifest disagreement therefore fails OpenShell startup. The product release (`v0.1.2`) and extension protocol (`1.0`) are separate values.
+- `OpenShellServiceConfig::new(DbConfig)` uses a trusted database URL only to choose dialect and derive a password-redacted approval identity; it never opens a DB connection. Validated registration config supplies policy/database/environment. `ValidateConfig` strictly accepts the existing fields `policy_yaml`, `dialect`, `database`, `environment`, `approval_action`, and `maxSqlBytes`; absent optional fields may default, malformed explicit values and unknown fields fail, and invalid replacement preserves the last good config.
+- After authentication, evaluation binds verified token `sandbox_id` to `RequestContext.sandbox_id` before config lookup, SQL extraction, policy evaluation, approval resolution, or SQL audit. `sandbox` name, workspace, process metadata, target, headers, and body are never used as security identity. Display values do not override the signed sandbox ID.
+- The service advertises a 1 MiB payload limit (below OpenShell's 4 MiB platform maximum) and enforces bounded config/context/target/header sizes plus the existing SQL/candidate limits. HTTP preserves upstream header order by inspecting only needed values; it does not reconstruct headers. QueryKnight does not require managed provider credentials to be present because middleware runs before OpenShell injects them.
+- The QueryKnight binding timeout defaults to 400 ms, below OpenShell v0.1.2's 500 ms default. OpenShell v0.1.2 accepts 10 ms–30 s operator timeouts and uses a binding timeout only to shorten the service timeout. The tagged external middleware client wraps calls in internal timers but does not send `grpc-timeout`; QueryKnight honors a received gRPC timeout when present and uses its advertised internal budget otherwise. Approval daemon connect/read/write operations share the remaining absolute budget, poll cancellation, leave an internal safety margin, and never retry after expiry. A timed-out or canceled blocking authorization drops any local permit and cannot return Allow. Approval errors use gRPC service failure; `on_error: fail_closed` is required for enforcement.
+- QueryKnight preserves ExactV2 and Session approval scope. Pending approval maps to a normal middleware DENY because the protocol has no pending state; audit remains `Pending`. `LegacyShape` is never authoritative. QueryKnight never executes SQL, serializes an `ExecutionPermit`, or claims that an external Allow reached the target.
+- WebSocket uses one authenticated supervisor credential for the complete gRPC stream, binds sandbox identity on preflight, requires session start, accepts strictly increasing stage sequence numbers with gaps, and checks each text message independently. Binary messages are denied; server-to-client messages are not advertised. HTTP response middleware is not implemented.
+- Findings and metadata remain empty; outward `queryknight_*` reason codes are sanitized to the v0.1.2 lowercase/digit/underscore grammar and 64-byte maximum. Auth diagnostics are separate `openshell_auth_success` / `openshell_auth_failure` / authorization decision stderr records; they omit JWTs, signatures, keys, SQL, and parameters. No Prometheus metric names or high-cardinality labels are added.
+- The standalone `queryknight openshell serve` and `queryknight openshell doctor` commands expose typed TLS/JWT listener configuration, local trust checks, and no database connectivity check. Authenticated mode is the default; `--insecure-local` is explicit, loopback-only, and development-only.
+- The same shared `Observer` records typed authorization outcomes and frozen metrics. These describe QueryKnight's authorization decision only, not downstream execution. No OCSF exporter or query-history call is added.
 
 ## Observability boundaries
 
 Query history is not audit; audit is not metrics; metrics are not OCSF. OpenShell records no daemon `query_events` history. `Observer` emits the canonical `AuditEvent` and metrics from typed `AuthorizationOutcome`s; a configured host sink may convert an event with the shared `to_ocsf`, but this service adds no OCSF transport. An `authorized` audit/OCSF outcome means only “authorized for an external executor”; it does not mean “executed” or “succeeded.”
 
-Example embedding (the host owns daemon and listener lifecycle):
+## Product boundary and database path
+
+OpenShell controls which network/service destinations an agent can reach. QueryKnight controls SQL/database actions after database access is intentionally granted. OpenShell's HTTP/WebSocket middleware does not inspect native PostgreSQL/MySQL protocols. The future database architecture is sandbox policy that allows the QueryKnight DB proxy and denies direct database destinations, with the application's `DATABASE_URL` pointed at QueryKnight. PostgreSQL/MySQL frontend and backend TLS remain separate milestones; this OpenShell integration does not make native database TLS production-ready.
+
+## Standalone and embedded deployment
+
+The supported standalone entrypoint is `queryknight openshell serve`; it requires `DATABASE_URL`/`MYSQL_URL` only for dialect/approval identity, and starts authenticated HTTPS by default. `queryknight openshell doctor` validates local TLS/JWKS/policy configuration without opening a database connection. See [`examples/openshell/README.md`](../examples/openshell/README.md) for the complete OpenShell v0.1.2 registration, CA, policy, and target-service flow.
+
+Embedding remains available when the host owns process lifecycle:
 
 ```rust
-let db = qk_db::DbConfig::from_url("postgresql://user:password@127.0.0.1/app")?;
+let database_url = std::env::var("DATABASE_URL")?;
+let db = qk_db::DbConfig::from_url(&database_url)?;
+let audience = "urn:openshell:extension:middleware:queryknight";
+let jwt = qk_openshell::OpenShellJwtConfig::new(
+    "queryknight-demo",
+    audience,
+    "/etc/queryknight/openshell-jwks.json",
+)?;
 let control_plane = qk_control_plane::ControlPlaneClient::discover(None)?;
 let service = qk_openshell::OpenShellService::new(
-    qk_openshell::OpenShellServiceConfig::new(db).with_control_plane(control_plane),
+    qk_openshell::OpenShellServiceConfig::new(db)
+        .with_expected_audience(audience)
+        .with_control_plane(control_plane),
 );
-let server =
-    qk_openshell::OpenShellServer::bind_unix("/run/queryknight/middleware.sock", service)
-        .await?;
+let config = qk_openshell::OpenShellServerConfig::authenticated(
+    "0.0.0.0:50051".parse()?,
+    "/etc/queryknight/tls/server.pem",
+    "/etc/queryknight/tls/server-key.pem",
+    jwt,
+);
+let server = qk_openshell::OpenShellServer::bind(config, service).await?;
 server.stop().await?;
 ```
 
 ## External schema note
 
-`supervisor_middleware.proto` is the NVIDIA Apache-2.0 schema vendored in the TypeScript tree. It references `extension.proto`, which is missing from that tree; the matching official peer-metadata schema is vendored unchanged in `crates/qk-openshell/proto/extension.proto`. The TypeScript handler emits an empty `extension` message and does not implement the advertised WebSocket stream; those protocol gaps are documented compatibility differences, not reasons to hand-roll a new protocol. The checked-in deployment uses a Unix-domain socket and insecure gRPC credentials. Current [OpenShell supervisor-middleware guidance](https://docs.nvidia.com/openshell/extensibility/supervisor-middleware) requires HTTPS/JWT for remote services and describes insecure transport as a trusted-network development option. Rust supports only local Unix-domain/loopback transports; it does not expose insecure remote gRPC or invent JWT key provisioning. Remote deployment remains unsupported until the gateway audience/public-key trust material is configured.
+Both vendored inputs are official NVIDIA/OpenShell Apache-2.0 protocol files, byte-for-byte equal to the v0.1.2 tag; their upstream commit, SHA-256 values, and binding regeneration command are recorded in [`third_party/openshell/README.md`](../third_party/openshell/README.md). No upstream implementation code or QueryKnight project-license changes are included. The sibling TypeScript adapter remains an unauthenticated historical implementation; QueryKnight's Rust network path follows the tagged v0.1.2 authenticated contract.

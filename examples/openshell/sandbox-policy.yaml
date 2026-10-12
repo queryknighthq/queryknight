@@ -1,0 +1,43 @@
+version: 1
+
+network_middlewares:
+  queryknight-sql:
+    name: QueryKnight SQL safety
+    middleware: queryknight
+    config:
+      policy_yaml: |
+        version: 1
+        defaults:
+          decision: deny
+        environments:
+          production:
+            databases:
+              main:
+                mutations:
+                  deny_without_where: [delete]
+                approval_required:
+                  - operations: [delete]
+                allow:
+                  - operations: [select]
+      dialect: postgres
+      database: main
+      environment: production
+      maxSqlBytes: 200000
+    on_error: fail_closed
+    endpoints:
+      include:
+        - 192.0.2.10 # Replace with the shared QueryKnight host address.
+
+network_policies:
+  queryknight-demo:
+    name: QueryKnight SQL demo target
+    endpoints:
+      - host: 192.0.2.10 # Replace with the same shared host address.
+        port: 18080
+        protocol: rest
+        rules:
+          - allow:
+              method: POST
+              path: /query
+    binaries:
+      - path: /usr/bin/curl

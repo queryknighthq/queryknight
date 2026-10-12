@@ -24,7 +24,7 @@ transport limits are documented in [`docs/release-security.md`](docs/release-sec
 | PostgreSQL proxy | Guarded Simple and supported Extended Query on loopback | Frontend/backend TLS, COPY, FunctionCall, replication, and CancelRequest are unsupported/fail closed. |
 | MySQL proxy | Guarded COM_QUERY and supported prepared statements on loopback | TLS, compression, LOCAL INFILE, cursors/FETCH, query attributes, and unmodeled commands are unsupported/fail closed. |
 | MCP | Local stdio process transport | No network listener. |
-| OpenShell | Local Unix socket or loopback authorization middleware | Authorization-only; loopback TCP has no peer authentication; remote TCP/HTTPS/JWT unsupported. |
+| OpenShell | Authenticated HTTPS with strict OpenShell extension JWT verification for v0.1.2; explicit insecure mode is loopback-only, and Unix sockets are local integration/test paths. | Authorization-only; unauthenticated remote and plaintext non-loopback are rejected. See the [integration guide](docs/openshell.md). |
 | Daemon/control plane | Loopback HTTP with bearer token on protected routes | Not a public remote API; shared client rejects non-loopback targets. |
 
 See [release security and deployment scope](docs/release-security.md) for the complete matrix and trust assumptions.
