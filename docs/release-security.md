@@ -8,12 +8,12 @@ supported over authenticated HTTPS with strict OpenShell extension JWT checks.
 That integration does not add MySQL TLS or make the database paths
 production-ready.
 
-The current workspace is not yet release-ready: Cargo package versions are split
-between `0.1.0` and `0.1.0-beta.0`; there is no Rust CI workflow, Dockerfile,
-release artifact workflow, or clean-install verification in this repository.
-The CLI currently reports `0.1.0-beta.0`. Do not bump or publish versions in
-this documentation change; synchronize the user-facing release packages before
-publishing. See [the release checklist](release-checklist.md).
+The source repository is public-ready under Apache-2.0, but it is **not yet
+release-ready**: every QueryKnight crate and every product version surface
+reports `0.1.0` from one workspace package declaration, and there is still no
+Dockerfile, release artifact workflow, or published binary. Nothing has been
+tagged, released, or published to crates.io. See
+[the release checklist](release-checklist.md).
 
 ## Canonical execution guarantee
 
@@ -188,11 +188,11 @@ Classification meanings:
 | MySQL admin/session switching | Unsupported commands are rejected; modeled SQL session changes follow policy and additional semantics fail closed. | No unmodeled database/user/session switch. | POST-V1 FEATURE | No, while explicitly excluded |
 | MySQL multi-statements | `CLIENT_MULTI_STATEMENTS` is cleared; a complete COM_QUERY payload is authorized and is not split. | The server cannot execute a negotiated multi-statement batch; no safe-half forwarding. | POST-V1 FEATURE | No, while explicitly excluded |
 | MariaDB validation | `mariadb://` is rejected by the MySQL URL parser; MariaDB server behavior has not been live-validated. | Do not claim MariaDB compatibility based on the MySQL protocol implementation. | PRODUCTION-MATURITY BLOCKER | Yes, if MariaDB support is claimed |
-| Docker | No Rust Dockerfile/image is present. | No container installation or update contract. | POST-V1 FEATURE | Only if a Docker distribution is claimed |
+| Docker | No Rust Dockerfile/image is present, deliberately deferred: the proxy is loopback-only and the OpenShell PostgreSQL path needs operator-managed forwarding, so a container image would imply a deployment contract that does not exist yet. | No container installation or update contract. | POST-V1 FEATURE | Only if a Docker distribution is claimed |
 | CI | No Rust CI workflow is present. | No automated clean-room gate for PRs/releases. | V1 BLOCKER | Yes |
 | Release binaries | No versioned Rust release artifacts/checksums are present. | Users cannot verify a canonical published binary. | V1 BLOCKER | Yes |
 | Clean-install verification | No release clean-install smoke is recorded. | Installation/startup assumptions remain unverified. | V1 BLOCKER | Yes |
-| Version consistency | 8 workspace crates are `0.1.0` and 7 are `0.1.0-beta.0`; CLI/runtime surfaces report beta.0. | A release must synchronize package and reported versions. | V1 BLOCKER | Yes |
+| Version consistency | All workspace crates inherit one `[workspace.package] version = "0.1.0"`; CLI, daemon health, MCP `serverInfo`, and the OpenShell `Describe` implementation metadata all report `0.1.0`. | Protocol and format versions (policy schema, approval digest, OCSF, OpenShell extension) are separate and unchanged. | Resolved for source publication; binary release packaging remains open | Yes, for a binary release |
 
 ## Deployment assumptions and failure semantics
 

@@ -110,7 +110,11 @@ Query history is not audit; audit is not metrics; metrics are not OCSF. OpenShel
 
 ## Product boundary and database path
 
-OpenShell controls which network/service destinations an agent can reach. QueryKnight controls SQL/database actions after database access is intentionally granted. OpenShell's HTTP/WebSocket middleware does not inspect native PostgreSQL/MySQL protocols. The future database architecture is sandbox policy that allows the QueryKnight DB proxy and denies direct database destinations, with the application's `DATABASE_URL` pointed at QueryKnight. PostgreSQL/MySQL frontend and backend TLS remain separate milestones; this OpenShell integration does not make native database TLS production-ready.
+OpenShell controls which network/service destinations an agent can reach. QueryKnight controls SQL/database actions after database access is intentionally granted. OpenShell's HTTP/WebSocket middleware does not inspect native PostgreSQL/MySQL protocols.
+
+That is a separate integration mode from the native database path, which is implemented and live verified: OpenShell sandbox policy admits the QueryKnight PostgreSQL proxy and denies the database destination directly, with the application pointed at QueryKnight. QueryKnight then enforces SQL on the proxied session and reaches PostgreSQL over verified backend TLS. Evidence and the exact policy shape are in [`openshell-postgres-demo.md`](openshell-postgres-demo.md) and [`openshell-compatibility.md`](openshell-compatibility.md).
+
+Still not implemented: PostgreSQL frontend TLS and MySQL TLS. This OpenShell integration does not make either database path production-ready.
 
 ## Standalone and embedded deployment
 
