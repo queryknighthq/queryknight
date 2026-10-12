@@ -9,7 +9,13 @@ commands, environment, and results.
 
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+      (the all-features selection is required: feature unification changes at
+      workspace scope, so a narrower clippy run can miss a break)
 - [ ] `cargo test --workspace`
+- [ ] `cargo build --workspace --all-features`
+- [ ] `scripts/check-rustls-provider.sh` — the workspace must resolve exactly one
+      rustls `CryptoProvider` (`ring`); both `ring` and `aws-lc-rs` enabled makes
+      every rustls consumer panic at first TLS use
 - [ ] Review every QueryKnight-owned `unsafe` occurrence; confirm the crate-level
       `deny(unsafe_code)` policies still cover intended crates and review unsafe
       in dependencies separately.
@@ -26,8 +32,8 @@ commands, environment, and results.
 
 ## Live database contracts
 
-Use isolated disposable databases and explicit plaintext configuration for the
-current non-TLS adapters. QueryKnight does not provision or validate tunnels.
+Use isolated disposable databases. QueryKnight does not provision or validate
+tunnels.
 
 - [ ] Direct PostgreSQL against PostgreSQL 17 with `sslmode=disable`:
 
@@ -45,6 +51,18 @@ current non-TLS adapters. QueryKnight does not provision or validate tunnels.
   QUERYKNIGHT_POSTGRES_TEST_URL='postgres://user:password@127.0.0.1:5432/testdb?sslmode=disable' \
     cargo test -p qk-proxy-postgres --test live_postgres live_postgres17_extended_query_matrix
   ```
+
+- [ ] Verified PostgreSQL backend TLS (direct adapter and wire proxy) against a
+      disposable PostgreSQL 17 with `ssl=on`:
+
+  ```sh
+  ./scripts/test-postgres-tls.sh
+  ```
+
+  Confirm trusted-CA success, unknown-CA failure, hostname-mismatch failure,
+  TLS-required-against-plaintext failure, explicit-plaintext success, and that
+  a denied statement through the proxy returns SQLSTATE `42501` without
+  reaching the backend. Do not accept a plaintext fallback as evidence.
 
 - [ ] Direct MySQL adapter against the supported MySQL server version using a
       plaintext URL with no TLS request:
@@ -81,6 +99,14 @@ current non-TLS adapters. QueryKnight does not provision or validate tunnels.
       filtering, TLS/compression/LOCAL INFILE/cursor refusal, and no replay.
 - [ ] Confirm OpenShell is described and tested as authorization-only; an Allow
       must not be counted as downstream execution.
+- [ ] `scripts/test-openshell-v0.1.2.sh` — real OpenShell v0.1.2 sandbox
+      middleware E2E (HTTP middleware path).
+- [ ] `scripts/test-openshell-postgres-v0.1.2.sh` — real OpenShell v0.1.2
+      sandbox + QueryKnight PostgreSQL proxy + PostgreSQL 17 over verified TLS.
+      This is the network-gating path: OpenShell must deny the sandbox's direct
+      connection to the database while admitting the proxy, and QueryKnight must
+      enforce SQL authorization on the proxied session. Do not accept a run that
+      skips the direct-denial assertion or falls back to plaintext.
 
 ## Packaging and release integrity
 

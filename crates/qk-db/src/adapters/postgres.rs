@@ -29,10 +29,10 @@ pub struct PostgresAdapter;
 fn connect_error(error: tokio_postgres::Error) -> DbError {
     let message = error.to_string();
     // Connect-phase failures are connection-level unless the server
-    // explicitly rejected credentials.
+    // explicitly rejected credentials or the TLS handshake failed.
     let kind = match classify_driver_message(&message) {
         DbErrorKind::Authentication => DbErrorKind::Authentication,
-        _ => DbErrorKind::Connection,
+        _ => crate::tls::classify_tls_error(&message),
     };
     DbError::new(kind, message)
 }
@@ -43,12 +43,23 @@ fn query_error(error: tokio_postgres::Error) -> DbError {
 }
 
 async fn connect(url: &SecretUrl) -> Result<Client, DbError> {
-    let config = parse_postgres_config(url)?;
-    let (client, connection) = config.connect(NoTls).await.map_err(connect_error)?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    Ok(client)
+    let (config, transport) = parse_postgres_config(url)?;
+    match transport.build_connector()? {
+        Some(connector) => {
+            let (client, connection) = config.connect(connector).await.map_err(connect_error)?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            Ok(client)
+        }
+        None => {
+            let (client, connection) = config.connect(NoTls).await.map_err(connect_error)?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            Ok(client)
+        }
+    }
 }
 
 fn to_sql_param(

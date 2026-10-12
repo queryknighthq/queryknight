@@ -63,14 +63,21 @@ and mismatched approval tokens all terminate before any adapter call.
   guarded authorization rejects the same configuration before approval
   resolution. Explicit `require_ssl=false` remains plaintext.
 
-- Direct qk-db PostgreSQL connections support only explicit
-  `sslmode=disable`. The parsed default (`prefer`), explicit `prefer`,
-  and `require` return typed `Unsupported` before connection, approval
-  resolution, or SQL; QueryKnight does not silently downgrade them.
-  `verify-ca`/`verify-full` are rejected by tokio-postgres's parser.
-  This intentionally breaks URLs that omit `sslmode`: add
-  `?sslmode=disable` only for an explicitly trusted plaintext path.
-  The PostgreSQL proxy has separate backend transport validation.
+- Direct qk-db PostgreSQL connections support explicit `sslmode=disable`
+  (plaintext) and `sslmode=require` (verified TLS). The parsed default
+  (`prefer`) and explicit `prefer`/`allow` return typed `Unsupported`
+  before connection, approval resolution, or SQL; QueryKnight does not
+  silently downgrade them. `verify-ca`/`verify-full` are rejected by
+  tokio-postgres's parser. This intentionally breaks URLs that omit
+  `sslmode`: add `?sslmode=disable` only for an explicitly trusted
+  plaintext path, or `?sslmode=require` for TLS.
+  Under `require`, the hostname is verified against the certificate SAN
+  and the CA bundle named by `QUERYKNIGHT_PG_SSLROOTCERT` (trusted startup
+  configuration, never client input) is the only trust anchor; an absent
+  bundle uses the platform root store. A backend that refuses TLS, presents
+  an untrusted certificate, or mismatches the hostname fails closed and is
+  never retried as plaintext. The PostgreSQL proxy has separate backend
+  transport validation.
 - Lifecycle: connect → operate → close per service call (matches the
   reference shape of short-lived adapter use; no pool). Consequence
   (frozen): no cross-request transaction affinity — `BEGIN` in one

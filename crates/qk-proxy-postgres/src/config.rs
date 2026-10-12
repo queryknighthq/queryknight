@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use qk_control_plane::ControlPlaneClient;
 use qk_core::PolicyFile;
+use qk_db::PostgresTransport;
 use qk_db::{DbConfig, SecretUrl};
-use tokio_postgres::config::{Host, SslMode};
+use tokio_postgres::config::Host;
 
 /// Bounded proxy configuration error. No backend URL, username/password,
 /// policy SQL, or control-plane token is included in its display surface.
@@ -17,7 +18,10 @@ pub enum ProxyConfigError {
     NotPostgres,
     /// Backend URL does not identify exactly one TCP host.
     UnsupportedBackendTarget,
-    /// Backend URL requests TLS, unsupported by this plaintext wire transport.
+    /// Backend URL selects a non-verifying transport (`prefer`/`allow`) or
+    /// an invalid TLS configuration. Verified TLS (`require`) and explicit
+    /// plaintext (`disable`) are the only accepted modes; QueryKnight never
+    /// downgrades.
     BackendTlsUnsupported,
     /// Backend role or database identity is absent.
     MissingBackendIdentity,
@@ -32,7 +36,7 @@ impl Display for ProxyConfigError {
             Self::NotPostgres => "the PostgreSQL proxy requires a PostgreSQL backend URL",
             Self::UnsupportedBackendTarget => "PostgreSQL proxy supports one TCP backend host only",
             Self::BackendTlsUnsupported => {
-                "PostgreSQL backend TLS is requested but unsupported by this proxy"
+                "PostgreSQL backend TLS mode must be sslmode=disable or verifying sslmode=require"
             }
             Self::MissingBackendIdentity => {
                 "PostgreSQL backend configuration must identify a user and database"
@@ -53,6 +57,7 @@ pub(crate) struct BackendConfig {
     pub(crate) port: u16,
     pub(crate) user: String,
     pub(crate) database: String,
+    pub(crate) transport: PostgresTransport,
 }
 
 impl BackendConfig {
@@ -61,17 +66,21 @@ impl BackendConfig {
             DbConfig::Postgres(url) => url,
             DbConfig::Mysql(_) | DbConfig::Sqlite(_) => return Err(ProxyConfigError::NotPostgres),
         };
-        Self::from_url(url)
+        let transport = url.postgres_transport().map_err(|error| {
+            if error.kind() == &qk_db::DbErrorKind::Unsupported {
+                ProxyConfigError::BackendTlsUnsupported
+            } else {
+                ProxyConfigError::InvalidBackend
+            }
+        })?;
+        Self::from_url(url, transport)
     }
 
-    fn from_url(url: &SecretUrl) -> Result<Self, ProxyConfigError> {
+    fn from_url(url: &SecretUrl, transport: PostgresTransport) -> Result<Self, ProxyConfigError> {
         let parsed: tokio_postgres::Config = url
             .expose()
             .parse()
             .map_err(|_| ProxyConfigError::InvalidBackend)?;
-        if parsed.get_ssl_mode() != SslMode::Disable {
-            return Err(ProxyConfigError::BackendTlsUnsupported);
-        }
         if parsed
             .get_options()
             .is_some_and(|options| !options.is_empty())
@@ -99,6 +108,7 @@ impl BackendConfig {
             port: parsed.get_ports().first().copied().unwrap_or(5432),
             user,
             database,
+            transport,
         })
     }
 }
@@ -172,9 +182,14 @@ mod tests {
 
     #[test]
     fn backend_tls_modes_are_never_silently_downgraded() {
-        for mode in ["prefer", "require"] {
-            let url =
-                format!("postgres://qk:backend-secret@127.0.0.1:5432/queryknight?sslmode={mode}");
+        // Non-verifying modes are rejected outright.
+        for mode in ["prefer", ""] {
+            let suffix = if mode.is_empty() {
+                String::new()
+            } else {
+                format!("?sslmode={mode}")
+            };
+            let url = format!("postgres://qk:backend-secret@127.0.0.1:5432/queryknight{suffix}");
             let config = DbConfig::from_url(&url).expect("PostgreSQL URL");
             assert!(
                 matches!(
@@ -184,6 +199,7 @@ mod tests {
                 "sslmode={mode}"
             );
         }
+        // Modes tokio-postgres cannot parse stay invalid.
         for mode in ["verify-ca", "verify-full"] {
             let url =
                 format!("postgres://qk:backend-secret@127.0.0.1:5432/queryknight?sslmode={mode}");
@@ -196,10 +212,20 @@ mod tests {
                 "sslmode={mode}"
             );
         }
+        // Explicit plaintext is supported.
         let config = DbConfig::from_url(
             "postgres://qk:backend-secret@127.0.0.1:5432/queryknight?sslmode=disable",
         )
         .expect("PostgreSQL URL");
-        assert!(BackendConfig::from_db_config(&config).is_ok());
+        let backend = BackendConfig::from_db_config(&config).expect("plaintext backend");
+        assert!(!backend.transport.is_tls());
+
+        // Verified TLS is supported.
+        let config = DbConfig::from_url(
+            "postgres://qk:backend-secret@127.0.0.1:5432/queryknight?sslmode=require",
+        )
+        .expect("PostgreSQL URL");
+        let backend = BackendConfig::from_db_config(&config).expect("verified TLS backend");
+        assert!(backend.transport.is_tls());
     }
 }

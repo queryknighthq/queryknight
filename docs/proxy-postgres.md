@@ -13,8 +13,8 @@ Audited source: `packages/proxies/postgres/src/{proxy.ts,messages.ts,reader.ts,p
 Rust adds `queryknight proxy [--listen <port>]`, bound only to `127.0.0.1`
 (default `5434`). `MYSQL_URL` takes precedence over `DATABASE_URL`, and the
 selected URL must be PostgreSQL. Backend selection is fixed at startup and
-supports one TCP host. Explicit `sslmode=disable` is required: backend TLS is
-not implemented and TLS-enabled or default-`prefer` configurations are rejected
+supports one TCP host. `sslmode=disable` selects explicit plaintext and
+`sslmode=require` selects verified TLS; `sslmode=prefer`/`allow` is rejected
 rather than downgraded. Frontend SSL/GSS requests receive `N`; following
 protocol and authentication traffic is plaintext. Keep the listener loopback-
 only.
@@ -22,13 +22,25 @@ only.
 Each frontend owns one backend TCP session, a prepared-statement map, a portal
 map, and extended error state. The proxy relays supported PostgreSQL
 authentication (AuthenticationOk, cleartext, MD5, and SCRAM messages) without
-logging passwords/proofs. The backend URL password is not substituted for the
+logging passwords/proofs.
+
+The backend URL password is not substituted for the
 frontend credential. Configured backend user/database are trusted identity;
 the frontend user must match, and an omitted frontend database defaults to
 that user. An omitted backend URL database defaults to the configured user.
 Only `application_name`, `client_encoding=UTF8`, and empty `options`/`replication`
 values are permitted; other startup parameters and non-empty values are
 rejected.
+
+The `AuthenticationSASL` mechanism list is rewritten before it reaches the
+frontend: `SCRAM-SHA-256-PLUS` requires TLS channel binding, which the
+inspected plaintext frontend hop cannot provide, so only mechanisms the client
+can actually complete are offered. A backend reached over verified TLS
+advertises `SCRAM-SHA-256-PLUS` first, and libpq aborts with "server offered
+SCRAM-SHA-256-PLUS authentication over a non-SSL connection" instead of falling
+back. A list that leaves nothing usable fails closed. If frontend TLS is ever
+implemented, this filter must become conditional on the frontend hop's
+channel-binding capability.
 
 | Frontend message/state | Proxy behavior | Backend behavior |
 |---|---|---|
@@ -108,6 +120,35 @@ no partial forwarding or permit cache exists, and the original `Q` is sent
 only after consuming its permit. Empty `Q` skips policy. COPY and SQL SET
 remain explicitly unsupported.
 
+## Verified backend TLS
+
+`sslmode=require` makes the proxy TLS-required, not TLS-preferred. Before any
+`StartupMessage` is written the proxy sends the 8-byte `SSLRequest` on the same
+socket and requires the backend's `S` byte. A backend `N`, a refused connection,
+a failed handshake, an untrusted certificate, or a hostname mismatch all fail
+closed with a `FATAL` frontend error and the session ends. The proxy never
+retries plaintext and never disables certificate verification.
+
+| Condition | SQLSTATE | Message |
+|---|---|---|
+| Backend refused the required TLS | `08001` | `PostgreSQL backend refused the required TLS connection` |
+| CA bundle missing/invalid | `08001` | `PostgreSQL backend TLS is misconfigured` |
+| Handshake, untrusted certificate, or hostname mismatch | `08001` | `PostgreSQL backend TLS handshake failed` |
+| Backend answered neither `S` nor `N` | `08P01` | `invalid PostgreSQL backend response to SSLRequest` |
+
+`QUERYKNIGHT_PG_SSLROOTCERT` names a PEM CA bundle that becomes the *only*
+trust anchor. The path comes from trusted startup configuration, never from a
+client or SQL; the bundle contents and any credential are never logged. With no
+bundle, the platform root store is used. The hostname verified against the
+certificate SAN is the URL host, never a `hostaddr` or a client-supplied value.
+
+Frontend TLS remains unimplemented: an `SSLRequest` from the client is answered
+`N`, so the inspected frontend hop is plaintext and must stay loopback-only.
+The inspected hop is the frontend one; backend TLS is transport protection
+only and does not change authorization. `Q` and `Execute` still require a
+positive `ExecutionPermit` before any executable operation is forwarded on the
+same backend session.
+
 ## PostgreSQL 17 live test
 
 The real-client integration matrix uses `tokio-postgres` and a disposable
@@ -124,11 +165,37 @@ blocked side effects against an independent direct connection, then removes
 the table. Without the environment variable it returns immediately; set it to
 collect live evidence.
 
+### Verified TLS matrix
+
+`scripts/test-postgres-tls.sh` provisions an ephemeral PKI and two disposable
+PostgreSQL 17 servers (one `ssl=on`, one plaintext), then runs the ignored
+`live_postgres_tls` matrices in `qk-db` and `qk-proxy-postgres`. It proves:
+
+* trusted CA + matching SAN connects;
+* an untrusted CA fails closed;
+* a hostname absent from the certificate SAN fails closed (an IP literal
+  against a DNS-only SAN, so no `/etc/hosts` edits are needed);
+* `sslmode=require` against a TLS-refusing backend fails closed;
+* explicit `sslmode=disable` still connects;
+* through the proxy, an allowed `SELECT` reaches the TLS backend, a denied
+  statement returns SQLSTATE `42501` and leaves the probe row untouched, and an
+  untrusted CA yields no working session.
+
+The containers and PKI are removed on exit; nothing is committed.
+
+## OpenShell-gated deployment
+
+`scripts/test-openshell-postgres-v0.1.2.sh` composes this proxy with a real
+OpenShell v0.1.2 sandbox and a TLS-enabled PostgreSQL 17, proving that the
+sandbox can reach the proxy but not the database, and that the
+QueryKnight → PostgreSQL hop is verified TLS. See
+[`openshell-postgres-demo.md`](openshell-postgres-demo.md).
+
 ## Scope boundary
 
 Supported: PostgreSQL Simple Query plus guarded Extended Query prepared
-statements and portals. Unsupported/fail-closed: COPY streaming, FunctionCall,
-replication startup, CancelRequest forwarding, frontend TLS, and backend TLS.
-This feature does not change MySQL or OpenShell. Legacy observe remains
-unimplemented and is not shipped in Rust; `../queryknight-ts` remains the
-read-only reference oracle.
+statements and portals, with explicit plaintext or verified TLS on the backend
+hop. Unsupported/fail-closed: COPY streaming, FunctionCall, replication
+startup, CancelRequest forwarding, and frontend TLS. This feature does not
+change MySQL or OpenShell. Legacy observe remains unimplemented and is not
+shipped in Rust; `../queryknight-ts` remains the read-only reference oracle.

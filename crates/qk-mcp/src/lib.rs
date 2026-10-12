@@ -26,7 +26,7 @@ pub use format::{
 pub use history::{classify_for_history, HistoryEvent, HistoryRecorder};
 pub use qk_control_plane::{ControlPlaneClient, DaemonApprovalProvider};
 pub use server::{
-    connection_url_from_env, instructions, load_policy, serve_stdio, ApprovalStatus,
-    ApprovalsDecideArgs, DbDescribeArgs, DbExplainArgs, DbQueryArgs, DbSampleArgs, DbSchemaArgs,
-    DbTablesArgs, McpState, QueryKnightServer, SERVER_NAME,
+    connection_url_from_env, instructions, load_policy, postgres_tls_options_from_env, serve_stdio,
+    ApprovalStatus, ApprovalsDecideArgs, DbDescribeArgs, DbExplainArgs, DbQueryArgs, DbSampleArgs,
+    DbSchemaArgs, DbTablesArgs, McpState, QueryKnightServer, SERVER_NAME,
 };

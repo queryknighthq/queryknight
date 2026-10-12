@@ -450,6 +450,7 @@ fn db_error_kind_name(kind: &DbErrorKind) -> String {
         DbErrorKind::Query => "query",
         DbErrorKind::Constraint => "constraint",
         DbErrorKind::Unsupported => "unsupported",
+        DbErrorKind::Transport => "transport",
         DbErrorKind::Protocol => "protocol",
         DbErrorKind::Internal => "internal",
     }

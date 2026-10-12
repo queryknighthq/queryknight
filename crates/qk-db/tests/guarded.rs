@@ -274,7 +274,7 @@ async fn unsupported_postgres_transport_blocks_before_approval_or_adapter() {
     let approval = approval(&store, Some(&provider));
     let policy = policy();
 
-    for ssl_options in ["", "?sslmode=prefer", "?sslmode=require"] {
+    for ssl_options in ["", "?sslmode=prefer"] {
         let raw_url = format!("postgres://qk:PG_TLS_SECRET_12345@localhost/db{ssl_options}");
         let config = DbConfig::from_url(&raw_url).expect("config");
         let outcome = guarded(
@@ -290,7 +290,7 @@ async fn unsupported_postgres_transport_blocks_before_approval_or_adapter() {
         match outcome {
             ExecutionOutcome::Blocked(reason) => {
                 assert_eq!(reason.code, qk_core::ReasonCode::PolicyError.as_str());
-                assert!(reason.message.contains("PostgreSQL TLS is not supported"));
+                assert!(reason.message.contains("sslmode=prefer"));
                 assert!(!reason.message.contains("PG_TLS_SECRET_12345"));
             }
             other => panic!("unsupported transport must block: {other:?}"),

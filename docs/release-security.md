@@ -5,8 +5,8 @@
 The existing direct database and proxy paths remain a **local / trusted-host**
 technical preview. Separately, OpenShell v0.1.2 supervisor middleware is
 supported over authenticated HTTPS with strict OpenShell extension JWT checks.
-That integration does not add native PostgreSQL/MySQL TLS or make the database
-paths production-ready.
+That integration does not add MySQL TLS or make the database paths
+production-ready.
 
 The current workspace is not yet release-ready: Cargo package versions are split
 between `0.1.0` and `0.1.0-beta.0`; there is no Rust CI workflow, Dockerfile,
@@ -47,11 +47,11 @@ or succeeded.
 
 | Surface | Client → QueryKnight | QueryKnight → database/backend | Current trust boundary |
 |---|---|---|---|
-| qk-db PostgreSQL direct | In-process API; MCP is a local stdio caller | Only explicit `sslmode=disable`; plaintext through `NoTls`. Omitted `sslmode` parses as `prefer`; `prefer` and `require` fail with typed `Unsupported` before network access. Parser-invalid modes remain configuration errors. Native TLS is not implemented. | Direct adapter; MCP rejects unsupported transport during connection binding, and guarded direct execution validates before approval resolution. |
+| qk-db PostgreSQL direct | In-process API; MCP is a local stdio caller | Explicit `sslmode=disable` (plaintext through `NoTls`) or `sslmode=require` (verified TLS). Omitted `sslmode` parses as `prefer`; `prefer`/`allow` fail with typed `Unsupported` before network access, and `verify-ca`/`verify-full` are parser errors. `QUERYKNIGHT_PG_SSLROOTCERT` (trusted startup config) is the only trust anchor under `require`; an absent bundle uses the platform roots. A refusing, untrusted, or hostname-mismatched backend fails closed with no plaintext retry. | Direct adapter; MCP rejects unsupported transport during connection binding, and guarded direct execution validates before approval resolution. |
 | qk-db MySQL direct | In-process API; MCP is a local stdio caller | Plaintext only. Parsed `SslOpts` are rejected as typed `Unsupported` before `Conn::new`; `require_ssl=false` is valid plaintext. Native TLS is not implemented and there is no downgrade. | Direct adapter; guarded execution blocks unsupported transport before approval resolution. |
-| PostgreSQL wire proxy | Plaintext PostgreSQL wire protocol on loopback only. SSL/GSS encryption requests receive `N` (up to two refusals, then close); no frontend TLS termination. | One raw TCP backend session per frontend; backend config must explicitly use `sslmode=disable`. Other TLS modes fail configuration; no fallback. | SQL remains visible to the proxy for authorization. COPY, FunctionCall, replication startup, and CancelRequest forwarding fail closed. |
+| PostgreSQL wire proxy | Plaintext PostgreSQL wire protocol on loopback only. SSL/GSS encryption requests receive `N` (up to two refusals, then close); no frontend TLS termination. | One raw TCP backend session per frontend; backend config must explicitly use `sslmode=disable` (trusted plaintext) or `sslmode=require` (verified TLS, hostname checked against the certificate SAN). `prefer`/`allow` fail configuration; no fallback and no plaintext retry after a TLS failure. | SQL remains visible to the proxy for authorization. COPY, FunctionCall, replication startup, and CancelRequest forwarding fail closed. |
 | MySQL wire proxy | Plaintext classic protocol on loopback only. `CLIENT_SSL` is filtered/rejected; compression/zstd and `CLIENT_LOCAL_FILES` are disabled. | One raw TCP backend session per frontend; TLS/socket/compression modes are rejected during proxy config validation. | Inspected COM_QUERY and supported prepared execution are authorized before forwarding. Unsupported commands are rejected rather than default-forwarded. |
-| MCP | stdio only; local process integration; no HTTP/SSE/network listener | Uses the configured qk-db adapter. A PostgreSQL URL must explicitly specify `sslmode=disable`; MySQL TLS requests fail during connection binding. | Tool arguments cannot choose the trusted dialect or connection. Protocol errors use the existing MCP error mapping. |
+| MCP | stdio only; local process integration; no HTTP/SSE/network listener | Uses the configured qk-db adapter. A PostgreSQL URL must explicitly specify `sslmode=disable` or `sslmode=require`; MySQL TLS requests fail during connection binding. | Tool arguments cannot choose the trusted dialect or connection. Protocol errors use the existing MCP error mapping. |
 | OpenShell | Authenticated HTTPS + OpenShell extension JWT for v0.1.2 network middleware. Explicit `OpenShellInsecureLocal` stays loopback-only; Unix sockets are owner-only local test/integration paths. | No database connection or SQL execution by QueryKnight. Native DB TLS is unchanged. | Authorization-only middleware; OpenShell's `on_error` policy controls transport failure behavior. |
 | Daemon/control plane | Loopback HTTP with a bearer token on protected routes; runtime token file is `session.token`. | No database protocol connection; it stores/resolves approvals and history. | Managed runtime binds loopback. The shared client rejects non-loopback daemon URLs and HTTPS. This is not a public remote API. |
 
@@ -67,11 +67,48 @@ OpenShell records authorization-only outcomes (`AttemptOutcome::Authorized` /
 only `AttemptOutcome::Executed` maps to Success. QueryKnight cannot prove what
 the external gateway executes after the authorization RPC.
 
-Where network encryption is required before native QueryKnight TLS exists, an
-operator may use an independently managed SSH tunnel, stunnel, service-mesh
+PostgreSQL backends support native verified TLS (`sslmode=require`), so the
+inspected PostgreSQL hop can be encrypted in-band. MySQL backend TLS and both
+frontend proxy legs remain plaintext; where encryption is required for those,
+an operator may use an independently managed SSH tunnel, stunnel, service-mesh
 sidecar, or private encrypted network. **QueryKnight does not provision,
 authenticate, validate, or manage such a tunnel and does not provide end-to-end
 TLS through it.**
+
+## Supported deployment profile: OpenShell-gated PostgreSQL
+
+One composition is live-verified end to end
+(`scripts/test-openshell-postgres-v0.1.2.sh`):
+
+```
+OpenShell-controlled local/trusted frontend path
+        +
+QueryKnight verified PostgreSQL backend TLS
+```
+
+- the agent runs in an OpenShell v0.1.2 sandbox whose egress policy admits only
+  the QueryKnight PostgreSQL proxy; a direct connection to the database is
+  denied by OpenShell, so valid database credentials alone are not enough to
+  bypass the architecture;
+- QueryKnight terminates the PostgreSQL wire protocol, authorizes each
+  statement, and forwards on the same backend session;
+- the QueryKnight → PostgreSQL hop is verified TLS (`sslmode=require`, pinned
+  CA, hostname checked against the certificate SAN).
+
+This profile does **not** establish, and must not be read as:
+
+- PostgreSQL frontend TLS — the sandbox → proxy leg is plaintext and local;
+- a publicly reachable QueryKnight PostgreSQL listener — the proxy binds
+  loopback only;
+- MySQL TLS — not implemented;
+- general production readiness — the maturity items in this document still
+  apply.
+
+The two OpenShell integration mechanisms are distinct: the HTTP middleware path
+runs QueryKnight *inside* OpenShell for admitted egress and never sees
+PostgreSQL traffic, while this profile uses OpenShell for network gating only
+and QueryKnight for SQL enforcement. See
+[`openshell-postgres-demo.md`](openshell-postgres-demo.md).
 
 ## Protocol support matrix
 
@@ -80,8 +117,8 @@ TLS through it.**
 | Area | Supported behavior | Unsupported / fail-closed behavior |
 |---|---|---|
 | Startup and auth | Bounded protocol-v3 startup; configured user and effective database must match; supported auth frames are relayed; one backend TCP session per frontend. If frontend database is omitted it defaults to the requested user; backend URL database also defaults to user if omitted. | One backend TCP host only; unsupported startup parameters/non-empty `options` or `replication` rejected. SSLRequest/GSSENCRequest receive `N` at most twice; another request closes the connection. |
-| Simple Query | Complete nonempty `Q` SQL is authorized with a fresh permit before the original frame is forwarded once. | Frontend/backend TLS, COPY streaming, SQL SET passthrough, FunctionCall, replication, and CancelRequest forwarding are unsupported. Empty `Q` is handled locally. |
-| Extended Query | Parse/Bind/Describe/Close/Flush are setup only; Execute resolves the current per-frontend portal, authorizes exact SQL and ordered wire parameters (ExactV2), then forwards once. Prepared statements, portals, transaction state, and approvals remain per frontend. | Execute without a permit, malformed/unverifiable setup, COPY, FunctionCall, replication, CancelRequest, and frontend/backend TLS fail closed. No permit cache or reconnect/replay path. |
+| Simple Query | Complete nonempty `Q` SQL is authorized with a fresh permit before the original frame is forwarded once. | Frontend TLS, COPY streaming, SQL SET passthrough, FunctionCall, replication, and CancelRequest forwarding are unsupported. Backend TLS is explicit `sslmode=disable` or `sslmode=require`. Empty `Q` is handled locally. |
+| Extended Query | Parse/Bind/Describe/Close/Flush are setup only; Execute resolves the current per-frontend portal, authorizes exact SQL and ordered wire parameters (ExactV2), then forwards once. Prepared statements, portals, transaction state, and approvals remain per frontend. | Execute without a permit, malformed/unverifiable setup, COPY, FunctionCall, replication, CancelRequest, and frontend TLS fail closed; an unverifiable backend TLS mode also fails closed. No permit cache or reconnect/replay path. |
 
 This is a guarded local PostgreSQL proxy for the implemented Simple and
 Extended Query paths, **not** a fully transparent PostgreSQL gateway.
@@ -131,10 +168,10 @@ Classification meanings:
 | MySQL COM_QUERY | Strict complete payload analysis and one permit-gated backend write. | Unsupported/oversized SQL is not default-forwarded. | V1 BLOCKER | Yes |
 | MySQL prepared statements | Supported audited PREPARE/EXECUTE/SEND_LONG_DATA/RESET/CLOSE subset with ExactV2 and per-frontend state. | Prepared values and buffered long data cannot reach MySQL before a permit. | V1 BLOCKER | Yes |
 | OpenShell | Authenticated HTTPS middleware for v0.1.2; local insecure mode is loopback-only. | Authorization Allow is not evidence of downstream execution or success. | PRODUCTION-MATURITY BLOCKER | Yes, before any claim of end-to-end external execution security |
-| Direct PostgreSQL native TLS | Not implemented. Only explicit `sslmode=disable` is accepted; omitted/prefer/require fail before network; parser-invalid modes remain errors. | No silent Prefer-to-plaintext downgrade; trusted plaintext is explicit. | PRODUCTION-MATURITY BLOCKER | Yes |
+| Direct PostgreSQL native TLS | Implemented as verified TLS (`sslmode=require`): hostname checked against the certificate SAN, `QUERYKNIGHT_PG_SSLROOTCERT` as the only trust anchor. Explicit `sslmode=disable` stays trusted plaintext; omitted/`prefer`/`allow` fail before network; `verify-ca`/`verify-full` remain parser errors. Live evidence: `scripts/test-postgres-tls.sh`. | No silent Prefer-to-plaintext downgrade and no retry after a failed handshake; trusted plaintext is explicit. | Resolved for PostgreSQL; MySQL native TLS remains a PRODUCTION-MATURITY BLOCKER | Yes |
 | Direct MySQL native TLS | Not implemented. Parsed `SslOpts` fail with typed Unsupported before `Conn::new`; `require_ssl=false` is plaintext. Malformed/unknown URL options remain parser errors. | No TLS-to-plaintext downgrade. | PRODUCTION-MATURITY BLOCKER | Yes |
 | PostgreSQL proxy frontend TLS | SSL/GSS requests receive `N`; no termination. | Clients must use plaintext on the local proxy leg. | PRODUCTION-MATURITY BLOCKER | Before recommending remotely exposed proxy listeners |
-| PostgreSQL proxy backend TLS | Raw TCP backend; config requires explicit `sslmode=disable`. | Backend encryption must be supplied outside QueryKnight if required. | PRODUCTION-MATURITY BLOCKER | Yes |
+| PostgreSQL proxy backend TLS | TLS-required (`sslmode=require`) or explicit plaintext (`sslmode=disable`). TLS-required sends SSLRequest on the same socket before StartupMessage and requires `S`; `N`, handshake failure, untrusted certificate, and hostname mismatch all fail closed. Live evidence: `scripts/test-postgres-tls.sh` and the composed `scripts/test-openshell-postgres-v0.1.2.sh` run. | No fallback to plaintext and no verification bypass. | Resolved for PostgreSQL; frontend proxy TLS remains a PRODUCTION-MATURITY BLOCKER | Yes |
 | MySQL proxy frontend TLS | `CLIENT_SSL` is filtered/rejected; no termination. | Frontend leg is plaintext and intended only for loopback. | PRODUCTION-MATURITY BLOCKER | Before recommending remotely exposed proxy listeners |
 | MySQL proxy backend TLS | Native TLS is unsupported; TLS-required URL options fail proxy config. | No silent backend downgrade. | PRODUCTION-MATURITY BLOCKER | Yes |
 | Remote OpenShell middleware | Authenticated HTTPS, strict EdDSA extension JWT, exact audience/issuer/caller/sandbox binding, local trusted JWKS, and fail-closed version negotiation are implemented for OpenShell v0.1.2. Unauthenticated remote, plaintext non-loopback, and unsupported mTLS remain rejected. | No token enters SQL/audit/control-plane state; the returned Allow is not proof of downstream execution. | Supported for v0.1.2; exact live-E2E evidence is recorded in the OpenShell compatibility matrix. | Yes, before any claim of end-to-end external execution security |

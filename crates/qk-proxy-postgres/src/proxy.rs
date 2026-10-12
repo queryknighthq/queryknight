@@ -11,7 +11,7 @@ use qk_db::{
     GuardedAuthorizationCall, ResolveMode, TrustedContext,
 };
 use qk_sql::Operation;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -123,9 +123,15 @@ impl ProxyServer {
     }
 }
 
+/// Boxed backend transport halves. The proxy relays either a plaintext
+/// `TcpStream` or a `rustls` TLS stream, so the halves are type-erased
+/// (dynamic dispatch per relay step is negligible next to SQL analysis).
+type BackendRead = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+type BackendWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+
 struct BackendSession {
-    reader: FrameReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: tokio::net::tcp::OwnedWriteHalf,
+    reader: FrameReader<BackendRead>,
+    writer: BackendWrite,
     transaction_status: u8,
     client_encoding: Option<String>,
 }
@@ -279,6 +285,97 @@ fn portal_state_bytes(portal: &Portal) -> usize {
         .saturating_add(portal.result_formats.len() * std::mem::size_of::<i16>())
 }
 
+/// Exact PostgreSQL SSLRequest wire bytes: length 8, code 80877103.
+const SSL_REQUEST: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F];
+
+/// Why a backend connection could not be established. Never carries the
+/// backend URL, credentials, or TLS library internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendConnectError {
+    /// TCP connect failed or timed out.
+    Refused,
+    /// TLS is required and the backend answered `N` to SSLRequest.
+    TlsRefused,
+    /// The TLS configuration could not be built (missing/invalid CA).
+    TlsConfig,
+    /// TLS handshake or certificate/hostname verification failed.
+    TlsHandshake,
+    /// The backend answered something other than `S` or `N`.
+    Protocol,
+}
+
+impl BackendConnectError {
+    /// PostgreSQL SQLSTATE + bounded message for the frontend.
+    fn frontend_error(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Refused => ("08001", "cannot connect to configured PostgreSQL backend"),
+            Self::TlsRefused => (
+                "08001",
+                "PostgreSQL backend refused the required TLS connection",
+            ),
+            Self::TlsConfig => ("08001", "PostgreSQL backend TLS is misconfigured"),
+            Self::TlsHandshake => ("08001", "PostgreSQL backend TLS handshake failed"),
+            Self::Protocol => ("08P01", "invalid PostgreSQL backend response to SSLRequest"),
+        }
+    }
+}
+
+/// Connect to the trusted backend, negotiating verified TLS when the
+/// transport requires it.
+///
+/// TLS-required mode sends SSLRequest and upgrades the same stream before
+/// any StartupMessage is written. A backend `N`, a failed handshake, an
+/// untrusted certificate, or a hostname mismatch all fail closed; the
+/// proxy never retries plaintext.
+async fn connect_backend(
+    backend: &BackendConfig,
+) -> Result<(BackendRead, BackendWrite), BackendConnectError> {
+    let stream = timeout(
+        BACKEND_CONNECT_TIMEOUT,
+        TcpStream::connect((backend.host.as_str(), backend.port)),
+    )
+    .await
+    .map_err(|_| BackendConnectError::Refused)?
+    .map_err(|_| BackendConnectError::Refused)?;
+
+    let client_config = backend
+        .transport
+        .build_rustls_config()
+        .map_err(|_| BackendConnectError::TlsConfig)?;
+    let Some(client_config) = client_config else {
+        let (read, write) = stream.into_split();
+        return Ok((Box::new(read), Box::new(write)));
+    };
+
+    let mut stream = stream;
+    stream
+        .write_all(&SSL_REQUEST)
+        .await
+        .map_err(|_| BackendConnectError::Refused)?;
+    let mut response = [0u8; 1];
+    stream
+        .read_exact(&mut response)
+        .await
+        .map_err(|_| BackendConnectError::Refused)?;
+    match response[0] {
+        b'S' => {}
+        b'N' => return Err(BackendConnectError::TlsRefused),
+        _ => return Err(BackendConnectError::Protocol),
+    }
+    let server_name = rustls::pki_types::ServerName::try_from(backend.host.clone())
+        .map_err(|_| BackendConnectError::TlsConfig)?;
+    let connector = tokio_rustls::TlsConnector::from(client_config);
+    let tls = timeout(
+        BACKEND_CONNECT_TIMEOUT,
+        connector.connect(server_name, stream),
+    )
+    .await
+    .map_err(|_| BackendConnectError::TlsHandshake)?
+    .map_err(|_| BackendConnectError::TlsHandshake)?;
+    let (read, write) = tokio::io::split(tls);
+    Ok((Box::new(read), Box::new(write)))
+}
+
 async fn handle_client(
     stream: TcpStream,
     config: Arc<ProxyConfig>,
@@ -309,25 +406,14 @@ async fn handle_client(
         let _ = write_error(&mut frontend_write, "FATAL", code, message).await;
         return;
     }
-    let backend_stream = match timeout(
-        BACKEND_CONNECT_TIMEOUT,
-        TcpStream::connect((config.backend.host.as_str(), config.backend.port)),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        _ => {
-            let _ = write_error(
-                &mut frontend_write,
-                "FATAL",
-                "08001",
-                "cannot connect to configured PostgreSQL backend",
-            )
-            .await;
+    let (backend_read, backend_write) = match connect_backend(&config.backend).await {
+        Ok(halves) => halves,
+        Err(error) => {
+            let (code, message) = error.frontend_error();
+            let _ = write_error(&mut frontend_write, "FATAL", code, message).await;
             return;
         }
     };
-    let (backend_read, backend_write) = backend_stream.into_split();
     let mut backend = BackendSession {
         reader: FrameReader::new(backend_read),
         writer: backend_write,
@@ -1514,7 +1600,7 @@ async fn authorize_extended_execute(
 async fn forward_permitted_execute(
     permit: qk_db::ExecutionPermit,
     frame: Frame,
-    backend: &mut tokio::net::tcp::OwnedWriteHalf,
+    backend: &mut BackendWrite,
 ) -> Result<(), ()> {
     if permit.dialect() != qk_sql::SqlDialect::PostgreSql {
         return Err(());
@@ -1523,7 +1609,7 @@ async fn forward_permitted_execute(
     backend.write_all(&frame.raw).await.map_err(|_| ())
 }
 
-async fn flush_backend_output(backend: &mut tokio::net::tcp::OwnedWriteHalf) -> Result<(), ()> {
+async fn flush_backend_output(backend: &mut BackendWrite) -> Result<(), ()> {
     backend
         .write_all(&BACKEND_FLUSH_FRAME)
         .await
@@ -1739,7 +1825,7 @@ async fn relay_authentication(
 struct AuthorizationIo<'a> {
     frontend: &'a mut FrameReader<tokio::net::tcp::OwnedReadHalf>,
     client: &'a mut tokio::net::tcp::OwnedWriteHalf,
-    backend_writer: &'a mut tokio::net::tcp::OwnedWriteHalf,
+    backend_writer: &'a mut BackendWrite,
     pending_frontend: &'a mut Option<Frame>,
     shutdown: &'a mut watch::Receiver<bool>,
 }
@@ -1906,7 +1992,7 @@ async fn record_history(
 async fn forward_permitted_query(
     permit: qk_db::ExecutionPermit,
     frame: Frame,
-    backend: &mut tokio::net::tcp::OwnedWriteHalf,
+    backend: &mut BackendWrite,
 ) -> Result<(), ()> {
     if permit.dialect() != qk_sql::SqlDialect::PostgreSql {
         return Err(());

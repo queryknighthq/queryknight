@@ -26,6 +26,11 @@ pub enum DbErrorKind {
     Constraint,
     /// The operation is not supported by this adapter.
     Unsupported,
+    /// TLS transport failure or invalid TLS configuration: CA unreadable,
+    /// CA parse failure, backend refused TLS, untrusted certificate,
+    /// hostname mismatch, or handshake failure. Never a policy/approval
+    /// outcome and never a silent plaintext fallback.
+    Transport,
     /// Protocol/driver-level failure.
     Protocol,
     /// Anything else driver-shaped.
@@ -74,6 +79,7 @@ impl Display for DbError {
             DbErrorKind::Query => "query",
             DbErrorKind::Constraint => "constraint",
             DbErrorKind::Unsupported => "unsupported",
+            DbErrorKind::Transport => "transport",
             DbErrorKind::Protocol => "protocol",
             DbErrorKind::Internal => "internal",
         };

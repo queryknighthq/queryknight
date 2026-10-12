@@ -4,8 +4,22 @@
 //! appear in errors, logs, or outcomes.
 
 use std::fmt::{self, Debug, Display, Formatter};
+use std::path::PathBuf;
 
 use crate::error::{DbError, DbErrorKind};
+use crate::tls::PostgresTransport;
+
+/// Operator-selected PostgreSQL TLS trust configuration.
+///
+/// `ca_path` names a PEM CA bundle that becomes the *only* trust anchor
+/// for a verified-TLS connection. `None` uses the platform native store.
+/// The path is trusted configuration, never agent input, and its contents
+/// are never logged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostgresTlsOptions {
+    /// PEM CA bundle path, or `None` for the platform native store.
+    pub ca_path: Option<PathBuf>,
+}
 
 /// A database URL whose credentials are redacted on every surface.
 /// `Display`/`Debug` render `password → ***` (frozen `redact()`
@@ -17,7 +31,7 @@ pub struct SecretUrl {
     // Cached from the drivers' typed URL parsers so authorization can
     // reject unsupported modes without reparsing or inspecting URL text.
     mysql_url_options: MysqlUrlOptions,
-    postgres_ssl_mode: PostgresSslMode,
+    postgres_transport: PostgresSslState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -28,9 +42,20 @@ enum MysqlUrlOptions {
     Invalid,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PostgresSslMode {
-    Parsed(tokio_postgres::config::SslMode),
+/// Resolved PostgreSQL transport state for one trusted URL.
+///
+/// The variant is derived from the URL's `sslmode` plus the operator's
+/// [`PostgresTlsOptions`]; agents never select it.
+#[derive(Clone, PartialEq, Eq)]
+enum PostgresSslState {
+    /// `sslmode=disable`: explicit plaintext.
+    Plaintext,
+    /// `sslmode=require`: TLS that must verify.
+    TlsVerified { ca_path: Option<PathBuf> },
+    /// `sslmode=prefer` (or any non-verifying mode): rejected. QueryKnight
+    /// never downgrades to plaintext.
+    DowngradeRejected,
+    /// The URL is not a parseable PostgreSQL configuration.
     Invalid,
 }
 
@@ -38,6 +63,11 @@ impl SecretUrl {
     /// Wrap a URL. Empty strings are rejected (fail fast on missing
     /// configuration, not on first connect).
     pub fn new(url: impl Into<String>) -> Result<Self, DbError> {
+        Self::new_with_tls(url, PostgresTlsOptions::default())
+    }
+
+    /// Wrap a URL with operator TLS trust configuration.
+    pub fn new_with_tls(url: impl Into<String>, tls: PostgresTlsOptions) -> Result<Self, DbError> {
         let url = url.into();
         if url.trim().is_empty() {
             return Err(DbError::new(DbErrorKind::Connection, "empty database URL"));
@@ -51,18 +81,27 @@ impl SecretUrl {
                 Err(_) => MysqlUrlOptions::Invalid,
             }
         };
-        let postgres_ssl_mode = if is_postgres_config_form(&url) {
+        let postgres_transport = if is_postgres_config_form(&url) {
             match url.parse::<tokio_postgres::Config>() {
-                Ok(config) => PostgresSslMode::Parsed(config.get_ssl_mode()),
-                Err(_) => PostgresSslMode::Invalid,
+                Ok(config) => match config.get_ssl_mode() {
+                    tokio_postgres::config::SslMode::Disable => PostgresSslState::Plaintext,
+                    tokio_postgres::config::SslMode::Require => PostgresSslState::TlsVerified {
+                        ca_path: tls.ca_path,
+                    },
+                    // `prefer` (and any future non-verifying mode) is never
+                    // accepted: QueryKnight has no plaintext downgrade.
+                    tokio_postgres::config::SslMode::Prefer => PostgresSslState::DowngradeRejected,
+                    _ => PostgresSslState::DowngradeRejected,
+                },
+                Err(_) => PostgresSslState::Invalid,
             }
         } else {
-            PostgresSslMode::Invalid
+            PostgresSslState::Invalid
         };
         Ok(Self {
             raw: url,
             mysql_url_options,
-            postgres_ssl_mode,
+            postgres_transport,
         })
     }
 
@@ -77,6 +116,18 @@ impl SecretUrl {
         redact_password(&self.raw)
     }
 
+    /// Resolve the PostgreSQL transport mode for this URL.
+    pub fn postgres_transport(&self) -> Result<PostgresTransport, DbError> {
+        match &self.postgres_transport {
+            PostgresSslState::Plaintext => Ok(PostgresTransport::Plaintext),
+            PostgresSslState::TlsVerified { ca_path } => Ok(PostgresTransport::TlsVerified {
+                ca_path: ca_path.clone(),
+            }),
+            PostgresSslState::DowngradeRejected => Err(unsupported_postgres_tls()),
+            PostgresSslState::Invalid => Err(invalid_postgres_url()),
+        }
+    }
+
     fn validate_mysql_options(&self) -> Result<(), DbError> {
         match self.mysql_url_options {
             MysqlUrlOptions::Tls => Err(unsupported_mysql_tls()),
@@ -89,11 +140,7 @@ impl SecretUrl {
     }
 
     fn validate_postgres_options(&self) -> Result<(), DbError> {
-        match self.postgres_ssl_mode {
-            PostgresSslMode::Parsed(tokio_postgres::config::SslMode::Disable) => Ok(()),
-            PostgresSslMode::Parsed(_) => Err(unsupported_postgres_tls()),
-            PostgresSslMode::Invalid => Err(invalid_postgres_url()),
-        }
+        self.postgres_transport().map(|_| ())
     }
 }
 
@@ -125,7 +172,7 @@ fn unsupported_mysql_tls() -> DbError {
 fn unsupported_postgres_tls() -> DbError {
     DbError::new(
         DbErrorKind::Unsupported,
-        "PostgreSQL TLS is not supported by this QueryKnight build; use sslmode=disable only for explicitly trusted plaintext connections",
+        "PostgreSQL sslmode=prefer/allow is not supported; use sslmode=disable for explicitly trusted plaintext or sslmode=require for verified TLS",
     )
 }
 
@@ -133,15 +180,20 @@ fn invalid_postgres_url() -> DbError {
     DbError::new(DbErrorKind::Connection, "invalid PostgreSQL database URL")
 }
 
-pub(crate) fn parse_postgres_config(url: &SecretUrl) -> Result<tokio_postgres::Config, DbError> {
+/// Parse a trusted PostgreSQL URL and resolve its transport mode.
+///
+/// Returns the parsed driver config plus the transport the adapter must
+/// use. `sslmode=prefer`/`allow` and malformed URLs fail here, before any
+/// network activity.
+pub(crate) fn parse_postgres_config(
+    url: &SecretUrl,
+) -> Result<(tokio_postgres::Config, PostgresTransport), DbError> {
     let config = url
         .expose()
         .parse::<tokio_postgres::Config>()
         .map_err(|_| invalid_postgres_url())?;
-    if config.get_ssl_mode() != tokio_postgres::config::SslMode::Disable {
-        return Err(unsupported_postgres_tls());
-    }
-    Ok(config)
+    let transport = url.postgres_transport()?;
+    Ok((config, transport))
 }
 
 pub(crate) fn parse_mysql_opts(url: &SecretUrl) -> Result<mysql_async::Opts, DbError> {
@@ -211,7 +263,15 @@ impl DbConfig {
     /// → sqlite, `postgres(ql):` → postgres, anything else → mysql.
     /// Matching is ASCII case-insensitive on the scheme.
     pub fn from_url(url: &str) -> Result<Self, DbError> {
-        let secret = SecretUrl::new(url)?;
+        Self::from_url_with_tls(url, PostgresTlsOptions::default())
+    }
+
+    /// Parse a connection URL with operator TLS trust configuration.
+    ///
+    /// `tls.ca_path` supplies the PostgreSQL CA bundle; it applies only to
+    /// `postgres(ql):` URLs. Selection rule matches [`DbConfig::from_url`].
+    pub fn from_url_with_tls(url: &str, tls: PostgresTlsOptions) -> Result<Self, DbError> {
+        let secret = SecretUrl::new_with_tls(url, tls)?;
         let lower = url.trim_start().to_ascii_lowercase();
         if lower.starts_with("sqlite:") {
             Ok(Self::Sqlite(secret))
@@ -237,6 +297,19 @@ impl DbConfig {
         match self {
             Self::Mysql(url) => url.validate_mysql_options(),
             Self::Postgres(_) | Self::Sqlite(_) => Ok(()),
+        }
+    }
+
+    /// Resolve the PostgreSQL transport mode for a `postgres(ql):` URL.
+    ///
+    /// Fails for non-PostgreSQL configurations.
+    pub fn postgres_transport(&self) -> Result<PostgresTransport, DbError> {
+        match self {
+            Self::Postgres(url) => url.postgres_transport(),
+            Self::Mysql(_) | Self::Sqlite(_) => Err(DbError::new(
+                DbErrorKind::Connection,
+                "configured database URL is not PostgreSQL",
+            )),
         }
     }
 
@@ -383,24 +456,23 @@ mod tests {
 
     #[test]
     fn postgres_ssl_modes_use_tokio_postgres_config_semantics() {
-        let unsupported_urls = [
+        // Non-verifying modes are rejected; there is no plaintext downgrade.
+        let downgrade_urls = [
             "postgres://u:p@localhost/db",
             "postgresql://u:p@localhost/db",
             "postgres://u:p@localhost/db?sslmode=prefer",
-            "postgres://u:p@localhost/db?sslmode=require",
-            "postgres://u:p@localhost/db?sslmode=disable&sslmode=require",
+            "postgres://u:p@localhost/db?sslmode=require&sslmode=prefer",
         ];
-        for url in unsupported_urls {
+        for url in downgrade_urls {
             let error = DbConfig::from_url(url)
                 .expect("URL config")
                 .validate_supported_transport()
-                .expect_err("TLS modes must fail closed");
+                .expect_err("non-verifying modes must fail closed");
             assert_eq!(error.kind(), &DbErrorKind::Unsupported, "{url}");
         }
         for connection_string in [
             "host=localhost dbname=db",
             "host=localhost dbname=db sslmode=prefer",
-            "host=localhost dbname=db sslmode=require",
         ] {
             let config = DbConfig::Postgres(SecretUrl::new(connection_string).expect("config"));
             let error = config
@@ -421,6 +493,23 @@ mod tests {
             config
                 .validate_supported_transport()
                 .expect("explicit disable is supported");
+            assert!(
+                !config.postgres_transport().expect("transport").is_tls(),
+                "{url} must stay plaintext"
+            );
+        }
+
+        // Verified TLS is now supported via sslmode=require.
+        for url in [
+            "postgres://u:p@localhost/db?sslmode=require",
+            "postgres://u:p@localhost/db?sslmode=disable&sslmode=require",
+            "host=localhost dbname=db sslmode=require",
+        ] {
+            let config = DbConfig::Postgres(SecretUrl::new(url).expect("URL"));
+            config
+                .validate_supported_transport()
+                .expect("verified TLS is supported");
+            assert!(config.postgres_transport().expect("transport").is_tls());
         }
 
         for url in [
@@ -439,11 +528,11 @@ mod tests {
     #[test]
     fn postgres_tls_error_is_typed_and_redacted() {
         let config =
-            DbConfig::from_url("postgres://user:PG_TLS_SECRET_12345@localhost/db?sslmode=require")
+            DbConfig::from_url("postgres://user:PG_TLS_SECRET_12345@localhost/db?sslmode=prefer")
                 .expect("URL config");
         let error = config
             .validate_supported_transport()
-            .expect_err("TLS is unsupported");
+            .expect_err("non-verifying mode is unsupported");
         assert_eq!(error.kind(), &DbErrorKind::Unsupported);
         assert!(error.message().contains("sslmode=disable"));
         assert!(!error.to_string().contains("PG_TLS_SECRET_12345"));

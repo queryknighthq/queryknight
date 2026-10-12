@@ -96,9 +96,17 @@ pub struct McpConnection {
 impl McpConnection {
     /// Resolve the bound connection URL into trusted configuration.
     /// Raw URLs come from startup configuration only, never from tool
-    /// arguments.
+    /// arguments. TLS trust configuration comes from the environment.
     pub fn from_url(url: &str) -> Result<Self, rmcp::ErrorData> {
-        let config = DbConfig::from_url(url).map_err(|error| {
+        Self::from_url_with_tls(url, crate::postgres_tls_options_from_env())
+    }
+
+    /// Resolve the bound connection URL with explicit TLS trust options.
+    pub fn from_url_with_tls(
+        url: &str,
+        tls: qk_db::PostgresTlsOptions,
+    ) -> Result<Self, rmcp::ErrorData> {
+        let config = DbConfig::from_url_with_tls(url, tls).map_err(|error| {
             protocol_error(ErrorKind::Internal(format!(
                 "invalid database URL: {error}"
             )))
@@ -167,7 +175,7 @@ mod tests {
         let error = McpConnection::from_url("postgres://user:PG_TLS_SECRET_12345@localhost/db")
             .expect_err("implicit sslmode=prefer must fail at config binding");
         let rendered = format!("{error:?}");
-        assert!(rendered.contains("PostgreSQL TLS is not supported"));
+        assert!(rendered.contains("sslmode=prefer"));
         assert!(rendered.contains("sslmode=disable"));
         assert!(!rendered.contains("PG_TLS_SECRET_12345"));
     }

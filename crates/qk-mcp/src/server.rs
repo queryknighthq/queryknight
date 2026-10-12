@@ -167,6 +167,20 @@ pub fn connection_url_from_env() -> Option<String> {
         })
 }
 
+/// PostgreSQL TLS trust configuration from trusted startup configuration.
+///
+/// `QUERYKNIGHT_PG_SSLROOTCERT` names a PEM CA bundle that becomes the only
+/// trust anchor for `sslmode=require` connections. The path comes from the
+/// environment, never from agent or tool input, and its contents are never
+/// logged.
+pub fn postgres_tls_options_from_env() -> qk_db::PostgresTlsOptions {
+    qk_db::PostgresTlsOptions {
+        ca_path: std::env::var_os("QUERYKNIGHT_PG_SSLROOTCERT")
+            .map(std::path::PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty()),
+    }
+}
+
 /// Load the policy file (`QUERYKNIGHT_POLICY_FILE`) or fall back to
 /// the built-in demo policy. Invalid files fail startup fast (frozen
 /// `QUERYKNIGHT_POLICY_FILE invalid` behavior).

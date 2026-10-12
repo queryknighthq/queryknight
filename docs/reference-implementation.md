@@ -73,10 +73,15 @@ port, not a byte-for-byte reproduction of those unsafe paths.
 
 The PostgreSQL Rust ingress uses `proxy_pg` as trusted integration identity,
 one backend session per frontend, and a fresh `ExecutionPermit` before every
-executable Q/Execute. It is not a generic proxy framework. The MySQL Rust
-ingress is a separate classic-protocol proxy for COM_QUERY and its audited
-prepared-statement subset. The Rust OpenShell adapter is implemented as
-authorization-only local gRPC middleware, not a database executor.
+executable Q/Execute. It is not a generic proxy framework. The backend hop is
+explicitly plaintext (`sslmode=disable`) or verified TLS (`sslmode=require`,
+with `QUERYKNIGHT_PG_SSLROOTCERT` as the only trust anchor); `prefer`/`allow`
+is rejected rather than downgraded, and a TLS-required backend that refuses,
+presents an untrusted certificate, or mismatches the hostname fails closed
+without a plaintext retry. The MySQL Rust ingress is a separate
+classic-protocol proxy for COM_QUERY and its audited prepared-statement
+subset. The Rust OpenShell adapter is implemented as authorization-only local
+gRPC middleware, not a database executor.
 
 ## MySQL proxy audit (source-verified)
 

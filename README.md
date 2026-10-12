@@ -19,13 +19,37 @@ transport limits are documented in [`docs/release-security.md`](docs/release-sec
 
 | Surface | Supported profile | Explicit limitation |
 |---|---|---|
-| Direct PostgreSQL | `qk-db` plaintext only with explicit `sslmode=disable` | Omitted/prefer/require fail closed; native TLS is not implemented. |
+| Direct PostgreSQL | Explicit `sslmode=disable` (trusted plaintext) or `sslmode=require` (verified TLS, `QUERYKNIGHT_PG_SSLROOTCERT` as the only trust anchor) | Omitted/`prefer`/`allow` fail closed; no plaintext retry after a TLS failure. |
 | Direct MySQL | Plaintext `mysql_async` connection | Parsed TLS requests fail closed; native TLS is not implemented. |
-| PostgreSQL proxy | Guarded Simple and supported Extended Query on loopback | Frontend/backend TLS, COPY, FunctionCall, replication, and CancelRequest are unsupported/fail closed. |
+| PostgreSQL proxy | Guarded Simple and supported Extended Query on loopback; backend hop explicitly plaintext (`sslmode=disable`) or verified TLS (`sslmode=require`) | Frontend TLS, COPY, FunctionCall, replication, and CancelRequest are unsupported/fail closed. |
 | MySQL proxy | Guarded COM_QUERY and supported prepared statements on loopback | TLS, compression, LOCAL INFILE, cursors/FETCH, query attributes, and unmodeled commands are unsupported/fail closed. |
 | MCP | Local stdio process transport | No network listener. |
 | OpenShell | Authenticated HTTPS with strict OpenShell extension JWT verification for v0.1.2; explicit insecure mode is loopback-only, and Unix sockets are local integration/test paths. | Authorization-only; unauthenticated remote and plaintext non-loopback are rejected. See the [integration guide](docs/openshell.md). |
 | Daemon/control plane | Loopback HTTP with bearer token on protected routes | Not a public remote API; shared client rejects non-loopback targets. |
+
+## OpenShell + PostgreSQL
+
+OpenShell controls where the agent can connect. QueryKnight controls what SQL it
+can execute inside PostgreSQL.
+
+```
+OpenShell sandbox ──X── direct PostgreSQL          (denied by OpenShell)
+        │
+        │ PostgreSQL protocol
+        ▼
+QueryKnight PostgreSQL proxy
+        │
+        │ verified TLS
+        ▼
+PostgreSQL 17
+```
+
+`scripts/test-openshell-postgres-v0.1.2.sh` runs this composition end to end on
+real components — a real OpenShell v0.1.2 sandbox, the real PostgreSQL proxy,
+and PostgreSQL 17 over verified TLS — and exits `0` only when every assertion
+passes. OpenShell enforces the network destination and never sees SQL;
+QueryKnight enforces SQL authorization and does not decide reachability. See
+[the demo](docs/openshell-postgres-demo.md).
 
 See [release security and deployment scope](docs/release-security.md) for the complete matrix and trust assumptions.
 

@@ -119,8 +119,9 @@ fn configured_service(common: &CommonArgs) -> Result<ConfiguredService, String> 
 
     let database_url = qk_mcp::connection_url_from_env()
         .ok_or("set MYSQL_URL or DATABASE_URL to provide the trusted SQL dialect")?;
-    let database = DbConfig::from_url(&database_url)
-        .map_err(|_| "configured database URL is invalid".to_owned())?;
+    let database =
+        DbConfig::from_url_with_tls(&database_url, qk_mcp::postgres_tls_options_from_env())
+            .map_err(|_| "configured database URL is invalid".to_owned())?;
     let control_plane = match ControlPlaneClient::discover(common.home.clone()) {
         Ok(client) => Some(client),
         Err(_) if std::env::var(qk_daemon::runtime::paths::ENV_DAEMON_URL).is_ok() => {

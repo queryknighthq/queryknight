@@ -24,6 +24,7 @@ pub mod cursor;
 pub mod error;
 pub mod result;
 pub mod service;
+pub mod tls;
 pub mod value;
 
 pub use adapter::{Capabilities, DatabaseAdapter, Param};
@@ -32,7 +33,7 @@ pub use auth::{
     GuardedAuthorizationCall, ResolveMode,
 };
 pub use budget::{ResultBudget, MAX_BYTES, MAX_ROWS, MAX_TOKENS};
-pub use config::{DbConfig, SecretUrl};
+pub use config::{DbConfig, PostgresTlsOptions, SecretUrl};
 pub use cursor::{CursorStore, StoredCursor, CURSOR_TTL};
 pub use error::{DbError, DbErrorKind, MAX_ERROR_MESSAGE};
 pub use result::{
@@ -43,4 +44,5 @@ pub use service::{
     ApprovalSetup, BlockedReason, ExecuteRequest, ExecutedReport, ExecutionOutcome,
     ExecutionService, ExplainCall, GuardedCall, PendingApproval, TrustedContext, DEFAULT_TIMEOUT,
 };
+pub use tls::{PostgresTransport, MAX_CA_FILE_BYTES};
 pub use value::{DbValue, MAX_SAFE_INTEGER};
